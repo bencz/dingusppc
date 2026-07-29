@@ -29,7 +29,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <atomic>
 #include <cinttypes>
 #include <functional>
-#include <setjmp.h>
 #include <string>
 
 // Uncomment this to have a more graceful approach to illegal opcodes
@@ -189,6 +188,40 @@ extern uint32_t tbr_freq_shift;
 extern uint64_t tbr_period_ns;
 extern uint32_t rtc_lo, rtc_hi;
 
+/* Retired instruction count. Virtual time is derived from it, so anything
+   reading the time base, the RTC or the decrementer needs it current. A block
+   executor has to bring it forward before running one of those instructions,
+   not merely when the block ends. */
+extern uint64_t g_icycles;
+
+/* Timers get a chance to run once g_icycles passes this */
+extern uint64_t g_icycles_max;
+
+/* Raised from other threads to pull the next event check forward */
+extern volatile bool exec_timer;
+
+extern int icnt_factor;
+
+/** Services whatever timers came due and returns the next deadline */
+uint64_t ppc_process_events();
+
+/** Accounts for retired instructions and services timers once their deadline
+    has passed.
+
+    The interpreter passes one instruction at a time. A block executor passes
+    the length of the block it just finished, which delays timer delivery by
+    at most that many instructions.
+
+    `deadline` exists so a hot loop can compare against something the compiler
+    keeps in a register instead of reloading g_icycles_max every instruction.
+    Pass g_icycles_max itself when there is no such loop to hold a copy. */
+inline void ppc_account_cycles(uint64_t count, uint64_t& deadline = g_icycles_max) {
+    g_icycles += count;
+    if (g_icycles > deadline || exec_timer) [[unlikely]] {
+        deadline = g_icycles_max = ppc_process_events();
+    }
+}
+
 /* Flags for controlling interpreter execution. */
 enum {
     EXEF_BRANCH         = 1 << 0, // Branch taken, target PC is is in ppc_next_instruction_address
@@ -344,7 +377,10 @@ enum Exc_Cause : uint32_t {
 
 extern unsigned exec_flags;
 
-extern jmp_buf exc_env;
+/** Thrown by the deep exception paths (MMU, devices) to abandon the
+    instruction in flight and hand control back to the execution loop.
+    Shallow paths just set exec_flags and return instead */
+struct PPCExcUnwind {};
 
 enum Po_Cause : int {
     po_none,
@@ -479,10 +515,18 @@ void set_host_rounding_mode(uint8_t mode);
 void update_fpscr(uint32_t new_fpscr);
 
 /* Exception handlers. */
+
+// Sets up SRR0/SRR1/MSR and raises EXEF_EXCEPTION, then returns. Callers must
+// not run any further part of the aborted instruction
 void ppc_exception_handler(Except_Type exception_type, uint32_t srr1_bits);
+
+// Same, but unwinds back to the execution loop. For callers too deep to
+// return a status through, such as the MMU and device I/O
+[[noreturn]] void ppc_exception_handler_unwind(Except_Type exception_type, uint32_t srr1_bits);
+
 [[noreturn]] void dbg_exception_handler(Except_Type exception_type, uint32_t srr1_bits);
 void ppc_floating_point_exception(uint32_t opcode);
-void ppc_alignment_exception(uint32_t opcode, uint32_t ea);
+[[noreturn]] void ppc_alignment_exception(uint32_t opcode, uint32_t ea);
 
 // MEMORY DECLARATIONS
 extern MemCtrlBase* mem_ctrl_instance;

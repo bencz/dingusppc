@@ -36,6 +36,9 @@ using namespace std;
 int ntested; // number of tested instructions
 int nfailed; // number of failed instructions
 
+int test_code_cache();      // defined in codecachetests.cpp
+int test_cycle_accounting(); // defined in cycletests.cpp
+
 #if defined(PPC_TESTS)
 void ppc_exception_handler(Except_Type exception_type, uint32_t srr1_bits) {
     power_on = false;
@@ -350,5 +353,14 @@ int main() {
 
     cout << "Running PPC disassembler tests..." << endl << endl;
 
-    return test_ppc_disasm();
+    int disasm_failed = test_ppc_disasm();
+
+    // these reset the processor, so keep them last
+    cout << endl << "Running code cache tests..." << endl << endl;
+
+    int cache_failed = test_code_cache();
+
+    cout << endl << "Running cycle accounting tests..." << endl << endl;
+
+    return disasm_failed + cache_failed + test_cycle_accounting();
 }

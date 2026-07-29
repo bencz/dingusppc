@@ -115,6 +115,8 @@ enum TLBFlags : uint16_t {
     TLBE_FROM_PAT = 1 << 4, // TLB entry has been translated with PAT
     PAGE_WRITABLE = 1 << 5, // page is writable
     PTE_SET_C     = 1 << 6, // tells if C bit of the PTE needs to be updated
+    PAGE_CODE     = 1 << 7, // page holds translated code and had PAGE_WRITABLE
+                            // taken away so stores to it can be noticed
 };
 
 extern std::function<void(uint32_t bat_reg)> ibat_update;
@@ -128,6 +130,14 @@ extern MapDmaResult mmu_map_dma_mem(uint32_t addr, uint32_t size, bool allow_mmi
 extern void mmu_change_mode(void);
 extern void mmu_pat_ctx_changed();
 extern void tlb_flush_entry(uint32_t ea);
+
+/** Tells the MMU that a physical page started holding translated code.
+
+    Every cached data mapping of that page is dropped so the next refill can
+    take PAGE_WRITABLE away from it. Called by the code cache when a page
+    gains its first block, so the cost lands once per page rather than once
+    per block */
+extern void mmu_mark_code_page(uint32_t phys_addr);
 
 extern uint64_t mem_read_dbg(uint32_t virt_addr, uint32_t size);
 extern void mem_write_dbg(uint32_t virt_addr, uint64_t value, int size);

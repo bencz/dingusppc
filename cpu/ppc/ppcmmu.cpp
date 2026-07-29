@@ -24,6 +24,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <core/memaccess.h>
 #include <devices/memctrl/memctrlbase.h>
 #include <devices/common/mmiodevice.h>
+#include "ppccodecache.h"
 #include "ppcemu.h"
 #include "ppcmmu.h"
 
@@ -730,6 +731,15 @@ static TLBEntry* dtlb2_refill(uint32_t guest_va, int is_write, bool is_dbg = fal
         flags |= TLBFlags::PAGE_WRITABLE; // assume physical pages are writable
     }
 
+    // Take writability away from a page holding translated code so the first
+    // store to it lands in the slow path and can drop those translations.
+    // A page that is already unwritable needs none of this, its stores fault
+    // before they can reach the code.
+    if (!ppc_code_cache_is_empty() && (flags & TLBFlags::PAGE_WRITABLE) &&
+        ppc_code_cache_page_has_blocks(phys_addr)) {
+        flags = uint16_t((flags & ~uint16_t(TLBFlags::PAGE_WRITABLE)) | TLBFlags::PAGE_CODE);
+    }
+
     // look up host virtual address
     AddressMapEntry* rgn_desc = mem_ctrl_instance->find_range(phys_addr);
     if (rgn_desc) {
@@ -902,6 +912,33 @@ void tlb_flush_entry(uint32_t ea)
     tlb_flush_secondary_entry(dtlb2_mode2, tag);
     tlb_flush_primary_entry(dtlb1_mode3, tag);
     tlb_flush_secondary_entry(dtlb2_mode3, tag);
+}
+
+template <std::size_t N>
+static void tlb_flush_phys_entries(std::array<TLBEntry, N> &tlb, uint32_t phys_tag)
+{
+    for (auto &tlb_el : tlb) {
+        if (tlb_el.tag != TLB_INVALID_TAG && tlb_el.phys_tag == phys_tag) {
+            tlb_el.tag = TLB_INVALID_TAG;
+        }
+    }
+}
+
+void mmu_mark_code_page(uint32_t phys_addr)
+{
+    const uint32_t phys_tag = phys_addr & PPC_PAGE_MASK;
+
+    /* A physical page can be reached through any number of effective
+       addresses and through any of the three translation modes, so there is
+       no shortcut here. Dropping the mappings makes the next refill rebuild
+       them with PAGE_WRITABLE removed. Instruction mappings are left alone
+       because fetches never write. */
+    tlb_flush_phys_entries(dtlb1_mode1, phys_tag);
+    tlb_flush_phys_entries(dtlb2_mode1, phys_tag);
+    tlb_flush_phys_entries(dtlb1_mode2, phys_tag);
+    tlb_flush_phys_entries(dtlb2_mode2, phys_tag);
+    tlb_flush_phys_entries(dtlb1_mode3, phys_tag);
+    tlb_flush_phys_entries(dtlb2_mode3, phys_tag);
 }
 
 template <std::size_t N>
@@ -1125,6 +1162,28 @@ void mmu_pat_ctx_changed()
 #endif
 
 // Forward declarations.
+/** A store landed on a page holding translated code. Drop the translations
+    on that page and hand its writability back so the store can go through.
+
+    Everything on the page goes, not just what the store overlapped, which
+    keeps the bookkeeping cheap. Mappings of the same page in the other
+    translation modes heal themselves the next time they are stored to,
+    because the invalidation is a no-op by then. */
+static void mmu_drop_code_page(uint32_t guest_va, uint32_t tag, TLBEntry *tlb_entry)
+{
+    ppc_code_cache_invalidate(tlb_entry->phys_tag, PPC_PAGE_SIZE);
+
+    tlb_entry->flags = uint16_t((tlb_entry->flags & ~uint16_t(TLBFlags::PAGE_CODE)) |
+                                TLBFlags::PAGE_WRITABLE);
+
+    // the two TLB levels each keep their own copy of the flags
+    TLBEntry *other_entry = lookup_secondary_tlb<TLBType::DTLB>(guest_va, tag);
+    if (other_entry != nullptr && other_entry != tlb_entry) {
+        other_entry->flags = uint16_t((other_entry->flags & ~uint16_t(TLBFlags::PAGE_CODE)) |
+                                      TLBFlags::PAGE_WRITABLE);
+    }
+}
+
 template <class T>
 static T read_unaligned(uint32_t opcode, uint32_t guest_va, uint8_t *host_va ARGS_SWAP_MUNGED);
 template <class T>
@@ -1329,9 +1388,13 @@ inline void mmu_write_vmem(uint32_t opcode, uint32_t guest_va, T value)
         num_primary_dtlb_hits++;
 #endif
         if (!(tlb1_entry->flags & TLBFlags::PAGE_WRITABLE)) {
-            ppc_state.spr[SPR::DSISR] = 0x08000000 | (1 << 25);
-            ppc_state.spr[SPR::DAR]   = guest_va;
-            mmu_exception_handler(Except_Type::EXC_DSI, 0);
+            if (tlb1_entry->flags & TLBFlags::PAGE_CODE) {
+                mmu_drop_code_page(guest_va, tag, tlb1_entry);
+            } else {
+                ppc_state.spr[SPR::DSISR] = 0x08000000 | (1 << 25);
+                ppc_state.spr[SPR::DAR]   = guest_va;
+                mmu_exception_handler(Except_Type::EXC_DSI, 0);
+            }
         }
         if (!(tlb1_entry->flags & TLBFlags::PTE_SET_C)) {
             // perform full page address translation to update PTE.C bit
@@ -1373,9 +1436,13 @@ inline void mmu_write_vmem(uint32_t opcode, uint32_t guest_va, T value)
 #endif
 
         if (!(tlb2_entry->flags & TLBFlags::PAGE_WRITABLE)) {
-            ppc_state.spr[SPR::DSISR] = 0x08000000 | (1 << 25);
-            ppc_state.spr[SPR::DAR]   = guest_va;
-            mmu_exception_handler(Except_Type::EXC_DSI, 0);
+            if (tlb2_entry->flags & TLBFlags::PAGE_CODE) {
+                mmu_drop_code_page(guest_va, tag, tlb2_entry);
+            } else {
+                ppc_state.spr[SPR::DSISR] = 0x08000000 | (1 << 25);
+                ppc_state.spr[SPR::DAR]   = guest_va;
+                mmu_exception_handler(Except_Type::EXC_DSI, 0);
+            }
         }
 
         if (!(tlb2_entry->flags & TLBFlags::PTE_SET_C)) {
@@ -1813,7 +1880,7 @@ uint64_t mem_read_dbg(uint32_t virt_addr, uint32_t size) {
     }
     catch (std::invalid_argument& exc) {
         /* restore MMU-related CPU state */
-        mmu_exception_handler     = ppc_exception_handler;
+        mmu_exception_handler     = ppc_exception_handler_unwind;
         ppc_state.spr[SPR::DSISR] = save_dsisr;
         ppc_state.spr[SPR::DAR]   = save_dar;
 
@@ -1822,7 +1889,7 @@ uint64_t mem_read_dbg(uint32_t virt_addr, uint32_t size) {
     }
     catch (...) {
         /* restore MMU-related CPU state */
-        mmu_exception_handler     = ppc_exception_handler;
+        mmu_exception_handler     = ppc_exception_handler_unwind;
         ppc_state.spr[SPR::DSISR] = save_dsisr;
         ppc_state.spr[SPR::DAR]   = save_dar;
 
@@ -1831,7 +1898,7 @@ uint64_t mem_read_dbg(uint32_t virt_addr, uint32_t size) {
     }
 
     /* restore MMU-related CPU state */
-    mmu_exception_handler     = ppc_exception_handler;
+    mmu_exception_handler     = ppc_exception_handler_unwind;
     ppc_state.spr[SPR::DSISR] = save_dsisr;
     ppc_state.spr[SPR::DAR]   = save_dar;
 
@@ -1866,7 +1933,7 @@ void mem_write_dbg(uint32_t virt_addr, uint64_t value, int size) {
         }
     } catch (std::invalid_argument& exc) {
         // restore MMU-related CPU state
-        mmu_exception_handler     = ppc_exception_handler;
+        mmu_exception_handler     = ppc_exception_handler_unwind;
         ppc_state.spr[SPR::DSISR] = save_dsisr;
         ppc_state.spr[SPR::DAR]   = save_dar;
 
@@ -1875,7 +1942,7 @@ void mem_write_dbg(uint32_t virt_addr, uint64_t value, int size) {
     }
 
     // restore MMU-related CPU state
-    mmu_exception_handler     = ppc_exception_handler;
+    mmu_exception_handler     = ppc_exception_handler_unwind;
     ppc_state.spr[SPR::DSISR] = save_dsisr;
     ppc_state.spr[SPR::DAR]   = save_dar;
 }
@@ -1933,7 +2000,7 @@ bool mmu_translate_dbg(uint32_t guest_va, uint32_t &guest_pa) {
     }
 
     /* restore MMU-related CPU state */
-    mmu_exception_handler     = ppc_exception_handler;
+    mmu_exception_handler     = ppc_exception_handler_unwind;
     ppc_state.spr[SPR::DSISR] = save_dsisr;
     ppc_state.spr[SPR::DAR]   = save_dar;
 
@@ -1960,7 +2027,7 @@ void ppc_mmu_init()
     last_exec_area  = {0xFFFFFFFF, 0xFFFFFFFF, 0, 0, nullptr, nullptr};
     last_ptab_area  = {0xFFFFFFFF, 0xFFFFFFFF, 0, 0, nullptr, nullptr};
 
-    mmu_exception_handler = ppc_exception_handler;
+    mmu_exception_handler = ppc_exception_handler_unwind;
 
     if (is_601) {
         // use 601-style unified BATs

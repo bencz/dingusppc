@@ -21,6 +21,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include <core/timermanager.h>
 #include <loguru.hpp>
+#include "ppccodecache.h"
 #include "ppcemu.h"
 #include "ppcmmu.h"
 #include "ppcdisasm.h"
@@ -30,7 +31,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <cstring>
 #include <iostream>
 #include <map>
-#include <setjmp.h>
 #include <stdexcept>
 #include <stdio.h>
 #include <string>
@@ -92,15 +92,11 @@ volatile bool exec_timer;
 bool int_pin = false; // interrupt request pin state: true - asserted
 bool dec_exception_pending = false;
 
-/* copy of local variable bb_start_la. Need for correct
-   calculation of CPU cycles after setjmp that clobbers
-   non-volatile local variables. */
-uint32_t    glob_bb_start_la;
-
 /* variables related to virtual time */
 const bool g_realtime = false;
 uint64_t g_nanoseconds_base;
 uint64_t g_icycles;
+uint64_t g_icycles_max;
 int      icnt_factor;
 
 /* global variables related to the timebase facility */
@@ -331,7 +327,7 @@ uint64_t get_virt_time_ns()
     }
 }
 
-static uint64_t process_events()
+uint64_t ppc_process_events()
 {
     exec_timer = false;
     uint64_t slice_ns = TimerManager::get_instance()->process_timers();
@@ -359,7 +355,7 @@ typedef enum {
 template <ppc_exec_type_t exec_type, endian_switch endian>
 static void ppc_exec_inner(uint32_t start_addr, uint32_t size)
 {
-    uint64_t max_cycles = 0;
+    uint64_t max_cycles = g_icycles_max;
     uint32_t page_start, eb_start, eb_end = 0;
     uint32_t opcode;
     PPCOpcode* opcode_grabber = ppc_opcode_grabber;
@@ -382,18 +378,18 @@ static void ppc_exec_inner(uint32_t start_addr, uint32_t size)
 
         opcode = ppc_read_instruction(pc_real);
         ppc_main_opcode(opcode_grabber, opcode);
-        if (g_icycles++ >= max_cycles || exec_timer) [[unlikely]]
-            max_cycles = process_events();
+        ppc_account_cycles(1, max_cycles);
 
         if (exec_flags) {
             if ((exec_flags & EXEF_SLEEP) && !(exec_flags & EXEF_EXCEPTION)) [[unlikely]] {
                 while (power_on && (exec_flags & EXEF_SLEEP)) {
-                    max_cycles = process_events();
+                    g_icycles_max = ppc_process_events();
+                    max_cycles    = g_icycles_max;
                     if (!(exec_flags & EXEF_SLEEP)) {
                         break;
                     }
-                    if (max_cycles > g_icycles) {
-                        g_icycles = max_cycles;
+                    if (g_icycles_max > g_icycles) {
+                        g_icycles = g_icycles_max;
                     } else {
                         g_icycles++;
                     }
@@ -404,7 +400,10 @@ static void ppc_exec_inner(uint32_t start_addr, uint32_t size)
             }
             // define next execution block
             eb_start = ppc_next_instruction_address;
-            if (!(exec_flags & EXEF_RFI) && (eb_start & PPC_PAGE_MASK) == page_start) {
+            // an exception or rfi may have switched the translation mode, so the
+            // page mapping behind pc_real cannot be reused
+            if (!(exec_flags & (EXEF_RFI | EXEF_EXCEPTION)) &&
+                (eb_start & PPC_PAGE_MASK) == page_start) {
                 if (endian == big_end)
                     INCPC((int)eb_start - (int)ppc_state.pc);
                 else
@@ -439,20 +438,20 @@ template void ppc_exec_inner<main, little_end>(uint32_t start_addr, uint32_t siz
 // outer interpreter loop
 void ppc_exec()
 {
-    if (setjmp(exc_env)) {
-        // process low-level exceptions
-        //LOG_F(9, "PPC-EXEC: low_level exception raised!");
-        ppc_state.pc = ppc_next_instruction_address;
-    }
-
     while (power_on) {
+        try {
 #if SUPPORTS_PPC_LITTLE_ENDIAN_MODE
-        if (ppc_state.is_LE)
-            ppc_exec_inner<main, little_end>(0, 0);
-        else
+            if (ppc_state.is_LE)
+                ppc_exec_inner<main, little_end>(0, 0);
+            else
 #endif
-        [[likely]] {
-            ppc_exec_inner<main, big_end>(0, 0);
+            [[likely]] {
+                ppc_exec_inner<main, big_end>(0, 0);
+            }
+        } catch (PPCExcUnwind&) {
+            // low-level exception, the handler already picked the vector
+            ppc_state.pc = ppc_next_instruction_address;
+            continue;
         }
         if (!power_on && power_off_reason == po_endian_switch) [[unlikely]] {
             power_on = true;
@@ -463,19 +462,19 @@ void ppc_exec()
 /** Execute one PPC instruction. */
 void ppc_exec_single()
 {
-    if (setjmp(exc_env)) {
-        // process low-level exceptions
-        //LOG_F(9, "PPC-EXEC: low_level exception raised!");
+    try {
+        uint8_t* pc_real = mmu_translate_imem(ppc_state.pc ATPCP); // &pcp
+        uint32_t opcode = ppc_read_instruction(pc_real);
+        ppc_main_opcode(ppc_opcode_grabber, opcode);
+        // stepping services timers every instruction on purpose, so that
+        // single stepping through timer driven code still makes progress
+        g_icycles++;
+        g_icycles_max = ppc_process_events();
+    } catch (PPCExcUnwind&) {
         ppc_state.pc = ppc_next_instruction_address;
         exec_flags = 0;
         return;
     }
-
-    uint8_t* pc_real = mmu_translate_imem(ppc_state.pc ATPCP); // &pcp
-    uint32_t opcode = ppc_read_instruction(pc_real);
-    ppc_main_opcode(ppc_opcode_grabber, opcode);
-    g_icycles++;
-    process_events();
 
     if (exec_flags) {
         ppc_state.pc = ppc_next_instruction_address;
@@ -492,21 +491,20 @@ template void ppc_exec_inner<until, big_end>(uint32_t start_addr, uint32_t size)
 template void ppc_exec_inner<until, little_end>(uint32_t start_addr, uint32_t size);
 
 // outer interpreter loop
-void ppc_exec_until(volatile uint32_t goal_addr) {
-    if (setjmp(exc_env)) {
-        // process low-level exceptions
-        // LOG_F(9, "PPC-EXEC: low_level exception raised!");
-        ppc_state.pc = ppc_next_instruction_address;
-    }
-
+void ppc_exec_until(uint32_t goal_addr) {
     while (power_on) {
+        try {
 #if SUPPORTS_PPC_LITTLE_ENDIAN_MODE
-        if (ppc_state.is_LE)
-            ppc_exec_inner<until, little_end>(goal_addr, 0);
-        else
+            if (ppc_state.is_LE)
+                ppc_exec_inner<until, little_end>(goal_addr, 0);
+            else
 #endif
-        [[likely]] {
-            ppc_exec_inner<until, big_end>(goal_addr, 0);
+            [[likely]] {
+                ppc_exec_inner<until, big_end>(goal_addr, 0);
+            }
+        } catch (PPCExcUnwind&) {
+            ppc_state.pc = ppc_next_instruction_address;
+            continue;
         }
         if (!power_on && power_off_reason == po_endian_switch) [[unlikely]] {
             power_on = true;
@@ -523,22 +521,21 @@ template void ppc_exec_inner<debug, big_end>(uint32_t start_addr, uint32_t size)
 template void ppc_exec_inner<debug, little_end>(uint32_t start_addr, uint32_t size);
 
 // outer interpreter loop
-void ppc_exec_dbg(volatile uint32_t start_addr, volatile uint32_t size)
+void ppc_exec_dbg(uint32_t start_addr, uint32_t size)
 {
-    if (setjmp(exc_env)) {
-        // process low-level exceptions
-        //LOG_F(9, "PPC-EXEC: low_level exception raised!");
-        ppc_state.pc = ppc_next_instruction_address;
-    }
-
     while (power_on && (ppc_state.pc < start_addr || ppc_state.pc >= start_addr + size)) {
+        try {
 #if SUPPORTS_PPC_LITTLE_ENDIAN_MODE
-        if (ppc_state.is_LE)
-            ppc_exec_inner<debug, little_end>(start_addr, size);
-        else
+            if (ppc_state.is_LE)
+                ppc_exec_inner<debug, little_end>(start_addr, size);
+            else
 #endif
-        [[likely]] {
-            ppc_exec_inner<debug, big_end>(start_addr, size);
+            [[likely]] {
+                ppc_exec_inner<debug, big_end>(start_addr, size);
+            }
+        } catch (PPCExcUnwind&) {
+            ppc_state.pc = ppc_next_instruction_address;
+            continue;
         }
         if (!power_on && power_off_reason == po_endian_switch) [[unlikely]] {
             power_on = true;
@@ -960,6 +957,7 @@ void ppc_cpu_init(MemCtrlBase* mem_ctrl, uint32_t cpu_version, bool do_include_6
 #endif
     g_nanoseconds_base = cpu_now_ns();
     g_icycles = 0;
+    g_icycles_max = 0;
 
 //                    //                                        // PDM cpu clock calculated at 0x403036CC in r3
 //  icnt_factor = 11; // 1 instruction = 2048 ns =    0.488 MHz // 00068034 =     0.426036 MHz = 2347.219 ns // floppy doesn't work
@@ -1008,6 +1006,7 @@ void ppc_cpu_init(MemCtrlBase* mem_ctrl, uint32_t cpu_version, bool do_include_6
     ppc_msr_did_change(new_msr_val, new_msr_val, false);
 
     ppc_mmu_init();
+    ppc_code_cache_init();
 
     /* redirect code execution to reset vector */
     ppc_state.pc = 0xFFF00100;
