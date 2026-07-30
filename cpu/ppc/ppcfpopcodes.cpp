@@ -1155,8 +1155,18 @@ void dppc_interpreter::ppc_mtfsf(uint32_t opcode) {
     // ensure neither FEX nor VX will be changed
     cr_mask &= ~(FPSCR::FEX | FPSCR::VX);
 
+    const uint32_t old_fpscr = ppc_state.fpscr;
+
     // copy FPR[reg_b] to FPSCR under control of cr_mask
     ppc_state.fpscr = (ppc_state.fpscr & ~cr_mask) | (FPR_INT(reg_b) & cr_mask);
+
+    // FEX and VX are derived bits and follow the usual rule
+    ppc_update_vx();
+    ppc_update_fex();
+
+    // a guest switching rounding modes does it through here
+    if ((old_fpscr ^ ppc_state.fpscr) & FPSCR::RN_MASK)
+        set_host_rounding_mode(ppc_state.fpscr & FPSCR::RN_MASK);
 
     if (rec)
         ppc_update_cr1();
@@ -1173,12 +1183,17 @@ void dppc_interpreter::ppc_mtfsfi(uint32_t opcode) {
     // prepare field mask and ensure that neither FEX nor VX will be changed
     uint32_t mask = (0xF0000000UL >> crf_d) & ~(FPSCR::FEX | FPSCR::VX);
 
+    const uint32_t old_fpscr = ppc_state.fpscr;
+
     // copy imm to FPSCR[crf_d] under control of the field mask
     ppc_state.fpscr = (ppc_state.fpscr & ~mask) | ((imm >> crf_d) & mask);
 
     // Update FEX and VX according to the "usual rule"
     ppc_update_vx();
     ppc_update_fex();
+
+    if ((old_fpscr ^ ppc_state.fpscr) & FPSCR::RN_MASK)
+        set_host_rounding_mode(ppc_state.fpscr & FPSCR::RN_MASK);
 
     if (rec)
         ppc_update_cr1();
@@ -1192,6 +1207,10 @@ void dppc_interpreter::ppc_mtfsb0(uint32_t opcode) {
     int crf_d = (opcode >> 21) & 0x1F;
     if (!crf_d || (crf_d > 2)) { // FEX and VX can't be explicitly cleared
         ppc_state.fpscr &= ~(0x80000000UL >> crf_d);
+        ppc_update_vx();
+        ppc_update_fex();
+        if (crf_d >= 30)
+            set_host_rounding_mode(ppc_state.fpscr & FPSCR::RN_MASK);
     }
 
     if (rec)
@@ -1206,6 +1225,10 @@ void dppc_interpreter::ppc_mtfsb1(uint32_t opcode) {
     int crf_d = (opcode >> 21) & 0x1F;
     if (!crf_d || (crf_d > 2)) { // FEX and VX can't be explicitly set
         ppc_state.fpscr |= (0x80000000UL >> crf_d);
+        ppc_update_vx();
+        ppc_update_fex();
+        if (crf_d >= 30)
+            set_host_rounding_mode(ppc_state.fpscr & FPSCR::RN_MASK);
     }
 
     if (rec)
@@ -1230,6 +1253,8 @@ void dppc_interpreter::ppc_mcrfs(uint32_t opcode) {
         FPSCR::VXVC |
         FPSCR::VXSOFT | FPSCR::VXSQRT | FPSCR::VXCVI
     ));
+    ppc_update_vx();
+    ppc_update_fex();
 }
 
 // Floating Point Comparisons
