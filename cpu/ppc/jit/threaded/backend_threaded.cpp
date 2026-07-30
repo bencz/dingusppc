@@ -227,12 +227,12 @@ void threaded_entry(const JitBlock* blk) {
         case IROpcode::Load:
             ppc_state.pc = entry_pc + in.offset;
             if (!rt_call_op(in.helper, in.imm)) {
-                retired = in.offset / 4;
+                retired = in.insn_idx;
                 goto done;
             }
             vals[i] = ppc_state.gpr[in.reg];
             if (exec_flags) {
-                retired = in.offset / 4 + 1;
+                retired = in.insn_idx + 1;
                 goto done;
             }
             break;
@@ -240,11 +240,11 @@ void threaded_entry(const JitBlock* blk) {
         case IROpcode::Store:
             ppc_state.pc = entry_pc + in.offset;
             if (!rt_call_op(in.helper, in.imm)) {
-                retired = in.offset / 4;
+                retired = in.insn_idx;
                 goto done;
             }
             if (exec_flags) {
-                retired = in.offset / 4 + 1;
+                retired = in.insn_idx + 1;
                 goto done;
             }
             break;
@@ -309,9 +309,7 @@ void threaded_entry(const JitBlock* blk) {
         }
 
         case IROpcode::Call: {
-            // offset is bytes from the block start, so it names which guest
-            // instruction this is without needing a field of its own
-            const uint32_t guest_idx = in.offset / 4;
+            const uint32_t guest_idx = in.insn_idx;
 
             // helpers read the PC for branch targets and exception
             // bookkeeping, and so does the accounting below: an asynchronous

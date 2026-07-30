@@ -214,6 +214,12 @@ typedef struct IRInsn {
         good for diagnostics only */
     uint16_t offset;
 
+    /** Guest instructions retired before this one, for the cycle accounting.
+        This used to be offset / 4 until the translator learned to walk
+        through always taken branches, which put gaps between offsets while
+        retirement kept counting by ones */
+    uint16_t insn_idx;
+
     IRValue  a, b;    // operands, IR_NO_VALUE when unused
     IRValue  dest;    // value defined, IR_NO_VALUE when none
     IRType   type;
@@ -268,6 +274,12 @@ typedef struct IRBlock {
     uint32_t insn_count;
 
     BlockEnd end_reason;
+
+    /** Raw word of the last guest instruction decoded, so diagnostics can
+        tell which kind of branch or sync actually closed the block, which
+        end_reason alone is too coarse for */
+    uint32_t end_word;
+
     std::vector<IRInsn> insns;
 
     void reset(uint32_t virt, uint32_t phys, uint32_t translation_mode);

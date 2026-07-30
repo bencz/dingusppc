@@ -71,7 +71,26 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include <loguru.hpp>
 
+namespace {
+
+/** DPPC_JIT_MAPLOG=<path> writes one line per emitted block: host address,
+    host bytes, guest instructions, end reason, entry address and the raw
+    word that closed the block. Joining it against perf samples is what
+    turns a flat [JIT] profile into a histogram of block shapes, which is
+    the evidence superblock decisions run on. FLUSH marks a pool reset,
+    after which host addresses start meaning different blocks */
+FILE* map_log() {
+    static FILE* f = [] {
+        const char* path = getenv("DPPC_JIT_MAPLOG");
+        return path ? fopen(path, "w") : nullptr;
+    }();
+    return f;
+}
+
+} // namespace
+
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -276,6 +295,13 @@ public:
         blk->chained_prev = nullptr;
         blk->chained_next = nullptr;
 
+        if (FILE* f = map_log()) [[unlikely]] {
+            fprintf(f, "%llx %zx %u %u %08x %08x\n",
+                    (unsigned long long)(uintptr_t)dst, this->asmb.size(),
+                    ir.insn_count, unsigned(ir.end_reason), ir.virt_addr,
+                    ir.end_word);
+        }
+
         return blk;
     }
 
@@ -288,6 +314,9 @@ public:
     void release_all() override {
         this->code.reset();
         this->full = false;
+        if (FILE* f = map_log()) [[unlikely]] {
+            fprintf(f, "FLUSH\n");
+        }
     }
 
     bool wants_flush() const override {
@@ -1114,7 +1143,7 @@ private:
     }
 
     bool emit_call(const IRInsn& in, X64Gpr arg0, X64Gpr arg1) {
-        const uint32_t guest_idx = in.offset / 4;
+        const uint32_t guest_idx = in.insn_idx;
 
         // ppc_state.pc = entry_pc + offset, which helpers read for branch
         // targets and for the address an exception records. It goes first
@@ -1303,7 +1332,7 @@ private:
         this->asmb.call_reg(REG_CALLOP);
 
         X64Emitter::Label cold = this->asmb.new_label();
-        this->cold_exits.push_back({cold, in.offset / 4u - this->accounted});
+        this->cold_exits.push_back({cold, in.insn_idx - this->accounted});
         this->asmb.cmp_mem_imm8(REG_FLAGS, 0, 0);
         this->asmb.jcc(X64Cond::NotEqual, cold);
 
@@ -1472,7 +1501,7 @@ private:
         this->asmb.call_reg(REG_CALLOP);
 
         X64Emitter::Label cold = this->asmb.new_label();
-        this->cold_exits.push_back({cold, in.offset / 4u - this->accounted});
+        this->cold_exits.push_back({cold, in.insn_idx - this->accounted});
         this->asmb.cmp_mem_imm8(REG_FLAGS, 0, 0);
         this->asmb.jcc(X64Cond::NotEqual, cold);
 

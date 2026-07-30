@@ -47,6 +47,7 @@ void IRBlock::reset(uint32_t virt, uint32_t phys, uint32_t translation_mode) {
     this->byte_size  = 0;
     this->insn_count = 0;
     this->end_reason = BlockEnd::SizeLimit;
+    this->end_word   = 0;
 
     // keeps the capacity, translation runs often enough that the reuse matters
     this->insns.clear();
