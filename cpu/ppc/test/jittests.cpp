@@ -1087,6 +1087,181 @@ static void test_cross_page_call() {
     jit_check(same_spr(interp, reguarded, &where),
               "a failed seam guard falls back to an honest fetch");
     report_spr(interp, reguarded, where, "reguarded");
+
+    // the blr of a walked leaf dissolves only while LR provably holds the
+    // call's return address; squeezing the budget so the blr lands outside
+    // it and then exactly on its last slot must refuse the dissolve and
+    // stay correct through the ordinary endings
+    const uint32_t saved_budget = dppc_jit::jit_max_block_insns;
+    for (uint32_t budget = 4; budget <= 5; budget++) {
+        dppc_jit::jit_max_block_insns = budget;
+        ppc_jit_disable();
+        ppc_jit_enable(JitBackend::automatic);
+        SprResult squeezed = run_cross_code();
+        where = -1;
+        jit_check(same_spr(interp, squeezed, &where),
+                  "a budget squeezed leaf return stays exact");
+        report_spr(interp, squeezed, where, "squeezed");
+    }
+    dppc_jit::jit_max_block_insns = saved_budget;
+    ppc_jit_disable();
+}
+
+/*  A leaf that redirects its own return with mtlr: the dissolve must see
+    the LR write and let the blr end the block, or execution would fall
+    into the very instruction the leaf jumped over.  */
+static const uint32_t lrw_caller_code[] = {
+    0x38600005, // 0xC000 li   r3, 5
+    0x48000FFD, // 0xC004 bl   -> 0xD000
+    0x38C00009, // 0xC008 li   r6, 9          the redirected return skips this
+    0x38E00003, // 0xC00C li   r7, 3          and lands here
+    0x00000000, // 0xC010 illegal, the program stops here
+};
+static const uint32_t lrw_callee_code[] = {
+    0x7CA802A6, // 0xD000 mflr r5             r5 = 0xC008
+    0x38850004, // 0xD004 addi r4, r5, 4      r4 = 0xC00C
+    0x7C8803A6, // 0xD008 mtlr r4
+    0x4E800020, // 0xD00C blr                 -> 0xC00C
+};
+
+constexpr uint32_t LRW_BASE   = 0xC000;
+constexpr uint32_t LRW_CALLEE = 0xD000;
+constexpr uint32_t LRW_END    = LRW_BASE + 0x10;
+
+static SprResult run_lr_write_code() {
+    for (int i = 0; i < 32; i++) {
+        ppc_state.gpr[i] = 0xC3C30000u | uint32_t(i);
+    }
+    ppc_state.spr[SPR::LR]  = 0;
+    ppc_state.spr[SPR::CTR] = 0;
+    ppc_state.cr  = 0;
+    ppc_state.pc  = LRW_BASE;
+    g_icycles     = 0;
+    g_icycles_max = 0;
+    exec_flags    = 0;
+    power_on      = true;
+
+    ppc_exec_until(LRW_END);
+
+    SprResult r;
+    for (int i = 0; i < 32; i++) r.regs.gpr[i] = ppc_state.gpr[i];
+    r.regs.pc      = ppc_state.pc;
+    r.regs.retired = g_icycles;
+    r.lr  = ppc_state.spr[SPR::LR];
+    r.ctr = ppc_state.spr[SPR::CTR];
+    r.cr  = ppc_state.cr;
+    return r;
+}
+
+static void test_leaf_lr_write() {
+    for (size_t i = 0; i < sizeof(lrw_caller_code) / 4; i++) {
+        mmu_write_vmem<uint32_t>(NO_OPCODE, LRW_BASE + uint32_t(i) * 4,
+                                 lrw_caller_code[i]);
+    }
+    for (size_t i = 0; i < sizeof(lrw_callee_code) / 4; i++) {
+        mmu_write_vmem<uint32_t>(NO_OPCODE, LRW_CALLEE + uint32_t(i) * 4,
+                                 lrw_callee_code[i]);
+    }
+
+    ppc_jit_disable();
+    SprResult interp = run_lr_write_code();
+    jit_check(interp.regs.pc == LRW_END && interp.regs.retired == 7 &&
+              interp.regs.gpr[6] == (0xC3C30000u | 6) && interp.regs.gpr[7] == 3,
+              "the mtlr leaf program behaves on the interpreter");
+
+    ppc_jit_enable(JitBackend::threaded);
+    SprResult threaded = run_lr_write_code();
+    int where = -1;
+    jit_check(same_spr(interp, threaded, &where),
+              "a leaf that rewrites LR keeps its blr honest (threaded)");
+    report_spr(interp, threaded, where, "threaded");
+
+    ppc_jit_disable();
+    ppc_jit_enable(JitBackend::automatic);
+    SprResult native = run_lr_write_code();
+    where = -1;
+    jit_check(same_spr(interp, native, &where),
+              "a leaf that rewrites LR keeps its blr honest (emitted)");
+    report_spr(interp, native, where, "emitted");
+    ppc_jit_disable();
+}
+
+/*  Two calls to the same leaf in a row: the first pair dissolves, the walk
+    machinery is spent for the block, and the second call has to end it and
+    chain through the ordinary path with exact retirement.  */
+static const uint32_t twice_caller_code[] = {
+    0x38600005, // 0xE000 li   r3, 5
+    0x48000FFD, // 0xE004 bl   -> 0xF000
+    0x48000FF9, // 0xE008 bl   -> 0xF000
+    0x38C00009, // 0xE00C li   r6, 9
+    0x00000000, // 0xE010 illegal, the program stops here
+};
+static const uint32_t twice_callee_code[] = {
+    0x38800007, // 0xF000 li   r4, 7
+    0x7CA802A6, // 0xF004 mflr r5
+    0x4E800020, // 0xF008 blr
+};
+
+constexpr uint32_t TW_BASE   = 0xE000;
+constexpr uint32_t TW_CALLEE = 0xF000;
+constexpr uint32_t TW_END    = TW_BASE + 0x10;
+
+static SprResult run_twice_code() {
+    for (int i = 0; i < 32; i++) {
+        ppc_state.gpr[i] = 0xC3C30000u | uint32_t(i);
+    }
+    ppc_state.spr[SPR::LR]  = 0;
+    ppc_state.spr[SPR::CTR] = 0;
+    ppc_state.cr  = 0;
+    ppc_state.pc  = TW_BASE;
+    g_icycles     = 0;
+    g_icycles_max = 0;
+    exec_flags    = 0;
+    power_on      = true;
+
+    ppc_exec_until(TW_END);
+
+    SprResult r;
+    for (int i = 0; i < 32; i++) r.regs.gpr[i] = ppc_state.gpr[i];
+    r.regs.pc      = ppc_state.pc;
+    r.regs.retired = g_icycles;
+    r.lr  = ppc_state.spr[SPR::LR];
+    r.ctr = ppc_state.spr[SPR::CTR];
+    r.cr  = ppc_state.cr;
+    return r;
+}
+
+static void test_leaf_called_twice() {
+    for (size_t i = 0; i < sizeof(twice_caller_code) / 4; i++) {
+        mmu_write_vmem<uint32_t>(NO_OPCODE, TW_BASE + uint32_t(i) * 4,
+                                 twice_caller_code[i]);
+    }
+    for (size_t i = 0; i < sizeof(twice_callee_code) / 4; i++) {
+        mmu_write_vmem<uint32_t>(NO_OPCODE, TW_CALLEE + uint32_t(i) * 4,
+                                 twice_callee_code[i]);
+    }
+
+    ppc_jit_disable();
+    SprResult interp = run_twice_code();
+    jit_check(interp.regs.pc == TW_END && interp.regs.retired == 10 &&
+              interp.lr == TW_BASE + 0x0C,
+              "the double call program behaves on the interpreter");
+
+    ppc_jit_enable(JitBackend::threaded);
+    SprResult threaded = run_twice_code();
+    int where = -1;
+    jit_check(same_spr(interp, threaded, &where),
+              "two calls into the same leaf stay exact (threaded)");
+    report_spr(interp, threaded, where, "threaded");
+
+    ppc_jit_disable();
+    ppc_jit_enable(JitBackend::automatic);
+    SprResult native = run_twice_code();
+    where = -1;
+    jit_check(same_spr(interp, native, &where),
+              "two calls into the same leaf stay exact (emitted)");
+    report_spr(interp, native, where, "emitted");
+    ppc_jit_disable();
 }
 
 /*  The XER[CA] family: addc, adde, addic, addic., subfc, subfe, subfic,
@@ -1482,6 +1657,8 @@ int test_jit() {
     test_superblock_subset();
     test_superblock_budget_edge();
     test_cross_page_call();
+    test_leaf_lr_write();
+    test_leaf_called_twice();
     test_carry_subset();
     test_ov_subset();
     test_xform_subset();

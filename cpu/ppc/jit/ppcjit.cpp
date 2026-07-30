@@ -743,6 +743,13 @@ bool ppc_jit_enable(JitBackend choice) {
         }
     }
 
+    if (const char* bf = getenv("DPPC_JIT_BLRFOLLOW")) {
+        dppc_jit::jit_blr_follow = strtol(bf, nullptr, 0) != 0;
+        if (!dppc_jit::jit_blr_follow) {
+            LOG_F(INFO, "JIT: leaf blr dissolve off");
+        }
+    }
+
     if (const char* heat = getenv("DPPC_JIT_HEAT")) {
         const long n = strtol(heat, nullptr, 0);
         if (n >= 0 && n <= 1000000) {

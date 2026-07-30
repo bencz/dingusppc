@@ -975,6 +975,14 @@ bool translate_block(uint32_t virt_addr, uint32_t phys_addr, const uint8_t* code
     int32_t off       = 0;
     bool    in_second = false;
 
+    // a cross page walk into a leaf remembers where the call returns to;
+    // while nothing in the callee writes LR, the leaf's own blr provably
+    // targets that spot and can dissolve into straight line decoding
+    bool           second_used = false;
+    bool           lr_known    = false;
+    const uint8_t* ret_host    = nullptr;
+    int32_t        ret_off     = 0;
+
     for (uint32_t i = 0; i < jit_max_block_insns; i++) {
         uint32_t raw = ppc_read_instruction(host);
 
@@ -1014,6 +1022,8 @@ bool translate_block(uint32_t virt_addr, uint32_t phys_addr, const uint8_t* code
                 // entered through any mapping of its page, and this LR is
                 // an address the guest computes with
                 b.store_spr(SPR::LR, b.pc_rel(off + 4));
+                if (in_second)
+                    lr_known = false;
             }
             if (in_second) {
                 out.second_size = uint32_t(off - out.second_off) + 4;
@@ -1037,7 +1047,7 @@ bool translate_block(uint32_t virt_addr, uint32_t phys_addr, const uint8_t* code
         uint32_t cross_to;
         if (jit_superblocks && jit_cross_follow &&
             (jit_decode_groups & JIT_DECODE_BRANCH) &&
-            !in_second && i + 1 < jit_max_block_insns &&
+            !second_used && i + 1 < jit_max_block_insns &&
             cross_target(raw, cur_va, &cross_to)) {
             uint32_t       tphys;
             const uint8_t* thost;
@@ -1046,6 +1056,10 @@ bool translate_block(uint32_t virt_addr, uint32_t phys_addr, const uint8_t* code
                 if (raw & 1) {
                     b.store_spr(SPR::LR, b.pc_rel(off + 4));
                 }
+                second_used = true;
+                lr_known    = (raw & 1) != 0;
+                ret_host    = host + 4;
+                ret_off     = off + 4;
                 out.byte_size = uint32_t(off) + 4;
                 out.end_off   = off + 4;
                 out.insn_count++;
@@ -1064,10 +1078,35 @@ bool translate_block(uint32_t virt_addr, uint32_t phys_addr, const uint8_t* code
             }
         }
 
+        // the return of a walked leaf: nothing between the call and this blr
+        // wrote LR, so its target is provably the call's own return address.
+        // The blr retires without emitting anything and decoding resumes at
+        // the caller's next instruction, dissolving the bl/blr pair. The
+        // return spot has to be on the caller's own page or the first
+        // region's envelope would leak across pages, and consumed means
+        // consumed: a later blr sees an unknown LR again
+        if (in_second && lr_known && jit_blr_follow &&
+            i + 1 < jit_max_block_insns &&
+            primary_op(raw) == 19 && ext_op(raw) == 16 &&
+            ((raw >> 21) & 0x14) == 0x14 && !(raw & 1) &&
+            ((virt_addr + uint32_t(ret_off)) & ~PPC_PAGE_MASK) != 0) {
+            out.second_size = uint32_t(off - out.second_off) + 4;
+            out.end_off     = ret_off;
+            out.insn_count++;
+            out.end_word    = raw;
+            in_second = false;
+            lr_known  = false;
+            host = ret_host;
+            off  = ret_off;
+            continue;
+        }
+
         // a forward conditional branch becomes a side exit and decoding
         // continues at its fall through, which is the measured hot side
         if (jit_superblocks && (jit_decode_groups & JIT_DECODE_BRANCH) &&
             side_exit_bc(raw)) {
+            if (in_second && (raw & 1))
+                lr_known = false;
             b.branch_side_exit((raw >> 21) & 0x1F, (raw >> 16) & 0x1F,
                                raw & 1, uint32_t(int32_t(int16_t(raw & ~3UL))));
             if (in_second) {
@@ -1085,6 +1124,13 @@ bool translate_block(uint32_t virt_addr, uint32_t phys_addr, const uint8_t* code
                 break;
             }
             continue;
+        }
+
+        // a write into LR anywhere in the callee turns the eventual blr
+        // back into an ordinary computed branch
+        if (in_second && primary_op(raw) == 31 && ext_op(raw) == 467 &&
+            (((raw >> 16) & 0x1F) | (((raw >> 11) & 0x1F) << 5)) == SPR::LR) {
+            lr_known = false;
         }
 
         // the groups are switchable so a misbehaviour can be bisected against

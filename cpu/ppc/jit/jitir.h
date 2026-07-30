@@ -377,6 +377,11 @@ extern bool jit_superblocks;
     branch ending its block while the same page superblocks stay on */
 extern bool jit_cross_follow;
 
+/** Whether the blr of a walked leaf may dissolve into straight line
+    decoding when LR provably holds the call's return address.
+    DPPC_JIT_BLRFOLLOW=0 keeps every leaf blr ending its block */
+extern bool jit_blr_follow;
+
 /** Settles the retired count before every call into a helper rather than only
     before the ones that read virtual time.
 
