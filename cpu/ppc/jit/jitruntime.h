@@ -38,12 +38,38 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #define PPC_JIT_RUNTIME_H
 
 #include "../ppcemu.h"
+#include "../ppcmmu.h"
 
 #include <cinttypes>
 
 namespace dppc_jit {
 
 struct JitBlock;
+
+/** Nothrow peek at the primary ITLB: does fetching at `va` translate to the
+    physical page `phys_page` right now. The same three compares the emitted
+    seam guard makes, shared by the threaded backend's ItransGuard and by
+    the translator asking whether a cross page walk through is warm enough
+    to attempt. A cold entry answers no, which is never wrong, only slow */
+inline bool itlb1_covers(uint32_t va, uint32_t phys_page) {
+    const TLBEntry& e = pCurITLB1[(va >> PPC_PAGE_SIZE_BITS) & tlb_size_mask];
+    return e.tag == ((va & PPC_PAGE_MASK) | g_itlb_epoch) &&
+           e.phys_tag == phys_page;
+}
+
+/** The discovery flavour: what physical page and host memory does fetching
+    at `va` name right now, warm entries backed by plain memory only. The
+    translator uses it to decide a cross page walk through; anything cold,
+    MMIO or unmapped declines, and the block ends at the branch as always */
+inline bool itlb1_peek(uint32_t va, uint32_t* phys_page, const uint8_t** host) {
+    const TLBEntry& e = pCurITLB1[(va >> PPC_PAGE_SIZE_BITS) & tlb_size_mask];
+    if (e.tag != ((va & PPC_PAGE_MASK) | g_itlb_epoch) || !(e.flags & PAGE_MEM)) {
+        return false;
+    }
+    *phys_page = e.phys_tag;
+    *host      = reinterpret_cast<const uint8_t*>(uintptr_t(int64_t(va) + e.host_va_offs_r));
+    return true;
+}
 
 /** One chain slot's registry entry, embedded in the slot it describes.
 

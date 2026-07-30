@@ -285,6 +285,9 @@ public:
         blk->phys_addr  = ir.phys_addr;
         blk->mode       = ir.mode;
         blk->byte_size  = ir.byte_size;
+        blk->end_off    = ir.end_off;
+        blk->second_phys = ir.second_phys;
+        blk->second_size = ir.second_size;
         blk->insn_count = ir.insn_count;
         blk->end_reason = uint8_t(ir.end_reason);
         blk->entry      = this->trampoline;
@@ -297,10 +300,10 @@ public:
         blk->chained_next = nullptr;
 
         if (FILE* f = map_log()) [[unlikely]] {
-            fprintf(f, "%llx %zx %u %u %08x %08x\n",
+            fprintf(f, "%llx %zx %u %u %08x %08x %x\n",
                     (unsigned long long)(uintptr_t)dst, this->asmb.size(),
                     ir.insn_count, unsigned(ir.end_reason), ir.virt_addr,
-                    ir.end_word);
+                    ir.end_word, ir.byte_size);
         }
 
         return blk;
@@ -392,6 +395,14 @@ private:
                 continue;
             }
 
+            if (in.opcode == IROpcode::ItransGuard) {
+                this->emit_itrans_guard(in);
+                // the probe scratches RAX, RDX and the scratch register;
+                // the builder invalidated its cache to match
+                free_mask = this->pool;
+                continue;
+            }
+
             if (in.opcode == IROpcode::AddCA || in.opcode == IROpcode::AddECA ||
                 in.opcode == IROpcode::SubCA || in.opcode == IROpcode::SubECA) {
                 if (!this->emit_carry(in, i, free_mask)) {
@@ -434,14 +445,14 @@ private:
                                ir.end_reason == BlockEnd::PageEnd;
         bool tail_done = false;
         if (ir.end_reason == BlockEnd::Branch || ir.end_reason == BlockEnd::SizeLimit) {
-            tail_done = this->emit_chained_exit(int32_t(ir.byte_size), tail_retired);
+            tail_done = this->emit_chained_exit(ir.end_off, tail_retired);
         }
         if (!tail_done && mode_safe) {
-            this->asmb.lea_reg_mem(RDX, REG_ENTRYPC, int32_t(ir.byte_size));
+            this->asmb.lea_reg_mem(RDX, REG_ENTRYPC, ir.end_off);
             tail_done = this->emit_va_chained_exit(tail_retired);
         }
         if (!tail_done) {
-            this->emit_exit(int32_t(ir.byte_size), tail_retired);
+            this->emit_exit(ir.end_off, tail_retired);
         }
 
         this->emit_cold_exits(ret);
@@ -643,6 +654,64 @@ private:
         this->asmb.mov_mem64_abs_reg(gen, RAX);
         this->asmb.xor_reg_reg32(REG_RETIRED, REG_RETIRED);
         this->asmb.jmp_mem_abs(code);
+    }
+
+    /** The seam of a cross page walk through: the same primary ITLB probe
+        the address predicted chains revalidate with, against an expected
+        physical page known at translate time. Passing falls through into
+        the callee's instructions; failing leaves through a plain exit with
+        pc on the branch target and everything before the seam retired, and
+        the dispatcher redoes the fetch honestly. No IR value is live here,
+        the builder saw to that */
+    void emit_itrans_guard(const IRInsn& in) {
+        X64Emitter::Label fail = this->asmb.new_label();
+        X64Emitter::Label ok   = this->asmb.new_label();
+
+        // the generation stamp is the hot path: while nothing that affects
+        // instruction translation has happened, the seam costs one warm
+        // compare instead of a walk into the cold ITLB array. Probing every
+        // pass was measured 8% down on the plateau, which is this whole
+        // exit's budget several times over
+        uint64_t* seam_gen =
+            reinterpret_cast<uint64_t*>(this->code.slot_alloc(8, 8));
+        if (seam_gen) {
+            *seam_gen = 0; // stale until the first pass proves the mapping
+            this->asmb.mov_reg64_mem_abs(RAX, seam_gen);
+            this->asmb.cmp_reg64_mem(RAX, REG_TIME, this->gen_disp);
+            this->asmb.jcc(X64Cond::Equal, ok);
+        }
+
+        this->asmb.lea_reg_mem(RDX, REG_ENTRYPC, in.offset);
+
+        // entry = pCurITLB1 + ((va >> 12) & tlb_size_mask) * sizeof(TLBEntry)
+        this->asmb.mov_reg_reg32(RAX, RDX);
+        this->asmb.shr_reg_imm8(RAX, PPC_PAGE_SIZE_BITS);
+        this->asmb.and_reg_imm32(RAX, TLB_SIZE - 1);
+        this->asmb.shl_reg_imm8(RAX, TLB_ENTRY_SHIFT);
+        this->asmb.mov_reg_imm64(REG_SCRATCH, uint64_t(uintptr_t(&pCurITLB1)));
+        this->asmb.add_reg64_mem(RAX, REG_SCRATCH, 0);
+
+        // fresh under the current epoch, and still the physical page the
+        // walk through was translated against?
+        this->asmb.mov_reg_reg32(REG_SCRATCH, RDX);
+        this->asmb.and_reg_imm32(REG_SCRATCH, PPC_PAGE_MASK);
+        this->asmb.or_reg_mem32(REG_SCRATCH, REG_TIME, this->iepoch_disp);
+        this->asmb.cmp_mem_reg32(RAX, TLB_TAG_OFFSET, REG_SCRATCH);
+        this->asmb.jcc(X64Cond::NotEqual, fail);
+        this->asmb.mov_reg_mem32(REG_SCRATCH, RAX, TLB_PHYS_OFFSET);
+        this->asmb.cmp_reg_imm32(REG_SCRATCH, int32_t(in.imm));
+        this->asmb.jcc(X64Cond::NotEqual, fail);
+
+        // proven: remember under which generation, so the next pass skips
+        if (seam_gen) {
+            this->asmb.mov_reg64_mem(RAX, REG_TIME, this->gen_disp);
+            this->asmb.mov_mem64_abs_reg(seam_gen, RAX);
+        }
+        this->asmb.jmp(ok);
+
+        this->asmb.bind(fail);
+        this->emit_exit(in.offset, in.insn_idx - this->accounted);
+        this->asmb.bind(ok);
     }
 
     /** One resolver per chained exit, emitted with the block and pointed at

@@ -985,6 +985,110 @@ static void test_superblock_budget_edge() {
     ppc_jit_disable();
 }
 
+/*  A call into another page, walked through into one block guarded by an
+    ItransGuard at the seam. Three things have to hold: the walked block
+    agrees with the interpreter, a store into the CALLEE page kills it
+    through its second invalidation range, and a flushed ITLB entry makes
+    the seam guard fail into an honest fetch instead of running stale.  */
+static const uint32_t cross_caller_code[] = {
+    0x38600005, // 0xA000 li   r3, 5
+    0x48000FFD, // 0xA004 bl   -> 0xB000
+    0x38C00009, // 0xA008 li   r6, 9          <- blr comes back here
+    0x00000000, // 0xA00C illegal, the program stops here
+};
+static const uint32_t cross_callee_code[] = {
+    0x38800007, // 0xB000 li   r4, 7
+    0x7CA802A6, // 0xB004 mflr r5             r5 = 0xA008
+    0x4E800020, // 0xB008 blr
+};
+
+constexpr uint32_t CC_BASE   = 0xA000;
+constexpr uint32_t CC_CALLEE = 0xB000;
+constexpr uint32_t CC_END    = CC_BASE + 0x0C;
+constexpr uint64_t CC_RETIRED = 6;
+
+static void load_cross_code() {
+    for (size_t i = 0; i < sizeof(cross_caller_code) / 4; i++) {
+        mmu_write_vmem<uint32_t>(NO_OPCODE, CC_BASE + uint32_t(i) * 4,
+                                 cross_caller_code[i]);
+    }
+    for (size_t i = 0; i < sizeof(cross_callee_code) / 4; i++) {
+        mmu_write_vmem<uint32_t>(NO_OPCODE, CC_CALLEE + uint32_t(i) * 4,
+                                 cross_callee_code[i]);
+    }
+}
+
+static SprResult run_cross_code() {
+    for (int i = 0; i < 32; i++) {
+        ppc_state.gpr[i] = 0xC3C30000u | uint32_t(i);
+    }
+    ppc_state.spr[SPR::LR]  = 0;
+    ppc_state.spr[SPR::CTR] = 0;
+    ppc_state.cr  = 0;
+    ppc_state.pc  = CC_BASE;
+    g_icycles     = 0;
+    g_icycles_max = 0;
+    exec_flags    = 0;
+    power_on      = true;
+
+    ppc_exec_until(CC_END);
+
+    SprResult r;
+    for (int i = 0; i < 32; i++) r.regs.gpr[i] = ppc_state.gpr[i];
+    r.regs.pc      = ppc_state.pc;
+    r.regs.retired = g_icycles;
+    r.lr  = ppc_state.spr[SPR::LR];
+    r.ctr = ppc_state.spr[SPR::CTR];
+    r.cr  = ppc_state.cr;
+    return r;
+}
+
+static void test_cross_page_call() {
+    load_cross_code();
+
+    ppc_jit_disable();
+    SprResult interp = run_cross_code();
+    jit_check(interp.regs.pc == CC_END && interp.regs.retired == CC_RETIRED,
+              "the cross page call program behaves on the interpreter");
+
+    ppc_jit_enable(JitBackend::threaded);
+    SprResult threaded = run_cross_code();
+    int where = -1;
+    jit_check(same_spr(interp, threaded, &where),
+              "the threaded backend agrees on the cross page call");
+    report_spr(interp, threaded, where, "threaded");
+
+    ppc_jit_disable();
+    ppc_jit_enable(JitBackend::automatic);
+    SprResult native = run_cross_code();
+    where = -1;
+    jit_check(same_spr(interp, native, &where),
+              "emitted code agrees on the cross page call");
+    report_spr(interp, native, where, "emitted");
+
+    if (ppc_jit_native_compiles() == 0) {
+        return; // no emitter on this host, the rest probes emitted paths
+    }
+
+    // a store into the CALLEE page has to reach the walked through block
+    // through its second invalidation range: rerunning must see the new
+    // value, and a stale 7 here means the range dangled
+    mmu_write_vmem<uint32_t>(NO_OPCODE, CC_CALLEE, 0x38800008); // li r4, 8
+    SprResult patched = run_cross_code();
+    jit_check(patched.regs.gpr[4] == 8 && patched.regs.retired == CC_RETIRED,
+              "a store into the callee page invalidates the walked through block");
+
+    // with the callee's ITLB entry flushed, the seam guard must fail into
+    // an honest fetch and still come out with the interpreter's answer
+    mmu_write_vmem<uint32_t>(NO_OPCODE, CC_CALLEE, 0x38800007);
+    tlb_flush_entry(CC_CALLEE);
+    SprResult reguarded = run_cross_code();
+    where = -1;
+    jit_check(same_spr(interp, reguarded, &where),
+              "a failed seam guard falls back to an honest fetch");
+    report_spr(interp, reguarded, where, "reguarded");
+}
+
 /*  The XER[CA] family: addc, adde, addic, addic., subfc, subfe, subfic,
     addze and subf, with the carry chaining from one into the next and the
     forms with both operands in the same register, which are the ones that
@@ -1377,6 +1481,7 @@ int test_jit() {
     test_branch_subset();
     test_superblock_subset();
     test_superblock_budget_edge();
+    test_cross_page_call();
     test_carry_subset();
     test_ov_subset();
     test_xform_subset();

@@ -62,7 +62,14 @@ struct JitBlock {
     uint32_t    virt_addr;  // where the block starts
     uint32_t    phys_addr;  // the invalidation key, see ppccodecache.h
     uint32_t    mode;       // ppc_jit_mode() the block was translated under
-    uint32_t    byte_size;  // guest bytes covered
+    uint32_t    byte_size;  // guest bytes covered on the entry's page
+    int32_t     end_off;    // one past the last instruction, the fall off PC
+
+    /** The second invalidation range a cross page walk through registers,
+        zero size when the block never left its page */
+    uint32_t    second_phys;
+    uint32_t    second_size;
+
     uint32_t    insn_count; // guest instructions covered
     uint8_t     end_reason; // BlockEnd, for diagnostics
     BlockEntry  entry;

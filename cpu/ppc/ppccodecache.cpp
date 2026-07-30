@@ -108,14 +108,15 @@ bool ppc_code_cache_page_is_protected(uint32_t phys_addr) {
     return protected_pages.find(phys_addr & PPC_PAGE_MASK) != protected_pages.end();
 }
 
-void ppc_code_cache_replace(uint32_t phys_addr, CodeBlockHandle from, CodeBlockHandle to) {
+void ppc_code_cache_remove(uint32_t phys_addr, CodeBlockHandle handle) {
     auto it = blocks_by_page.find(phys_addr & PPC_PAGE_MASK);
     if (it == blocks_by_page.end()) {
         return;
     }
     for (CodeBlock& blk : it->second) {
-        if (blk.handle == from) {
-            blk.handle = to;
+        if (blk.handle == handle) {
+            blk.handle = nullptr;
+            ppc_code_cache_count--;
             return;
         }
     }
@@ -147,8 +148,15 @@ unsigned ppc_code_cache_invalidate(uint32_t phys_addr, uint32_t size) {
             auto& page_blocks = it->second;
             for (size_t i = 0; i < page_blocks.size();) {
                 const CodeBlock& blk = page_blocks[i];
-                if (blk.start <= last && blk.end > phys_addr) {
+                if (!blk.handle) {
+                    // a tombstone left by ppc_code_cache_remove; the count
+                    // was already adjusted when it died
+                    page_blocks[i] = page_blocks.back();
+                    page_blocks.pop_back();
+                } else if (blk.start <= last && blk.end > phys_addr) {
                     if (release_cb) {
+                        // may tombstone other entries, this one included;
+                        // the removal below does not care either way
                         release_cb(blk.handle);
                     }
                     page_blocks[i] = page_blocks.back();
@@ -177,7 +185,9 @@ unsigned ppc_code_cache_invalidate_all() {
     if (release_cb) {
         for (auto& page : blocks_by_page) {
             for (auto& blk : page.second) {
-                release_cb(blk.handle);
+                if (blk.handle) {
+                    release_cb(blk.handle);
+                }
             }
         }
     }

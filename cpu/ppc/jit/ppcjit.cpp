@@ -213,8 +213,26 @@ void unbind_all_chains() {
     chain_refs   = 0;
 }
 
+/** Registers a block's invalidation ranges, the cross page walk through's
+    second one included */
+void register_ranges(JitBlock* blk) {
+    ppc_code_cache_add(blk->phys_addr, blk->byte_size,
+                       static_cast<CodeBlockHandle>(blk));
+    if (blk->second_size) {
+        ppc_code_cache_add(blk->second_phys, blk->second_size,
+                           static_cast<CodeBlockHandle>(blk));
+    }
+}
+
 void on_block_released(CodeBlockHandle handle) {
     JitBlock* blk = static_cast<JitBlock*>(handle);
+    if (blk->second_size) [[unlikely]] {
+        // both registrations die with the block. Whichever one the
+        // invalidation walk is standing on only gets tombstoned, which the
+        // walk survives; the other would dangle without this
+        ppc_code_cache_remove(blk->phys_addr, handle);
+        ppc_code_cache_remove(blk->second_phys, handle);
+    }
     unbind_chains_to(blk);
     cache_forget(blk);
     pending_free.push_back(blk);
@@ -293,8 +311,7 @@ JitBlock* promote_block(JitBlock* blk, uint32_t virt_addr, uint32_t phys_addr,
         native_compiles++;
         nblk->owner = native_backend.get();
         cache_insert(nblk);
-        ppc_code_cache_add(nblk->phys_addr, nblk->byte_size,
-                           static_cast<CodeBlockHandle>(nblk));
+        register_ranges(nblk);
         return nblk;
     }
     if (!nblk) {
@@ -306,8 +323,15 @@ JitBlock* promote_block(JitBlock* blk, uint32_t virt_addr, uint32_t phys_addr,
 
     cache_forget(blk);
     cache_insert(nblk);
-    ppc_code_cache_replace(blk->phys_addr, static_cast<CodeBlockHandle>(blk),
-                           static_cast<CodeBlockHandle>(nblk));
+    // not a swap in place: the retranslation may cover different ground
+    // than the threaded original did, a cross page walk through forming
+    // once the target's translation warmed up being the usual way, so the
+    // old ranges go and the new ones are registered from scratch
+    ppc_code_cache_remove(blk->phys_addr, static_cast<CodeBlockHandle>(blk));
+    if (blk->second_size) {
+        ppc_code_cache_remove(blk->second_phys, static_cast<CodeBlockHandle>(blk));
+    }
+    register_ranges(nblk);
     blk->owner->release(blk); // a threaded payload is plain heap, and the
                               // block is not executing at any promotion site
     return nblk;
@@ -388,7 +412,7 @@ JitBlock* find_or_translate(uint32_t virt_addr, bool allow_flush) {
     blk->owner = owner;
 
     cache_insert(blk);
-    ppc_code_cache_add(blk->phys_addr, blk->byte_size, static_cast<CodeBlockHandle>(blk));
+    register_ranges(blk);
     return blk;
 }
 
@@ -467,8 +491,21 @@ void trace_dump() {
     whatever goal was asked for, such a block is stepped through on the
     interpreter */
 bool goal_splits_block(const JitBlock* blk, uint32_t entry_pc) {
-    return run_type == JitExecType::until &&
-           run_goal > entry_pc && run_goal < entry_pc + blk->byte_size;
+    if (run_type != JitExecType::until) {
+        return false;
+    }
+    // conservative both ways: gaps a walk through skipped count as covered
+    if (run_goal > entry_pc && run_goal < entry_pc + blk->byte_size) {
+        return true;
+    }
+    // the callee region of a cross page walk through, by its guest address;
+    // a block with one always ends inside it, so its start is end_off minus
+    // its size, and modular arithmetic keeps a backward call honest
+    if (blk->second_size) {
+        const uint32_t s = entry_pc + uint32_t(blk->end_off) - blk->second_size;
+        return run_goal - s < blk->second_size;
+    }
+    return false;
 }
 
 /** One instruction on the interpreter, for whatever no backend took.
@@ -696,6 +733,13 @@ bool ppc_jit_enable(JitBackend choice) {
         dppc_jit::jit_superblocks = strtol(sb, nullptr, 0) != 0;
         if (!dppc_jit::jit_superblocks) {
             LOG_F(INFO, "JIT: superblocks off, every branch ends its block");
+        }
+    }
+
+    if (const char* cx = getenv("DPPC_JIT_CROSS")) {
+        dppc_jit::jit_cross_follow = strtol(cx, nullptr, 0) != 0;
+        if (!dppc_jit::jit_cross_follow) {
+            LOG_F(INFO, "JIT: cross page walk through off");
         }
     }
 

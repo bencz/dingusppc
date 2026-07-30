@@ -102,6 +102,18 @@ enum class IROpcode : uint8_t {
         code the moment the kernel mapped a page somewhere new */
     PcRel,     // entry pc + imm -> dest
 
+    /** The seam of a cross page walk through: proves that fetching at
+        entry + offset still names the physical page in imm, by the same
+        primary ITLB compare the address predicted chains revalidate with.
+        Passing falls through into the instructions walked in from the other
+        page; failing leaves the block with pc = entry + offset and insn_idx
+        retired, exactly the state after the branch and before its target,
+        and the dispatcher redoes the fetch the honest way. The mapping is
+        the only thing guarded because it is the only thing that can move:
+        the bytes themselves are guarded by the second invalidation range
+        the block registers */
+    ItransGuard, // no value; imm holds the physical page
+
     // integer arithmetic and logic
     Add,       // a + b        -> dest
     Sub,       // a - b        -> dest
@@ -219,14 +231,18 @@ typedef struct IRInsn {
     IROpcode opcode;
     uint8_t  flags;
 
-    /** Bytes from the start of the block, not an address.
+    /** Bytes from the start of the block, not an address, and signed: a
+        walked through cross page call puts instructions megabytes ahead of
+        or behind the entry.
 
         Blocks are keyed by physical address, so the same block can be entered
         through more than one virtual mapping of the page it lives on. Nothing
         a backend keeps may be an absolute virtual address for that reason; the
         one the block was translated through is in IRBlock::virt_addr and is
-        good for diagnostics only */
-    uint16_t offset;
+        good for diagnostics only. The guest itself computes branch targets
+        relative to where the code runs, which is what makes entry relative
+        offsets exact under any mapping */
+    int32_t  offset;
 
     /** Guest instructions retired before this one, for the cycle accounting.
         This used to be offset / 4 until the translator learned to walk
@@ -280,7 +296,23 @@ typedef struct IRBlock {
     uint32_t virt_addr;
     uint32_t phys_addr;
     uint32_t mode;
+
+    /** Bytes covered on the entry's page, the invalidation range there */
     uint32_t byte_size;
+
+    /** One past the last decoded instruction, as a delta from the entry.
+        This is what the fall off the end exits resume at, and it stopped
+        being byte_size when a cross page walk through put the last
+        instruction on another page entirely */
+    int32_t  end_off;
+
+    /** The other page a cross page walk through pulled instructions from,
+        zero size when there is none. The block registers this second range
+        with the code cache, so a store into the callee kills it just as a
+        store into the entry page does */
+    uint32_t second_phys;
+    int32_t  second_off;
+    uint32_t second_size;
 
     /** Guest instructions covered, which is no longer insns.size(): one guest
         instruction can decode into several IR instructions, and a guest
@@ -339,6 +371,11 @@ extern uint32_t jit_decode_groups;
     misbehaving boot: every branch goes back to ending its block while
     every other layer stays exactly as it was */
 extern bool jit_superblocks;
+
+/** The cross page kind specifically: walking through b and bl into another
+    page behind an ItransGuard. DPPC_JIT_CROSS=0 keeps every cross page
+    branch ending its block while the same page superblocks stay on */
+extern bool jit_cross_follow;
 
 /** Settles the retired count before every call into a helper rather than only
     before the ones that read virtual time.

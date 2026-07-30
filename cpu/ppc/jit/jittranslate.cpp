@@ -30,6 +30,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include "jitir.h"
+#include "jitruntime.h"
 #include "../ppcemu.h"
 #include "../ppcmmu.h"
 
@@ -104,16 +105,16 @@ bool is_branch(uint32_t opcode) {
     Three fences, each load bearing. Relative only: the block cache is keyed
     by physical address, so a block entered through another mapping of the
     page still has every relative target at the same offset, while an
-    absolute target could name different memory entirely. Same page only:
-    the host pointer and the invalidation key stop at the page edge. Forward
-    only: covered bytes stay inside [virt_addr, virt_addr + byte_size), so
-    the invalidation range stays one honest interval, and the instruction
+    absolute target could name different memory entirely. Same page only,
+    the page being the one the branch itself is on: the host pointer and
+    the region's invalidation envelope stop at its edge. Forward only:
+    covered bytes stay one honest interval per region, and the instruction
     budget alone bounds the walk, self loops included.
 
     The LK forms still write LR, which makes bcl 20,31,$+4, the idiom
     position independent code reads its own address with, dissolve into a
-    plain constant store */
-bool follow_target(uint32_t op, uint32_t pc, uint32_t entry, uint32_t* target) {
+    plain store of PcRel */
+bool follow_target(uint32_t op, uint32_t pc, uint32_t* target) {
     uint32_t t;
     switch (primary_op(op)) {
     case 18: { // b and bl, relative
@@ -134,19 +135,101 @@ bool follow_target(uint32_t op, uint32_t pc, uint32_t entry, uint32_t* target) {
     default:
         return false;
     }
-    if (((t ^ entry) & PPC_PAGE_MASK) != 0 || t <= pc) {
+    if (((t ^ pc) & PPC_PAGE_MASK) != 0 || t <= pc) {
         return false;
     }
     *target = t;
     return true;
 }
 
-/** Whether the instruction at byte offset `off` has no translation at all,
-    which is what makes a walk through to it unsound: the block would end
-    before its own tail knows the branch was taken */
-bool target_is_illegal(const uint8_t* code, uint32_t off) {
-    const uint32_t raw = ppc_read_instruction(code + off);
+/** A b or bl whose relative target sits on another page, the shape of every
+    function call that matters: measured at 27% of the Cheetah storm's
+    emitted code time, same page calls being 1.4%. Walking through it needs
+    the seam guarded at run time, because which physical page the target
+    names can change; the guard is ItransGuard and the caller decides
+    whether the target is warm enough to try. Any direction: each region
+    keeps its own forward envelope, so a backward call breaks nothing */
+bool cross_target(uint32_t op, uint32_t pc, uint32_t* target) {
+    if (primary_op(op) != 18 || (op & 2)) {
+        return false;
+    }
+    int32_t li = int32_t((op & ~3UL) << 6) >> 6;
+    const uint32_t t = pc + uint32_t(li);
+    if (((t ^ pc) & PPC_PAGE_MASK) == 0) {
+        return false;
+    }
+    *target = t;
+    return true;
+}
+
+/** Whether the instruction at `host` has no translation at all, which is
+    what makes a walk through to it unsound: the block would end before its
+    own tail knows the branch was taken */
+bool target_is_illegal(const uint8_t* host) {
+    const uint32_t raw = ppc_read_instruction(host);
     return ppc_opcode_grabber[(raw >> 15 & 0x1F800) | (raw & 0x7FF)] == ppc_illegalop;
+}
+
+/** Whether the code at `host` reaches something that ends a block within
+    `budget` instructions, mirroring the translator's own decisions without
+    emitting anything.
+
+    This is the fitness test for a cross page walk through, and it exists
+    because walking into a callee that does NOT fit shattered the boot:
+    the budget ran out mid function, the remainder became its own block
+    entered at an offset no other caller shares, and the block population
+    doubled while the plateau lost 10%. A callee that runs to its blr keeps
+    the superblock whole and the return slot monomorphic.
+
+    Conservative mirror: forward conditional bc continues (the translator
+    side exits it), a same page forward always branch moves the scan the
+    way the walk through would, and everything else that is a branch, a
+    context sync or an untranslatable word ends the scan with success or
+    failure as the translator would end the block */
+bool side_exit_bc(uint32_t op);
+bool ends_context(uint32_t opcode);
+
+/** How small a callee has to be for a cross page walk through to pay.
+    Measured the other way first: walking into everything that fit the
+    block budget lost 6% of the plateau to duplicated code and cold private
+    exits, so only the tiny leaf shape, the position independent helpers a
+    call storm is made of, gets inlined */
+constexpr uint32_t CROSS_LEAF_INSNS = 12;
+
+bool callee_fits(const uint8_t* host, uint32_t va, uint32_t budget) {
+    if (budget > CROSS_LEAF_INSNS) {
+        budget = CROSS_LEAF_INSNS;
+    }
+    for (uint32_t k = 0; k < budget; k++) {
+        const uint32_t raw = ppc_read_instruction(host);
+        if (ppc_opcode_grabber[(raw >> 15 & 0x1F800) | (raw & 0x7FF)] == ppc_illegalop) {
+            return false; // would end mid walk with the tail pointing wrong
+        }
+        uint32_t t;
+        if (follow_target(raw, va, &t)) {
+            host += t - va;
+            va = t;
+            continue;
+        }
+        if (side_exit_bc(raw)) {
+            host += 4;
+            va   += 4;
+            continue;
+        }
+        if (primary_op(raw) == 19 && ext_op(raw) == 16 &&
+            ((raw >> 21) & 0x14) == 0x14 && !(raw & 1)) {
+            return true; // a plain blr: the leaf ends on its own terms
+        }
+        if (is_branch(raw) || ends_context(raw)) {
+            return false; // anything else is not the leaf shape
+        }
+        host += 4;
+        va   += 4;
+        if ((va & ~PPC_PAGE_MASK) == 0) {
+            return false;
+        }
+    }
+    return false; // too big to be the leaf this is for
 }
 
 /** A conditional branch worth turning into a side exit rather than a block
@@ -416,6 +499,15 @@ public:
         this->invalidate();
     }
 
+    /** The seam of a cross page walk through. The emitted probe scratches
+        registers, so the cache rule is the same as for a call */
+    void guard_itrans(uint32_t phys_page) {
+        IRInsn in = blank(IROpcode::ItransGuard);
+        in.imm    = phys_page;
+        this->out.append(in);
+        this->invalidate();
+    }
+
     void call(PPCOpcode helper, uint32_t raw, uint8_t flags) {
         IRInsn in  = blank(IROpcode::Call);
         in.helper  = helper;
@@ -425,8 +517,8 @@ public:
         this->invalidate();
     }
 
-    void set_position(uint32_t off, uint32_t idx) {
-        this->offset   = uint16_t(off);
+    void set_position(int32_t off, uint32_t idx) {
+        this->offset   = off;
         this->insn_idx = uint16_t(idx);
     }
 
@@ -450,7 +542,7 @@ private:
 
     IRBlock& out;
     IRValue  cache[32];
-    uint16_t offset   = 0;
+    int32_t  offset   = 0;
     uint16_t insn_idx = 0;
 };
 
@@ -872,16 +964,19 @@ bool translate_block(uint32_t virt_addr, uint32_t phys_addr, const uint8_t* code
     out.reset(virt_addr, phys_addr, mode);
     Builder b(out);
 
-    // a block never crosses a page, so the host pointer stays valid for the
-    // whole walk and ppc_code_cache_add gets a range it can key by one page.
-    // The cursor is a byte offset from the entry because a walked through
-    // branch moves it by more than 4; reset() preset SizeLimit, so running
-    // out of budget needs no store here
-    const uint32_t page_limit = PPC_PAGE_SIZE - (virt_addr & ~PPC_PAGE_MASK);
-    uint32_t off = 0;
+    // the cursor is a host pointer and an entry relative delta moving in
+    // lockstep. A same page walk through moves both by the same bytes; the
+    // cross page kind rebases the host side onto the callee's page while
+    // the delta keeps telling the truth about the guest address. Each
+    // region's coverage grows forward only, so both invalidation ranges
+    // stay honest intervals. reset() preset SizeLimit, so running out of
+    // budget needs no store here
+    const uint8_t* host = code;
+    int32_t off       = 0;
+    bool    in_second = false;
 
     for (uint32_t i = 0; i < jit_max_block_insns; i++) {
-        uint32_t raw = ppc_read_instruction(code + off);
+        uint32_t raw = ppc_read_instruction(host);
 
         // resolving the helper through the current table is what makes MSR[FP]
         // part of the block key: the no FPU table maps different functions
@@ -896,34 +991,77 @@ bool translate_block(uint32_t virt_addr, uint32_t phys_addr, const uint8_t* code
         }
 
         b.set_position(off, i);
+        const uint32_t cur_va = virt_addr + uint32_t(off);
 
         // walking through a branch retires it without emitting anything but
         // the LR write, and decoding continues at its target. Gated with the
         // branch group so bisection still sees every branch end its block.
         //
-        // The walk is only sound if at least one instruction gets decoded AT
+        // Any walk is only sound if at least one instruction gets decoded AT
         // the target: a block that ends right after the walk falls off its
-        // end with pc = entry + byte_size, the fall through of the branch,
-        // and an always taken branch resuming at its fall through executes
-        // the very code it jumped over. So a branch in the last budget slot
-        // and a branch whose target will not decode both close the block
-        // the ordinary way instead, whose exit knows the real target
+        // end at the branch's fall through, executing the very code it
+        // jumped over. So a branch in the last budget slot and one whose
+        // target will not decode both close the block the ordinary way,
+        // whose exit knows the real target. The budget edge escaping this
+        // was a real kernel crash, not a nicety
         uint32_t follow_to;
         if (jit_superblocks && (jit_decode_groups & JIT_DECODE_BRANCH) &&
             i + 1 < jit_max_block_insns &&
-            follow_target(raw, virt_addr + off, virt_addr, &follow_to) &&
-            !target_is_illegal(code, follow_to - virt_addr)) {
+            follow_target(raw, cur_va, &follow_to) &&
+            !target_is_illegal(host + (follow_to - cur_va))) {
             if (raw & 1) {
                 // relative to the entry of THIS run: the block can be
                 // entered through any mapping of its page, and this LR is
                 // an address the guest computes with
                 b.store_spr(SPR::LR, b.pc_rel(off + 4));
             }
-            out.byte_size  = off + 4;
+            if (in_second) {
+                out.second_size = uint32_t(off - out.second_off) + 4;
+            } else {
+                out.byte_size = uint32_t(off) + 4;
+            }
+            out.end_off = off + 4;
             out.insn_count++;
             out.end_word = raw;
-            off = follow_to - virt_addr;
+            host += follow_to - cur_va;
+            off  += int32_t(follow_to - cur_va);
             continue;
+        }
+
+        // a call or jump into another page: the shape of every function
+        // call, and 27% of the storm's emitted code time. The walk needs
+        // the target's translation warm and backed by plain memory, and
+        // plants an ItransGuard at the seam so a mapping that moves sends
+        // the run back through an honest fetch. One second region per
+        // block: a further cross branch inside the callee ends it
+        uint32_t cross_to;
+        if (jit_superblocks && jit_cross_follow &&
+            (jit_decode_groups & JIT_DECODE_BRANCH) &&
+            !in_second && i + 1 < jit_max_block_insns &&
+            cross_target(raw, cur_va, &cross_to)) {
+            uint32_t       tphys;
+            const uint8_t* thost;
+            if (itlb1_peek(cross_to, &tphys, &thost) &&
+                callee_fits(thost, cross_to, jit_max_block_insns - (i + 1))) {
+                if (raw & 1) {
+                    b.store_spr(SPR::LR, b.pc_rel(off + 4));
+                }
+                out.byte_size = uint32_t(off) + 4;
+                out.end_off   = off + 4;
+                out.insn_count++;
+                out.end_word = raw;
+
+                const int32_t delta = int32_t(cross_to - virt_addr);
+                b.set_position(delta, i + 1);
+                b.guard_itrans(tphys & PPC_PAGE_MASK);
+
+                out.second_phys = (tphys & PPC_PAGE_MASK) | (cross_to & ~PPC_PAGE_MASK);
+                out.second_off  = delta;
+                in_second = true;
+                host = thost;
+                off  = delta;
+                continue;
+            }
         }
 
         // a forward conditional branch becomes a side exit and decoding
@@ -932,11 +1070,17 @@ bool translate_block(uint32_t virt_addr, uint32_t phys_addr, const uint8_t* code
             side_exit_bc(raw)) {
             b.branch_side_exit((raw >> 21) & 0x1F, (raw >> 16) & 0x1F,
                                raw & 1, uint32_t(int32_t(int16_t(raw & ~3UL))));
-            out.byte_size  = off + 4;
+            if (in_second) {
+                out.second_size = uint32_t(off - out.second_off) + 4;
+            } else {
+                out.byte_size = uint32_t(off) + 4;
+            }
+            out.end_off = off + 4;
             out.insn_count++;
             out.end_word = raw;
             off += 4;
-            if (off >= page_limit) {
+            host += 4;
+            if (((virt_addr + uint32_t(off)) & ~PPC_PAGE_MASK) == 0) {
                 out.end_reason = BlockEnd::PageEnd;
                 break;
             }
@@ -959,7 +1103,12 @@ bool translate_block(uint32_t virt_addr, uint32_t phys_addr, const uint8_t* code
             b.call(helper, raw, sync ? IR_SYNC_CYCLES : 0);
         }
 
-        out.byte_size  = off + 4;
+        if (in_second) {
+            out.second_size = uint32_t(off - out.second_off) + 4;
+        } else {
+            out.byte_size = uint32_t(off) + 4;
+        }
+        out.end_off = off + 4;
         out.insn_count++;
         out.end_word = raw;
 
@@ -973,7 +1122,8 @@ bool translate_block(uint32_t virt_addr, uint32_t phys_addr, const uint8_t* code
         }
 
         off += 4;
-        if (off >= page_limit) {
+        host += 4;
+        if (((virt_addr + uint32_t(off)) & ~PPC_PAGE_MASK) == 0) {
             out.end_reason = BlockEnd::PageEnd;
             break;
         }

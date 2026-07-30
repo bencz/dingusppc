@@ -114,6 +114,18 @@ void threaded_entry(const JitBlock* blk) {
             vals[i] = entry_pc + in.imm;
             break;
 
+        case IROpcode::ItransGuard:
+            // the seam of a cross page walk through: a mapping that moved
+            // ends the block right here, after the branch and before its
+            // target, and the dispatcher redoes the fetch honestly
+            if (!itlb1_covers(entry_pc + uint32_t(in.offset), in.imm)) [[unlikely]] {
+                ppc_next_instruction_address = entry_pc + uint32_t(in.offset);
+                exec_flags = EXEF_BRANCH;
+                retired = in.insn_idx;
+                goto done;
+            }
+            break;
+
         case IROpcode::ConstI32:
             vals[i] = in.imm;
             break;
@@ -356,7 +368,7 @@ void threaded_entry(const JitBlock* blk) {
     }
 
 done:
-    rt_block_end(entry_pc, blk->byte_size, retired - accounted);
+    rt_block_end(entry_pc, uint32_t(blk->end_off), retired - accounted);
 }
 
 class ThreadedBackend : public Backend {
@@ -376,6 +388,9 @@ public:
         blk->phys_addr  = ir.phys_addr;
         blk->mode       = ir.mode;
         blk->byte_size  = ir.byte_size;
+        blk->end_off    = ir.end_off;
+        blk->second_phys = ir.second_phys;
+        blk->second_size = ir.second_size;
         blk->insn_count = ir.insn_count;
         blk->end_reason = uint8_t(ir.end_reason);
         blk->entry      = threaded_entry;

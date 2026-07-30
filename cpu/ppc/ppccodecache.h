@@ -93,10 +93,14 @@ bool ppc_code_cache_page_is_protected(uint32_t phys_addr);
     mapping lets a store slip past the next block unnoticed */
 bool ppc_code_cache_store_to_page(uint32_t phys_addr, uint32_t size);
 
-/** Swaps one registered handle for another without touching the range it
-    covers. This is how a block promoted to a better executor keeps its
-    invalidation registration pointing at the live object */
-void ppc_code_cache_replace(uint32_t phys_addr, CodeBlockHandle from, CodeBlockHandle to);
+/** Forgets one registration of the handle on the page phys_addr names,
+    without running the release callback. The entry is only tombstoned, so
+    calling this from inside the release callback is safe even while an
+    invalidation is walking the very vector the entry lives in; the next
+    walk over that page compacts it away. This is how a block registered on
+    two pages, which a walked through cross page call creates, takes its
+    other registration with it when either page kills it */
+void ppc_code_cache_remove(uint32_t phys_addr, CodeBlockHandle handle);
 
 /** Drops every block overlapping the range and returns how many went away */
 unsigned ppc_code_cache_invalidate(uint32_t phys_addr, uint32_t size);

@@ -29,6 +29,7 @@ uint32_t jit_max_block_insns = JIT_MAX_BLOCK_INSNS;
 uint32_t jit_decode_groups   = JIT_DECODE_ALL;
 bool     jit_sync_every_call = false;
 bool     jit_superblocks     = true;
+bool     jit_cross_follow    = true;
 
 const char* block_end_name(BlockEnd reason) {
     switch (reason) {
@@ -45,10 +46,14 @@ void IRBlock::reset(uint32_t virt, uint32_t phys, uint32_t translation_mode) {
     this->virt_addr  = virt;
     this->phys_addr  = phys;
     this->mode       = translation_mode;
-    this->byte_size  = 0;
-    this->insn_count = 0;
-    this->end_reason = BlockEnd::SizeLimit;
-    this->end_word   = 0;
+    this->byte_size   = 0;
+    this->end_off     = 0;
+    this->second_phys = 0;
+    this->second_off  = 0;
+    this->second_size = 0;
+    this->insn_count  = 0;
+    this->end_reason  = BlockEnd::SizeLimit;
+    this->end_word    = 0;
 
     // keeps the capacity, translation runs often enough that the reuse matters
     this->insns.clear();
