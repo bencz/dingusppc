@@ -37,6 +37,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "../ppcmmu.h"
 #include "devices/memctrl/mpc106.h"
 
+#include <cstdlib>
 #include <iostream>
 
 using namespace std;
@@ -1177,6 +1178,14 @@ static void test_xform_subset() {
 int test_jit() {
     jit_tested = 0;
     jit_failed = 0;
+
+    // the heat gate would keep every block threaded through these short
+    // programs and quietly skip the native comparisons, which are the point
+#if defined(_WIN32)
+    _putenv("DPPC_JIT_HEAT=0");
+#else
+    setenv("DPPC_JIT_HEAT", "0", 1);
+#endif
 
     MPC106* host_bridge = new MPC106;
 

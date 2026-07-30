@@ -269,6 +269,7 @@ public:
         blk->end_reason = uint8_t(ir.end_reason);
         blk->entry      = this->trampoline;
         blk->payload    = nullptr; // the code is the payload, and it is pooled
+        blk->heat       = 0;
         blk->code       = dst;
         blk->owner      = nullptr; // the facade fills this in
 

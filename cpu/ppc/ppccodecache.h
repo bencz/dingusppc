@@ -93,6 +93,11 @@ bool ppc_code_cache_page_is_protected(uint32_t phys_addr);
     mapping lets a store slip past the next block unnoticed */
 bool ppc_code_cache_store_to_page(uint32_t phys_addr, uint32_t size);
 
+/** Swaps one registered handle for another without touching the range it
+    covers. This is how a block promoted to a better executor keeps its
+    invalidation registration pointing at the live object */
+void ppc_code_cache_replace(uint32_t phys_addr, CodeBlockHandle from, CodeBlockHandle to);
+
 /** Drops every block overlapping the range and returns how many went away */
 unsigned ppc_code_cache_invalidate(uint32_t phys_addr, uint32_t size);
 

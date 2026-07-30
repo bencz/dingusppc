@@ -79,6 +79,12 @@ struct JitBlock {
         threaded one, so within a single run blocks can come from either and
         each has to go home to be released */
     Backend*    owner;
+
+    /** Entries seen while the block is still threaded. A block is only
+        emitted once this crosses the promotion threshold, which is what
+        keeps code that runs once, of which a booting system has megabytes,
+        from ever paying for the emitter */
+    uint32_t    heat;
 };
 
 /** Lookup key. The physical address alone identifies the memory, the mode

@@ -81,6 +81,20 @@ IRBlock scratch_ir;
 unsigned native_compiles   = 0;
 unsigned threaded_compiles = 0;
 
+/** Entries a block collects as a threaded one before the emitter is asked.
+
+    A booting system runs megabytes of code exactly once: loaders, linkers,
+    initialisation that never comes back. Emitting all of it cost more than
+    running it, and the churn was worse than the cost: every block thrown
+    away by an invalidation had bought chain bindings, registry entries and
+    code pool bytes with it. Below the threshold a block runs as IR, which
+    is roughly interpreter speed; crossing it buys emission once.
+
+    Zero turns the gate off and every block compiles native on first entry,
+    which is what the tests use to hold the emitter to full coverage.
+    DPPC_JIT_HEAT overrides it for bisection either way */
+uint32_t promote_threshold = 8;
+
 /** What the outer loop is doing, so rt_dispatch can apply the same stopping
     rule from inside generated code. Set once per ppc_jit_exec_inner and read
     between blocks */
@@ -199,6 +213,51 @@ void flush_everything() {
 
     Can unwind out of mmu_translate_imem on an instruction fetch fault, which
     is fine: no generated frame is on the stack at this point */
+/** Retranslates a heated threaded block and swaps a native one into its
+    place: same cache key, same invalidation registration, new executor.
+    Returns nullptr when the emitter declines or the pool is full in a
+    context that may not flush, and the threaded block stays as it was */
+JitBlock* promote_block(JitBlock* blk, uint32_t virt_addr, uint32_t phys_addr,
+                        const uint8_t* code, uint32_t mode, bool allow_flush) {
+    if (!translate_block(virt_addr, phys_addr, code, mode, scratch_ir)) {
+        return nullptr;
+    }
+
+    JitBlock* nblk = native_backend->compile(scratch_ir);
+
+    if (!nblk && native_backend->wants_flush()) {
+        if (!allow_flush) {
+            return nullptr; // a resolver is on the stack, see find_or_translate
+        }
+        LOG_F(INFO, "JIT: code memory exhausted, flushing %zu blocks", cache_size());
+        flush_everything(); // takes the threaded original with it
+        nblk = native_backend->compile(scratch_ir);
+        if (!nblk) {
+            return nullptr;
+        }
+        native_compiles++;
+        nblk->owner = native_backend.get();
+        cache_insert(nblk);
+        ppc_code_cache_add(nblk->phys_addr, nblk->byte_size,
+                           static_cast<CodeBlockHandle>(nblk));
+        return nblk;
+    }
+    if (!nblk) {
+        return nullptr; // declined for real; the block keeps running as IR
+    }
+
+    native_compiles++;
+    nblk->owner = native_backend.get();
+
+    cache_forget(blk);
+    cache_insert(nblk);
+    ppc_code_cache_replace(blk->phys_addr, static_cast<CodeBlockHandle>(blk),
+                           static_cast<CodeBlockHandle>(nblk));
+    blk->owner->release(blk); // a threaded payload is plain heap, and the
+                              // block is not executing at any promotion site
+    return nblk;
+}
+
 JitBlock* find_or_translate(uint32_t virt_addr, bool allow_flush) {
 #if SUPPORTS_PPC_LITTLE_ENDIAN_MODE
     if (ppc_state.is_LE) [[unlikely]] {
@@ -215,6 +274,18 @@ JitBlock* find_or_translate(uint32_t virt_addr, bool allow_flush) {
     const uint8_t* code = mmu_translate_imem(virt_addr, &phys_addr);
 
     if (JitBlock* blk = cache_lookup(phys_addr, mode)) {
+        // a threaded block heats up with every entry; the one that crosses
+        // the threshold comes back native, and the caller jumps straight
+        // into it. A failed promotion leaves the threaded block in place,
+        // and resetting the heat spaces out the retries
+        if (blk->owner == threaded_backend.get() && native_backend &&
+            promote_threshold && ++blk->heat >= promote_threshold) {
+            blk->heat = 0;
+            if (JitBlock* promoted =
+                    promote_block(blk, virt_addr, phys_addr, code, mode, allow_flush)) {
+                return promoted;
+            }
+        }
         return blk;
     }
 
@@ -222,22 +293,31 @@ JitBlock* find_or_translate(uint32_t virt_addr, bool allow_flush) {
         return nullptr;
     }
 
+    // with a native backend present a block is born threaded and earns its
+    // emission through the heat gate above; without one, threaded is all
+    // there is. The gate off means native on first entry
     Backend* owner = native_backend.get();
-    JitBlock* blk  = owner ? owner->compile(scratch_ir) : nullptr;
+    JitBlock* blk  = nullptr;
 
-    if (!blk && owner && owner->wants_flush()) {
-        if (!allow_flush) {
-            // a resolver is on the stack with its return address inside the
-            // memory a flush reclaims. No block, no threaded fallback, no
-            // cache entry: the retry from the dispatch stub redoes all of it
-            return nullptr;
-        }
-        // the pool filled up. Everything translated so far goes, and this
-        // block gets one more try on the empty pool. Nothing is executing
-        // here, so the code the flush reclaims cannot be under anyone's feet
-        LOG_F(INFO, "JIT: code memory exhausted, flushing %zu blocks", cache_size());
-        flush_everything();
+    if (owner && !promote_threshold) {
         blk = owner->compile(scratch_ir);
+
+        if (!blk && owner->wants_flush()) {
+            if (!allow_flush) {
+                // a resolver is on the stack with its return address inside
+                // the memory a flush reclaims. No block, no threaded
+                // fallback, no cache entry: the retry from the dispatch
+                // stub redoes all of it
+                return nullptr;
+            }
+            // the pool filled up. Everything translated so far goes, and
+            // this block gets one more try on the empty pool. Nothing is
+            // executing here, so the code the flush reclaims cannot be
+            // under anyone's feet
+            LOG_F(INFO, "JIT: code memory exhausted, flushing %zu blocks", cache_size());
+            flush_everything();
+            blk = owner->compile(scratch_ir);
+        }
     }
 
     if (blk) {
@@ -563,6 +643,18 @@ bool ppc_jit_enable(JitBackend choice) {
         if (n >= 1 && n <= long(dppc_jit::JIT_MAX_BLOCK_INSNS)) {
             dppc_jit::jit_max_block_insns = uint32_t(n);
             LOG_F(INFO, "JIT: blocks limited to %ld guest instructions", n);
+        }
+    }
+
+    if (const char* heat = getenv("DPPC_JIT_HEAT")) {
+        const long n = strtol(heat, nullptr, 0);
+        if (n >= 0 && n <= 1000000) {
+            dppc_jit::promote_threshold = uint32_t(n);
+            if (n) {
+                LOG_F(INFO, "JIT: blocks go native after %ld entries", n);
+            } else {
+                LOG_F(INFO, "JIT: heat gate off, every block goes native at once");
+            }
         }
     }
 

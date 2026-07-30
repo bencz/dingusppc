@@ -108,6 +108,19 @@ bool ppc_code_cache_page_is_protected(uint32_t phys_addr) {
     return protected_pages.find(phys_addr & PPC_PAGE_MASK) != protected_pages.end();
 }
 
+void ppc_code_cache_replace(uint32_t phys_addr, CodeBlockHandle from, CodeBlockHandle to) {
+    auto it = blocks_by_page.find(phys_addr & PPC_PAGE_MASK);
+    if (it == blocks_by_page.end()) {
+        return;
+    }
+    for (CodeBlock& blk : it->second) {
+        if (blk.handle == from) {
+            blk.handle = to;
+            return;
+        }
+    }
+}
+
 bool ppc_code_cache_store_to_page(uint32_t phys_addr, uint32_t size) {
     ppc_code_cache_invalidate(phys_addr, size);
 
