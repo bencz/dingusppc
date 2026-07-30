@@ -252,7 +252,7 @@ public:
         // now that the code has a home, every chain slot can point at its
         // resolver thunk. The slots live in plain data, no protection dance
         for (const ChainExit& ce : this->chain_exits) {
-            *ce.slot = dst + ce.thunk_off;
+            ce.slot->code = dst + ce.thunk_off;
         }
         for (const VaChainExit& ce : this->va_chain_exits) {
             ce.slot->code0    = dst + ce.thunk_off;
@@ -272,6 +272,9 @@ public:
         blk->heat       = 0;
         blk->code       = dst;
         blk->owner      = nullptr; // the facade fills this in
+        blk->chain_in     = nullptr;
+        blk->chained_prev = nullptr;
+        blk->chained_next = nullptr;
 
         return blk;
     }
@@ -451,10 +454,12 @@ private:
             return false; // leaves the page, dispatch has to translate
         }
 
-        void** slot = reinterpret_cast<void**>(this->code.slot_alloc(8, 8));
+        ChainSlot* slot =
+            reinterpret_cast<ChainSlot*>(this->code.slot_alloc(sizeof(ChainSlot), 8));
         if (!slot) {
             return false;
         }
+        slot->ref.target = nullptr; // unbound until the resolver says so
 
         X64Emitter::Label to_dispatch = this->asmb.new_label();
 
@@ -469,7 +474,7 @@ private:
 
         this->asmb.lea_reg_mem(REG_ENTRYPC, REG_ENTRYPC, next_off);
         this->asmb.xor_reg_reg32(REG_RETIRED, REG_RETIRED);
-        this->asmb.jmp_mem_abs(slot);
+        this->asmb.jmp_mem_abs(&slot->code);
 
         // a due timer goes the long way round; the count is zero because the
         // cycles are already in, and rt_dispatch settling zero is a no-op
@@ -508,6 +513,8 @@ private:
         slot->gen1  = 0;
         slot->phys1 = 0;
         slot->flip  = 0;
+        slot->ref0.target = nullptr; // both ways unbound
+        slot->ref1.target = nullptr;
 
         X64Emitter::Label to_dispatch = this->asmb.new_label();
         X64Emitter::Label try_way1    = this->asmb.new_label();
@@ -1671,7 +1678,7 @@ private:
     /** One per chained exit: the slot it jumps through and where its
         resolver thunk begins, as an offset the final code address turns into
         the slot's initial content */
-    typedef struct ChainExit { void** slot; size_t thunk_off; } ChainExit;
+    typedef struct ChainExit { ChainSlot* slot; size_t thunk_off; } ChainExit;
     std::vector<ChainExit> chain_exits;
 
     /** The address predicted kind, for targets only known as a virtual

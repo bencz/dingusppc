@@ -38,7 +38,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <cstdlib>
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -101,62 +100,117 @@ uint32_t promote_threshold = 8;
 JitExecType run_type = JitExecType::run;
 uint32_t    run_goal = 0;
 
-/** Chain slots currently bound, keyed by the block they jump into, each with
-    the resolver address to put back. A bound slot skips lookup entirely, so
-    the moment a block dies every slot aimed at it has to go back to
-    resolving, or the next pass would run a stale translation.
+/** Blocks whose chain_in is nonempty, so unbinding everything walks only
+    them instead of every block there is */
+JitBlock* chained_head = nullptr;
 
-    The address predicted kind also has its prediction poisoned, both so the
-    exit stops matching and so the slot counts as virgin again, which is what
-    lets it bind a fresh target */
-typedef struct ChainRef {
-    void**      code;     // where the target pointer lives
-    const void* resolver; // what goes back there
-    uint64_t*   pred;     // pred_va to poison, nullptr for the same page kind
-} ChainRef;
-
-std::unordered_map<JitBlock*, std::vector<ChainRef>> chain_bindings;
-
-/** How many refs the registry holds, and the point where it all gets thrown
-    away. Address predicted slots rebind on every miss, and a computed
-    dispatch rotating through hundreds of targets would otherwise grow the
-    registry for as long as it runs. Blowing everything up instead costs one
-    walk over the registry, and the sites that matter rebind on their next
-    pass */
+/** Bound slots, purely a statistic. Entries live in the slots themselves,
+    so the registry cannot grow past the slots emitted code holds and there
+    is no cap to police. The capped pooled registry this replaces tore every
+    chain in the machine down about once a second during the Cheetah storm,
+    address predicted slots rebinding on every miss being what filled it */
 size_t chain_refs = 0;
-constexpr size_t CHAIN_REF_CAP = size_t(1) << 18;
 
 /** Binding is off during `until` runs, where every block entry has to be
     observed for the goal, and under tracing, which wants every entry too */
 bool chain_allowed = false;
 
-void unbind_one(const ChainRef& ref) {
-    *ref.code = const_cast<void*>(ref.resolver);
-    if (ref.pred) {
-        *ref.pred = 1;
+void unlink_chained_block(JitBlock* blk) {
+    if (blk->chained_prev) {
+        blk->chained_prev->chained_next = blk->chained_next;
+    } else {
+        chained_head = blk->chained_next;
     }
+    if (blk->chained_next) {
+        blk->chained_next->chained_prev = blk->chained_prev;
+    }
+    blk->chained_prev = nullptr;
+    blk->chained_next = nullptr;
 }
 
+/** Detaches a ref from its target's incoming list without touching the slot,
+    for a way that is about to be rewritten with a fresh binding anyway */
+void unlink_chain_ref(ChainRef* ref) {
+    JitBlock* blk = ref->target;
+    if (ref->prev) {
+        ref->prev->next = ref->next;
+    } else {
+        blk->chain_in = ref->next;
+        if (!ref->next) {
+            unlink_chained_block(blk);
+        }
+    }
+    if (ref->next) {
+        ref->next->prev = ref->prev;
+    }
+    ref->target = nullptr;
+    chain_refs--;
+}
+
+/** Points a slot's registry entry at a new target. A rebinding entry moves
+    off the old target's list first, so nothing is allocated and nothing is
+    left behind, however hard a site churns */
+void bind_chain(JitBlock* blk, ChainRef* ref, void** code, const void* resolver,
+                uint64_t* pred) {
+    if (ref->target) {
+        unlink_chain_ref(ref);
+    }
+    ref->code     = code;
+    ref->resolver = resolver;
+    ref->pred     = pred;
+    ref->target   = blk;
+    ref->prev     = nullptr;
+    ref->next     = blk->chain_in;
+    if (ref->next) {
+        ref->next->prev = ref;
+    } else {
+        blk->chained_prev = nullptr;
+        blk->chained_next = chained_head;
+        if (chained_head) {
+            chained_head->chained_prev = blk;
+        }
+        chained_head = blk;
+    }
+    blk->chain_in = ref;
+    chain_refs++;
+}
+
+/** Sends every slot aimed at the block back to resolving */
 void unbind_chains_to(JitBlock* blk) {
-    auto it = chain_bindings.find(blk);
-    if (it == chain_bindings.end()) {
+    ChainRef* ref = blk->chain_in;
+    if (!ref) {
         return;
     }
-    for (const ChainRef& ref : it->second) {
-        unbind_one(ref);
-    }
-    chain_refs -= it->second.size();
-    chain_bindings.erase(it);
+    do {
+        *ref->code = const_cast<void*>(ref->resolver);
+        if (ref->pred) {
+            *ref->pred = 1;
+        }
+        ref->target = nullptr;
+        chain_refs--;
+        ref = ref->next;
+    } while (ref);
+    blk->chain_in = nullptr;
+    unlink_chained_block(blk);
 }
 
 void unbind_all_chains() {
-    for (const auto& [blk, refs] : chain_bindings) {
-        for (const ChainRef& ref : refs) {
-            unbind_one(ref);
+    for (JitBlock* blk = chained_head; blk;) {
+        JitBlock* next_blk = blk->chained_next;
+        for (ChainRef* ref = blk->chain_in; ref; ref = ref->next) {
+            *ref->code = const_cast<void*>(ref->resolver);
+            if (ref->pred) {
+                *ref->pred = 1;
+            }
+            ref->target = nullptr;
         }
+        blk->chain_in     = nullptr;
+        blk->chained_prev = nullptr;
+        blk->chained_next = nullptr;
+        blk = next_blk;
     }
-    chain_bindings.clear();
-    chain_refs = 0;
+    chained_head = nullptr;
+    chain_refs   = 0;
 }
 
 void on_block_released(CodeBlockHandle handle) {
@@ -186,10 +240,11 @@ void flush_everything() {
     drain_pending_free();
     cache_clear();
 
-    // every release above already unbound its chains; whatever this catches
-    // would be a leak, and the slot area is about to be taken back anyway
-    chain_bindings.clear();
-    chain_refs = 0;
+    // every release above already unbound its chains and emptied the chained
+    // list; the entries themselves live in the slot area the backends are
+    // about to take back wholesale
+    chained_head = nullptr;
+    chain_refs   = 0;
 
     if (native_backend) {
         native_backend->release_all();
@@ -489,7 +544,7 @@ const void* rt_dispatch(uint32_t retired) noexcept {
     }
 }
 
-const void* rt_chain_resolve(void** slot) noexcept {
+const void* rt_chain_resolve(ChainSlot* slot) noexcept {
     try {
         // the chained exit settled the cycles and checked the timer before
         // coming here, so flags mean something translation raised last time
@@ -515,13 +570,10 @@ const void* rt_chain_resolve(void** slot) noexcept {
         // the jump itself is valid either way; what `until` and tracing veto
         // is the binding, which would let later passes skip this observation
         if (chain_allowed) {
-            if (chain_refs >= CHAIN_REF_CAP) [[unlikely]] {
-                unbind_all_chains();
-            }
-            const void* resolver = *slot;
-            chain_bindings[blk].push_back({slot, resolver, nullptr});
-            chain_refs++;
-            *slot = blk->code;
+            // the cell still points at the resolver thunk, or this call
+            // would not be happening
+            bind_chain(blk, &slot->ref, &slot->code, slot->code, nullptr);
+            slot->code = blk->code;
         }
         return blk->code;
     } catch (PPCExcUnwind&) {
@@ -553,10 +605,10 @@ const void* rt_chain_resolve_va(ChainVaSlot* slot) noexcept {
         // way choice: refresh the way already predicting this address, which
         // is how a stale generation gets restamped instead of duplicating the
         // prediction across ways; then a virgin way; then evict round robin.
-        // The entry left behind by an eviction goes stale harmlessly, its
-        // unbind poisons a way that has moved on and forces one re-resolve.
-        // Rebinding at all matters as much as the ways do: a policy that
-        // only bound virgin slots left every site dead after the first tlbie
+        // An eviction moves the way's registry entry to the new target, so
+        // nothing stale remains anywhere. Rebinding at all matters as much
+        // as the ways do: a policy that only bound virgin slots left every
+        // site dead after the first tlbie
         if (chain_allowed) {
             int way;
             if (slot->pred0 == entry_pc)      way = 0;
@@ -572,27 +624,21 @@ const void* rt_chain_resolve_va(ChainVaSlot* slot) noexcept {
             uint64_t* gen  = way ? &slot->gen1  : &slot->gen0;
             void**    code = way ? &slot->code1 : &slot->code0;
             uint32_t* phys = way ? &slot->phys1 : &slot->phys0;
+            ChainRef* ref  = way ? &slot->ref1  : &slot->ref0;
 
             // the storm case: the way already holds this very binding and
             // only the generation went stale. The translation was just
-            // re-verified, so restamping it is enough, and the registry
-            // entry from the original bind still covers the way. The exit's
-            // inline probe catches most of these; what reaches here is the
-            // probe missing the primary ITLB, which the translation above
-            // has just refilled. Pushing a duplicate ref instead used to run
-            // the registry into its cap, and the unbind_all that followed
-            // killed every chain in the machine, the same page ones included
+            // re-verified, so restamping it is enough, and the way's entry
+            // already sits on the right list. The exit's inline probe
+            // catches most of these; what reaches here is the probe missing
+            // the primary ITLB, which the translation above has just
+            // refilled
             if (*pred == entry_pc && *code == blk->code) {
                 *gen = mmu_itrans_generation;
                 return blk->code;
             }
 
-            if (chain_refs >= CHAIN_REF_CAP) [[unlikely]] {
-                unbind_all_chains();
-            }
-
-            chain_bindings[blk].push_back({code, slot->resolver, pred});
-            chain_refs++;
+            bind_chain(blk, ref, code, slot->resolver, pred);
             *pred = entry_pc;
             *gen  = mmu_itrans_generation;
             *phys = blk->phys_addr & PPC_PAGE_MASK;

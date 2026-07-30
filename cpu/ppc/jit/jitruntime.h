@@ -43,6 +43,30 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 namespace dppc_jit {
 
+struct JitBlock;
+
+/** One chain slot's registry entry, embedded in the slot it describes.
+
+    The registry answers one question: when a block dies, which slots jump
+    into it and have to go back to resolving. Owning the entry by the slot
+    instead of allocating one per bind is what bounds the registry at the
+    number of slots in emitted code, so rebinding is a move between two
+    incoming lists and can never grow anything. It is also what keeps the
+    bind path off cold memory: the entry shares cache lines with the slot
+    fields the resolver just wrote. The pooled predecessor was measured at
+    8% of the Cheetah boot storm, almost all of it one cold load per bind
+
+    target is null while the slot is unbound, and only ppcjit.cpp touches
+    any of this */
+struct ChainRef {
+    void**      code;     // where the target pointer lives
+    const void* resolver; // what goes back there on unbind
+    uint64_t*   pred;     // pred to poison on unbind, nullptr for same page
+    JitBlock*   target;   // block the slot jumps into, nullptr while unbound
+    ChainRef*   prev;     // neighbours on the target's incoming list
+    ChainRef*   next;
+};
+
 /** Runs one interpreter helper on behalf of generated code.
 
     Returns true when the helper returned normally, which includes the case
@@ -125,7 +149,12 @@ void rt_block_end(uint32_t entry_pc, uint32_t byte_size, uint32_t retired) noexc
     `until` run needs every entry observed. Nothing may unwind out of it.
 
     Defined in ppcjit.cpp, next to rt_dispatch, for the same reason */
-const void* rt_chain_resolve(void** slot) noexcept;
+typedef struct ChainSlot {
+    void*    code; // stays first: the exit jumps through the slot address
+    ChainRef ref;
+} ChainSlot;
+
+const void* rt_chain_resolve(ChainSlot* slot) noexcept;
 
 /** A chain whose target is only known as a virtual address: a return or
     bcctr, whose target lives in a register, or a direct branch into another
@@ -156,9 +185,8 @@ const void* rt_chain_resolve(void** slot) noexcept;
 
     A prediction starts (and is unbound to) 1, an address no instruction can
     have. A binding lives and dies in the way it was installed in and is
-    never copied across, so the registry entry pointing at that way stays
-    telling the truth for as long as the target lives. resolver remembers the
-    thunk so any unbind knows what to put back */
+    never copied across. resolver remembers the thunk so any unbind knows
+    what to put back */
 typedef struct ChainVaSlot {
     uint64_t    pred0;
     uint64_t    gen0;
@@ -170,14 +198,16 @@ typedef struct ChainVaSlot {
     uint64_t    flip;   // which way the next eviction lands on
     uint32_t    phys0;  // physical page the way's target resolved to,
     uint32_t    phys1;  // what the inline revalidation checks against
+    ChainRef    ref0;   // registry entries owned by the ways; an eviction
+    ChainRef    ref1;   // moves the entry, nothing is ever left behind
 } ChainVaSlot;
 
 /** rt_chain_resolve for a ChainVaSlot. Installs the target into the way
     already predicting this address if there is one, a virgin way otherwise,
     and the flip way as a last resort, so a site alternating between two
-    targets settles with both bound. The registry this feeds is capped;
-    overflowing it unbinds everything and lets the hot sites rebind lazily,
-    which keeps a megamorphic site from growing it without end */
+    targets settles with both bound. A megamorphic site just keeps rotating
+    its two ways; each rotation moves the way's registry entry, so churn
+    costs nothing to anyone else */
 const void* rt_chain_resolve_va(ChainVaSlot* slot) noexcept;
 
 /** Hands control back to the emulator between two blocks and says where to

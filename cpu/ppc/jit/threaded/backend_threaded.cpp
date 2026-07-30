@@ -374,6 +374,9 @@ public:
         blk->heat       = 0;
         blk->code       = nullptr; // ordinary C++, there is no frame to share
         blk->owner      = nullptr; // the facade fills this in
+        blk->chain_in     = nullptr;
+        blk->chained_prev = nullptr;
+        blk->chained_next = nullptr;
 
         return blk;
     }

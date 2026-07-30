@@ -34,6 +34,7 @@ namespace dppc_jit {
 
 class Backend;
 struct JitBlock;
+struct ChainRef;
 
 /** Runs compiled code, starting with this block.
 
@@ -85,6 +86,17 @@ struct JitBlock {
         keeps code that runs once, of which a booting system has megabytes,
         from ever paying for the emitter */
     uint32_t    heat;
+
+    /** Chain slots elsewhere that jump straight into this block, so they can
+        all go back to resolving the moment it dies. The entries live in the
+        slots themselves, see ChainRef in jitruntime.h; this is just the head
+        of their list */
+    ChainRef*   chain_in;
+
+    /** Neighbours in the list of blocks whose chain_in is nonempty, which is
+        what unbinding everything walks instead of every block there is */
+    JitBlock*   chained_prev;
+    JitBlock*   chained_next;
 };
 
 /** Lookup key. The physical address alone identifies the memory, the mode
