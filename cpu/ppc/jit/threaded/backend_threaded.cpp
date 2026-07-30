@@ -110,6 +110,10 @@ void threaded_entry(const JitBlock* blk) {
         case IROpcode::StoreSPR:
             ppc_state.spr[in.reg] = vals[in.a];
             break;
+        case IROpcode::PcRel:
+            vals[i] = entry_pc + in.imm;
+            break;
+
         case IROpcode::ConstI32:
             vals[i] = in.imm;
             break;
@@ -304,7 +308,14 @@ void threaded_entry(const JitBlock* blk) {
                 ppc_state.spr[SPR::LR] = guest_pc + 4;
             }
 
-            // a branch always ends the block and always completes
+            // a side exit ends the block only when taken; the block ending
+            // kind always does, with everything retired either way
+            if (in.flags & IR_BRANCH_SIDE_EXIT) {
+                if (!(ctr_ok && cnd_ok)) {
+                    break;
+                }
+                retired = in.insn_idx + 1;
+            }
             goto done;
         }
 

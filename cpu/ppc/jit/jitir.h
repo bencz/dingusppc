@@ -94,6 +94,14 @@ enum class IROpcode : uint8_t {
     // values
     ConstI32,  // imm          -> dest
 
+    /** The address of the block's entry as it was entered THIS run, plus
+        imm. Blocks are keyed by physical address and can be entered through
+        any virtual mapping of their page, so an address the guest gets to
+        see, like the LR a walked through bcl writes, may never be baked in
+        at translate time. Doing exactly that broke position independent
+        code the moment the kernel mapped a page somewhere new */
+    PcRel,     // entry pc + imm -> dest
+
     // integer arithmetic and logic
     Add,       // a + b        -> dest
     Sub,       // a - b        -> dest
@@ -192,6 +200,12 @@ enum IRFlags : uint8_t {
         so retired instructions have to be accounted for before it runs and
         not merely when the block ends */
     IR_SYNC_CYCLES = 1 << 0,
+
+    /** The Branch does not end the block: taken leaves through a chained
+        side exit with insn_idx + 1 retired, not taken falls through to the
+        instructions after it. What made superblocks pay: conditional
+        branches close 59% of the emitted code time of a Cheetah boot */
+    IR_BRANCH_SIDE_EXIT = 1 << 1,
 };
 
 /** Where a Branch finds its target */
@@ -318,6 +332,13 @@ enum JitDecodeGroup : uint32_t {
 };
 
 extern uint32_t jit_decode_groups;
+
+/** Lets the translator build superblocks: walking through always taken
+    direct branches and turning forward conditional ones into side exits.
+    DPPC_JIT_SUPERBLOCK=0 turns it off, which is the honest bisection for a
+    misbehaving boot: every branch goes back to ending its block while
+    every other layer stays exactly as it was */
+extern bool jit_superblocks;
 
 /** Settles the retired count before every call into a helper rather than only
     before the ones that read virtual time.

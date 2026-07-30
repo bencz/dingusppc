@@ -31,6 +31,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     These run last because they call ppc_cpu_init, which resets the processor.
  */
 
+#include "../jit/jitir.h"
 #include "../ppccodecache.h"
 #include "../ppcemu.h"
 #include "../ppcjit.h"
@@ -832,6 +833,158 @@ static void test_branch_subset() {
               "a second pass over the cached branch blocks agrees");
 }
 
+/*  Superblock formation: a taken forward beq leaving through a side exit, a
+    not taken one falling through it, a bcl 20,31,$+4 dissolving into an LR
+    store, and unconditional skips walked through with gaps behind them. The
+    retired count is the sharp edge here: every walked through branch still
+    retires, and a side exit taken must retire exactly up to itself.  */
+static const uint32_t superblock_code[] = {
+    0x38600000, // +0x00 li     r3, 0
+    0x2C030000, // +0x04 cmpwi  cr0, r3, 0     EQ set
+    0x41820010, // +0x08 beq    +0x10          -> +0x18, taken side exit
+    0x3880000B, // +0x0C li     r4, 11         skipped
+    0x38A00016, // +0x10 li     r5, 22         skipped
+    0x4800000C, // +0x14 b      +0x0C          -> +0x20, never runs
+    0x38C00021, // +0x18 li     r6, 33
+    0x2C060063, // +0x1C cmpwi  cr0, r6, 99    EQ clear
+    0x41820008, // +0x20 beq    +0x08          -> +0x28, not taken
+    0x38E0002C, // +0x24 li     r7, 44
+    0x429F0005, // +0x28 bcl    20, 31, +4     LR = +0x2C, walked through
+    0x7D0802A6, // +0x2C mflr   r8             r8 = +0x2C
+    0x48000008, // +0x30 b      +0x08          -> +0x38, walked through
+    0x39200037, // +0x34 li     r9, 55         skipped, lives in a gap
+    0x39400042, // +0x38 li     r10, 66
+    0x00000000, // +0x3C illegal, the program stops here
+};
+
+constexpr uint32_t SB_BASE = 0x8800;
+constexpr uint32_t SB_END  = SB_BASE + 0x3C;
+constexpr uint64_t SB_RETIRED = 11;
+
+static void load_superblock_code() {
+    for (size_t i = 0; i < sizeof(superblock_code) / sizeof(superblock_code[0]); i++) {
+        mmu_write_vmem<uint32_t>(NO_OPCODE, SB_BASE + uint32_t(i) * 4,
+                                 superblock_code[i]);
+    }
+}
+
+static SprResult run_superblock_code() {
+    for (int i = 0; i < 32; i++) {
+        ppc_state.gpr[i] = 0xC3C30000u | uint32_t(i);
+    }
+    ppc_state.spr[SPR::LR]  = 0;
+    ppc_state.spr[SPR::CTR] = 0;
+    ppc_state.cr  = 0;
+    ppc_state.pc  = SB_BASE;
+    g_icycles     = 0;
+    g_icycles_max = 0;
+    exec_flags    = 0;
+    power_on      = true;
+
+    ppc_exec_until(SB_END);
+
+    SprResult r;
+    for (int i = 0; i < 32; i++) r.regs.gpr[i] = ppc_state.gpr[i];
+    r.regs.pc      = ppc_state.pc;
+    r.regs.retired = g_icycles;
+    r.lr  = ppc_state.spr[SPR::LR];
+    r.ctr = ppc_state.spr[SPR::CTR];
+    r.cr  = ppc_state.cr;
+    return r;
+}
+
+static void test_superblock_subset() {
+    load_superblock_code();
+
+    ppc_jit_disable();
+    SprResult interp = run_superblock_code();
+    jit_check(interp.regs.pc == SB_END,
+              "the superblock program stopped where it should");
+    jit_check(interp.regs.retired == SB_RETIRED,
+              "the interpreter retired the expected count in the superblock program");
+
+    ppc_jit_enable(JitBackend::threaded);
+    SprResult threaded = run_superblock_code();
+    int where = -1;
+    jit_check(same_spr(interp, threaded, &where),
+              "the threaded backend agrees on the superblock program");
+    report_spr(interp, threaded, where, "threaded");
+
+    ppc_jit_disable();
+    ppc_jit_enable(JitBackend::automatic);
+    SprResult native = run_superblock_code();
+
+    if (ppc_jit_native_compiles() == 0) {
+        cout << "  (no emitter on this host, skipping the native comparison)" << endl;
+        return;
+    }
+
+    where = -1;
+    jit_check(same_spr(interp, native, &where),
+              "emitted code agrees on the superblock program");
+    report_spr(interp, native, where, "emitted");
+
+    SprResult again = run_superblock_code();
+    where = -1;
+    jit_check(same_spr(interp, again, &where),
+              "a second pass over the cached superblocks agrees");
+}
+
+/*  A walked through branch landing exactly on the block budget edge. With
+    the budget at two, the b occupies the last slot; a translator that walks
+    through it anyway ends the block with nothing decoded at the target, and
+    the fall off the end exit resumes at the branch's fall through, running
+    the very code the branch jumped over. The r9 poison in the jumped over
+    region is the detector.  */
+static const uint32_t budget_edge_code[] = {
+    0x38600001, // +0x00 li r3, 1
+    0x48000008, // +0x04 b  +0x08       -> +0x0C
+    0x39200063, // +0x08 li r9, 99      jumped over, must never run
+    0x38800002, // +0x0C li r4, 2
+    0x00000000, // +0x10 illegal, the program stops here
+};
+
+constexpr uint32_t BE_BASE = 0x8900;
+constexpr uint32_t BE_END  = BE_BASE + 0x10;
+
+static void test_superblock_budget_edge() {
+    for (size_t i = 0; i < sizeof(budget_edge_code) / sizeof(budget_edge_code[0]); i++) {
+        mmu_write_vmem<uint32_t>(NO_OPCODE, BE_BASE + uint32_t(i) * 4,
+                                 budget_edge_code[i]);
+    }
+
+    const uint32_t saved_budget = dppc_jit::jit_max_block_insns;
+    dppc_jit::jit_max_block_insns = 2;
+
+    ppc_jit_disable();
+    ppc_state.pc = BE_BASE;
+    for (int i = 0; i < 32; i++) ppc_state.gpr[i] = 0;
+    g_icycles = 0; g_icycles_max = 0; exec_flags = 0; power_on = true;
+    ppc_exec_until(BE_END);
+    const uint32_t interp_r9 = ppc_state.gpr[9];
+    const uint32_t interp_pc = ppc_state.pc;
+
+    ppc_jit_enable(JitBackend::threaded);
+    ppc_state.pc = BE_BASE;
+    for (int i = 0; i < 32; i++) ppc_state.gpr[i] = 0;
+    g_icycles = 0; g_icycles_max = 0; exec_flags = 0; power_on = true;
+    ppc_exec_until(BE_END);
+    jit_check(ppc_state.pc == interp_pc && ppc_state.gpr[9] == interp_r9,
+              "a walk through on the budget edge stays off the jumped over code (threaded)");
+
+    ppc_jit_disable();
+    ppc_jit_enable(JitBackend::automatic);
+    ppc_state.pc = BE_BASE;
+    for (int i = 0; i < 32; i++) ppc_state.gpr[i] = 0;
+    g_icycles = 0; g_icycles_max = 0; exec_flags = 0; power_on = true;
+    ppc_exec_until(BE_END);
+    jit_check(ppc_state.pc == interp_pc && ppc_state.gpr[9] == interp_r9,
+              "a walk through on the budget edge stays off the jumped over code (emitted)");
+
+    dppc_jit::jit_max_block_insns = saved_budget;
+    ppc_jit_disable();
+}
+
 /*  The XER[CA] family: addc, adde, addic, addic., subfc, subfe, subfic,
     addze and subf, with the carry chaining from one into the next and the
     forms with both operands in the same register, which are the ones that
@@ -1222,6 +1375,8 @@ int test_jit() {
     test_store_subset();
     test_cr_subset();
     test_branch_subset();
+    test_superblock_subset();
+    test_superblock_budget_edge();
     test_carry_subset();
     test_ov_subset();
     test_xform_subset();

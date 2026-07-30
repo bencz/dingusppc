@@ -141,6 +141,36 @@ bool follow_target(uint32_t op, uint32_t pc, uint32_t entry, uint32_t* target) {
     return true;
 }
 
+/** Whether the instruction at byte offset `off` has no translation at all,
+    which is what makes a walk through to it unsound: the block would end
+    before its own tail knows the branch was taken */
+bool target_is_illegal(const uint8_t* code, uint32_t off) {
+    const uint32_t raw = ppc_read_instruction(code + off);
+    return ppc_opcode_grabber[(raw >> 15 & 0x1F800) | (raw & 0x7FF)] == ppc_illegalop;
+}
+
+/** A conditional branch worth turning into a side exit rather than a block
+    end. Measured on the Cheetah storm: bc testing only the CR with the
+    target ahead closes 48% of all emitted code time, while the backward
+    kind is the loop closer, whose taken side already pays one chained exit
+    per iteration whether it ends the block or not, so it keeps doing that
+    and spares the duplicated tail. CTR forms are the other 1% and their
+    decrement has no business running twice, helpers keep them.
+
+    Only the fall through side needs to stay in the page; the taken target
+    goes through the same exit machinery a block ending branch uses, which
+    is mapping safe at any distance */
+bool side_exit_bc(uint32_t op) {
+    if (primary_op(op) != 16 || (op & 2)) {
+        return false;
+    }
+    const unsigned bo = (op >> 21) & 0x1F;
+    if ((bo & 0x14) != 0x04) { // must test CR, must leave CTR alone
+        return false;
+    }
+    return int16_t(op & ~3UL) > 0; // ahead of here, the measured hot kind
+}
+
 bool ends_context(uint32_t opcode) {
     switch (primary_op(opcode)) {
     case 17: // sc
@@ -239,6 +269,14 @@ public:
     IRValue constant(uint32_t imm) {
         IRInsn in = blank(IROpcode::ConstI32);
         in.imm = imm;
+        return this->out.append(in);
+    }
+
+    /** The runtime entry address plus disp, for the rare guest visible
+        address inside a block. Never fold this into a constant */
+    IRValue pc_rel(uint32_t disp) {
+        IRInsn in = blank(IROpcode::PcRel);
+        in.imm = disp;
         return this->out.append(in);
     }
 
@@ -359,6 +397,23 @@ public:
         in.imm       = imm;
         in.target    = target;
         this->out.append(in);
+    }
+
+    /** A conditional branch the block continues past: taken is a side exit,
+        not taken falls through to whatever is decoded next. The emitter's
+        exit machinery scratches registers freely on the taken path, so
+        nothing cached may cross this, same rule as a call */
+    void branch_side_exit(uint8_t bo, uint8_t bi, bool link, uint32_t imm) {
+        IRInsn in    = blank(IROpcode::Branch);
+        in.flags    |= IR_BRANCH_SIDE_EXIT;
+        in.bo        = bo;
+        in.bi        = bi;
+        in.link      = link;
+        in.absolute  = false;
+        in.imm       = imm;
+        in.target    = BranchTarget::Direct;
+        this->out.append(in);
+        this->invalidate();
     }
 
     void call(PPCOpcode helper, uint32_t raw, uint8_t flags) {
@@ -844,17 +899,47 @@ bool translate_block(uint32_t virt_addr, uint32_t phys_addr, const uint8_t* code
 
         // walking through a branch retires it without emitting anything but
         // the LR write, and decoding continues at its target. Gated with the
-        // branch group so bisection still sees every branch end its block
+        // branch group so bisection still sees every branch end its block.
+        //
+        // The walk is only sound if at least one instruction gets decoded AT
+        // the target: a block that ends right after the walk falls off its
+        // end with pc = entry + byte_size, the fall through of the branch,
+        // and an always taken branch resuming at its fall through executes
+        // the very code it jumped over. So a branch in the last budget slot
+        // and a branch whose target will not decode both close the block
+        // the ordinary way instead, whose exit knows the real target
         uint32_t follow_to;
-        if ((jit_decode_groups & JIT_DECODE_BRANCH) &&
-            follow_target(raw, virt_addr + off, virt_addr, &follow_to)) {
+        if (jit_superblocks && (jit_decode_groups & JIT_DECODE_BRANCH) &&
+            i + 1 < jit_max_block_insns &&
+            follow_target(raw, virt_addr + off, virt_addr, &follow_to) &&
+            !target_is_illegal(code, follow_to - virt_addr)) {
             if (raw & 1) {
-                b.store_spr(SPR::LR, b.constant(virt_addr + off + 4));
+                // relative to the entry of THIS run: the block can be
+                // entered through any mapping of its page, and this LR is
+                // an address the guest computes with
+                b.store_spr(SPR::LR, b.pc_rel(off + 4));
             }
             out.byte_size  = off + 4;
             out.insn_count++;
             out.end_word = raw;
             off = follow_to - virt_addr;
+            continue;
+        }
+
+        // a forward conditional branch becomes a side exit and decoding
+        // continues at its fall through, which is the measured hot side
+        if (jit_superblocks && (jit_decode_groups & JIT_DECODE_BRANCH) &&
+            side_exit_bc(raw)) {
+            b.branch_side_exit((raw >> 21) & 0x1F, (raw >> 16) & 0x1F,
+                               raw & 1, uint32_t(int32_t(int16_t(raw & ~3UL))));
+            out.byte_size  = off + 4;
+            out.insn_count++;
+            out.end_word = raw;
+            off += 4;
+            if (off >= page_limit) {
+                out.end_reason = BlockEnd::PageEnd;
+                break;
+            }
             continue;
         }
 

@@ -28,6 +28,7 @@ namespace dppc_jit {
 uint32_t jit_max_block_insns = JIT_MAX_BLOCK_INSNS;
 uint32_t jit_decode_groups   = JIT_DECODE_ALL;
 bool     jit_sync_every_call = false;
+bool     jit_superblocks     = true;
 
 const char* block_end_name(BlockEnd reason) {
     switch (reason) {

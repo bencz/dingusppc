@@ -692,6 +692,13 @@ bool ppc_jit_enable(JitBackend choice) {
         }
     }
 
+    if (const char* sb = getenv("DPPC_JIT_SUPERBLOCK")) {
+        dppc_jit::jit_superblocks = strtol(sb, nullptr, 0) != 0;
+        if (!dppc_jit::jit_superblocks) {
+            LOG_F(INFO, "JIT: superblocks off, every branch ends its block");
+        }
+    }
+
     if (const char* heat = getenv("DPPC_JIT_HEAT")) {
         const long n = strtol(heat, nullptr, 0);
         if (n >= 0 && n <= 1000000) {

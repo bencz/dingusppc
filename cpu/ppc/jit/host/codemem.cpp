@@ -79,12 +79,14 @@ bool CodeMem::init(size_t bytes, size_t slot_bytes) {
     const size_t total     = code_part + round_up(slot_bytes, host_page_size());
 
 #if defined(_WIN32)
-    void* mem = VirtualAlloc(nullptr, total, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    void* mem = VirtualAlloc(nullptr, total, MEM_RESERVE, PAGE_NOACCESS);
     if (!mem) {
         LOG_F(WARNING, "JIT: could not reserve %zu bytes of code memory", total);
         return false;
     }
 #else
+    // anonymous memory is committed by the kernel one touched page at a
+    // time, so reserving generously costs address space and nothing else
     void* mem = mmap(nullptr, total, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED) {
@@ -100,6 +102,17 @@ bool CodeMem::init(size_t bytes, size_t slot_bytes) {
     this->slot_size   = total - code_part;
     this->slot_offset = 0;
     this->reserved    = total;
+#if defined(_WIN32)
+    this->code_committed = 0;
+    this->slot_committed = 0;
+    if (!this->ensure_code_committed(host_page_size())) {
+        this->shutdown();
+        return false;
+    }
+#else
+    this->code_committed = code_part;
+    this->slot_committed = total - code_part;
+#endif
     this->writable    = true;
 
     // nothing has been emitted, but leaving it writable would mean the very
@@ -124,10 +137,78 @@ void CodeMem::shutdown() {
     this->slot_size   = 0;
     this->slot_offset = 0;
     this->reserved    = 0;
+    this->code_committed = 0;
+    this->slot_committed = 0;
     this->writable    = false;
 }
 
+/** Commit granule. Big enough that a storm compiling thousands of blocks a
+    second grows the region a handful of times, small enough that an idle
+    guest never pays for space it will not use */
+constexpr size_t COMMIT_GRANULE = size_t(4) << 20;
+
+bool CodeMem::ensure_code_committed(size_t end) {
+#if defined(_WIN32)
+    if (end <= this->code_committed) {
+        return true;
+    }
+    const size_t grown = round_up(end, COMMIT_GRANULE) > this->size
+                       ? this->size : round_up(end, COMMIT_GRANULE);
+    if (!VirtualAlloc(this->base + this->code_committed,
+                      grown - this->code_committed, MEM_COMMIT, PAGE_READWRITE)) {
+        LOG_F(ERROR, "JIT: could not commit code memory");
+        return false;
+    }
+    this->code_committed = grown;
+#else
+    (void)end;
+#endif
+    return true;
+}
+
+bool CodeMem::ensure_slot_committed(size_t end) {
+#if defined(_WIN32)
+    if (end <= this->slot_committed) {
+        return true;
+    }
+    const size_t grown = round_up(end, COMMIT_GRANULE) > this->slot_size
+                       ? this->slot_size : round_up(end, COMMIT_GRANULE);
+    if (!VirtualAlloc(this->base + this->size + this->slot_committed,
+                      grown - this->slot_committed, MEM_COMMIT, PAGE_READWRITE)) {
+        LOG_F(ERROR, "JIT: could not commit slot memory");
+        return false;
+    }
+    this->slot_committed = grown;
+#else
+    (void)end;
+#endif
+    return true;
+}
+
 void CodeMem::reset() {
+    // the pages above the floor carry nothing anyone will run again; handing
+    // them back is what keeps the footprint at the working set instead of
+    // the high water mark of the worst storm so far
+    const size_t page       = host_page_size();
+    const size_t keep       = round_up(this->floor, page);
+    const size_t code_used  = round_up(this->offset, page);
+    const size_t slot_used  = round_up(this->slot_offset, page);
+    if (this->base && code_used > keep) {
+#if defined(_WIN32)
+        VirtualFree(this->base + keep, code_used - keep, MEM_DECOMMIT);
+        this->code_committed = keep;
+#else
+        madvise(this->base + keep, code_used - keep, MADV_DONTNEED);
+#endif
+    }
+    if (this->base && slot_used > 0) {
+#if defined(_WIN32)
+        VirtualFree(this->base + this->size, slot_used, MEM_DECOMMIT);
+        this->slot_committed = 0;
+#else
+        madvise(this->base + this->size, slot_used, MADV_DONTNEED);
+#endif
+    }
     this->offset      = this->floor;
     this->slot_offset = 0;
 }
@@ -140,14 +221,16 @@ bool CodeMem::begin_write() {
     if (!this->base || this->writable) {
         return this->base != nullptr;
     }
+    // the flip stops at the commit watermark: reserved pages have no
+    // protection to change yet, and get theirs when they are committed
 #if defined(_WIN32)
     DWORD old;
-    if (!VirtualProtect(this->base, this->size, PAGE_READWRITE, &old)) {
+    if (!VirtualProtect(this->base, this->code_committed, PAGE_READWRITE, &old)) {
         LOG_F(ERROR, "JIT: could not make code memory writable");
         return false;
     }
 #else
-    if (mprotect(this->base, this->size, PROT_READ | PROT_WRITE) != 0) {
+    if (mprotect(this->base, this->code_committed, PROT_READ | PROT_WRITE) != 0) {
         LOG_F(ERROR, "JIT: could not make code memory writable");
         return false;
     }
@@ -162,12 +245,12 @@ bool CodeMem::end_write() {
     }
 #if defined(_WIN32)
     DWORD old;
-    if (!VirtualProtect(this->base, this->size, PAGE_EXECUTE_READ, &old)) {
+    if (!VirtualProtect(this->base, this->code_committed, PAGE_EXECUTE_READ, &old)) {
         LOG_F(ERROR, "JIT: could not make code memory executable");
         return false;
     }
 #else
-    if (mprotect(this->base, this->size, PROT_READ | PROT_EXEC) != 0) {
+    if (mprotect(this->base, this->code_committed, PROT_READ | PROT_EXEC) != 0) {
         LOG_F(ERROR, "JIT: could not make code memory executable");
         return false;
     }
@@ -196,6 +279,9 @@ bool CodeMem::begin_write_range(size_t upcoming) {
         this->range_len   = 0;
         this->range_open  = true;
         return true;
+    }
+    if (!this->ensure_code_committed(round_up(end, page))) {
+        return false;
     }
     const size_t len = round_up(end, page) - start;
 
@@ -274,6 +360,9 @@ uint8_t* CodeMem::slot_alloc(size_t bytes, size_t alignment) {
     const size_t start = round_up(this->slot_offset, alignment);
     if (start + bytes > this->slot_size) {
         return nullptr; // full; the exit is emitted without a chain instead
+    }
+    if (!this->ensure_slot_committed(start + bytes)) {
+        return nullptr;
     }
 
     this->slot_offset = start + bytes;

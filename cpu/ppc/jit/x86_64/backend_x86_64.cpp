@@ -209,16 +209,17 @@ public:
             return false;
         }
         // the tail holds the chain slots, a few dozen bytes per block worst
-        // case. The pool is sized so a real boot fits whole: Mac OS 9 keeps
-        // about 26 thousand blocks live, some 50 MB with thunks and slots,
-        // and a pool of 8 MB turned that boot into a flush every other
-        // second, each one throwing away the entire working set. DPPC_JIT_POOL
-        // shrinks it deliberately, which is how the flush paths get exercised
-        // on demand instead of once in a blue moon
-        size_t pool_mb = 64;
+        // case. The pool is a reservation, not a footprint: physical pages
+        // arrive as emission touches them and go back at every flush, so
+        // generosity here costs address space only. What it buys is flush
+        // scarcity, because nothing is reclaimed per block and gross
+        // emission is what fills it; the Cheetah storm emits past 128 MB.
+        // DPPC_JIT_POOL shrinks it deliberately, which is how the flush
+        // paths get exercised on demand instead of once in a blue moon
+        size_t pool_mb = 512;
         if (const char* env = getenv("DPPC_JIT_POOL")) {
             const long n = strtol(env, nullptr, 0);
-            if (n >= 1 && n <= 256) {
+            if (n >= 1 && n <= 4096) {
                 pool_mb = size_t(n);
                 LOG_F(INFO, "JIT: code pool limited to %zu MB", pool_mb);
             }
@@ -368,6 +369,15 @@ private:
             }
 
             if (in.opcode == IROpcode::Branch) {
+                if (in.flags & IR_BRANCH_SIDE_EXIT) {
+                    // taken leaves through the chain with this instruction
+                    // retired, not taken falls through to the rest of the
+                    // block. The builder invalidated its cache, so nothing
+                    // lives across this and the exit scratches freely
+                    this->emit_branch(in, in.insn_idx + 1 - this->accounted);
+                    free_mask = this->pool;
+                    continue;
+                }
                 this->emit_branch(in, ir.insn_count - this->accounted);
                 // it ends the block, so what follows is only the tail below
                 continue;
@@ -696,6 +706,7 @@ private:
         case IROpcode::LoadGPR:
         case IROpcode::LoadSPR:
         case IROpcode::ConstI32:
+        case IROpcode::PcRel:
         case IROpcode::Add:
         case IROpcode::Sub:
         case IROpcode::And:
@@ -760,6 +771,11 @@ private:
             break;
         case IROpcode::ConstI32:
             this->asmb.mov_reg_imm32(dst, in.imm);
+            break;
+        case IROpcode::PcRel:
+            // same shape emit_branch writes LR with: the entry register
+            // holds the address this run actually came in through
+            this->asmb.lea_reg_mem(dst, REG_ENTRYPC, int32_t(in.imm));
             break;
         case IROpcode::Add:
         case IROpcode::And:

@@ -57,6 +57,14 @@ public:
         through every protection flip, because binding and unbinding a chain
         happens while code is executing.
 
+        Reserving is not paying: address space is claimed whole so the code
+        stays contiguous for those rel32s, but physical memory arrives page
+        by page as emission touches it, and reset() hands the pages above
+        the floor back to the operating system. The hosts differ in who
+        keeps the books: POSIX overcommits anonymous mappings by itself,
+        Windows charges commit up front, so there the pages are committed in
+        granules as the watermark advances.
+
         Returns false when the host refuses, which leaves the backend to
         decline every block and everything on the interpreter */
     bool init(size_t bytes, size_t slot_bytes = 0);
@@ -64,8 +72,10 @@ public:
     /** Releases the region back to the operating system */
     void shutdown();
 
-    /** Forgets every block without giving the region back, keeping whatever
-        was emitted before the floor was marked */
+    /** Forgets every block without giving the address space back, keeping
+        whatever was emitted before the floor was marked. The physical pages
+        above the floor go back to the operating system, so the footprint
+        after a flush is the stubs, not the storm that forced it */
     void reset();
 
     /** Declares everything emitted so far permanent, so reset rewinds to here
@@ -107,6 +117,12 @@ public:
     size_t capacity() const { return this->size; }
 
 private:
+    /** Windows only: makes the pages behind [0, end) of the code part or the
+        slot tail real. On POSIX both are committed lazily by the kernel and
+        these are no-ops */
+    bool ensure_code_committed(size_t end);
+    bool ensure_slot_committed(size_t end);
+
     uint8_t* base    = nullptr;
     size_t   size    = 0;      // code bytes only, the tail comes after
     size_t   offset  = 0;
@@ -114,6 +130,8 @@ private:
     size_t   slot_size   = 0;
     size_t   slot_offset = 0;
     size_t   reserved    = 0;  // whole mapping, for the munmap
+    size_t   code_committed = 0; // watermarks, only ever below the
+    size_t   slot_committed = 0; // reservation on Windows
     bool     writable = false;
 
     // the open ranged bracket, page aligned; empty when none is open
