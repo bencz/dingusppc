@@ -32,10 +32,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     happens in reset(), which the code cache calls on a full flush.
 
     Pages are writable or executable, never both. Emission brackets itself
-    with begin_write and end_write, which flip the whole region, so the cost
-    is two system calls per translation rather than per block byte. Nothing
-    executes while the region is writable because translation and execution
-    never overlap in this design.
+    with begin_write_range and end_write_range, which flip only the pages the
+    block being placed will touch; the whole region flip exists for init.
+    Nothing executes while a page is writable because translation and
+    execution never overlap in this design.
  */
 
 #ifndef PPC_JIT_CODEMEM_H
@@ -81,6 +81,18 @@ public:
         architectures that need telling */
     bool end_write();
 
+    /** The per block bracket: flips only the pages the next alloc of
+        `upcoming` bytes will touch, instead of the whole region.
+
+        The whole region flip is fine at init, when nothing has been emitted,
+        but its cost grows with the region: every page gets its protection
+        rewritten and every core its TLB shot down, twice per translation. A
+        booting Mac OS X translates thousands of blocks a second, and with a
+        64 MB pool the emulator was spending most of its time inside those
+        two system calls. A block touches a page or two */
+    bool begin_write_range(size_t upcoming);
+    bool end_write_range();
+
     /** Space for one block, aligned, or nullptr when the region is full.
         Only valid between begin_write and end_write */
     uint8_t* alloc(size_t bytes, size_t alignment = 16);
@@ -103,6 +115,11 @@ private:
     size_t   slot_offset = 0;
     size_t   reserved    = 0;  // whole mapping, for the munmap
     bool     writable = false;
+
+    // the open ranged bracket, page aligned; empty when none is open
+    size_t   range_start = 0;
+    size_t   range_len   = 0;
+    bool     range_open  = false;
 };
 
 } // namespace dppc_jit

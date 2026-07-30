@@ -260,6 +260,34 @@ void X64Emitter::not_reg32(X64Gpr dst) {
     this->modrm_reg(2, uint8_t(dst)); // /2 is not
 }
 
+void X64Emitter::neg_reg32(X64Gpr dst) {
+    this->rex(false, 0, uint8_t(dst));
+    this->emit8(0xF7);
+    this->modrm_reg(3, uint8_t(dst)); // /3 is neg
+}
+
+void X64Emitter::imul_reg_reg32(X64Gpr dst, X64Gpr src) {
+    // the two operand form: OF and CF say the product lost significant bits,
+    // which for the signed 32 bit product is exactly mullwo's overflow
+    this->rex(false, uint8_t(dst), uint8_t(src));
+    this->emit8(0x0F);
+    this->emit8(0xAF);
+    this->modrm_reg(uint8_t(dst), uint8_t(src));
+}
+
+void X64Emitter::imul_reg64_reg64(X64Gpr dst, X64Gpr src) {
+    this->rex(true, uint8_t(dst), uint8_t(src));
+    this->emit8(0x0F);
+    this->emit8(0xAF);
+    this->modrm_reg(uint8_t(dst), uint8_t(src));
+}
+
+void X64Emitter::movsxd_reg64_reg32(X64Gpr dst, X64Gpr src) {
+    this->rex(true, uint8_t(dst), uint8_t(src));
+    this->emit8(0x63);
+    this->modrm_reg(uint8_t(dst), uint8_t(src));
+}
+
 void X64Emitter::setcc_reg8(X64Cond cond, X64Gpr dst) {
     // the low byte of rsp, rbp, rsi and rdi is only reachable through REX,
     // and emitting one turns spl and friends on rather than ah and friends
@@ -284,6 +312,12 @@ void X64Emitter::or_reg_reg32(X64Gpr dst, X64Gpr src) {
     this->rex(false, uint8_t(src), uint8_t(dst));
     this->emit8(0x09);
     this->modrm_reg(uint8_t(src), uint8_t(dst));
+}
+
+void X64Emitter::or_reg_mem32(X64Gpr dst, X64Gpr base, int32_t disp) {
+    this->rex(false, uint8_t(dst), uint8_t(base));
+    this->emit8(0x0B);
+    this->modrm_mem(uint8_t(dst), uint8_t(base), disp);
 }
 
 void X64Emitter::and_reg_imm32(X64Gpr dst, uint32_t imm) {
@@ -591,6 +625,14 @@ void X64Emitter::mov_reg64_mem_abs(X64Gpr dst, const void* addr) {
     this->rex(true, uint8_t(dst), 0);
     this->emit8(0x8B);
     this->emit8(uint8_t(0x05 | ((dst & 7) << 3))); // mod 00 rm 101, RIP relative
+    this->abs_fixups.push_back({this->buf.size(), addr});
+    this->emit32(0);
+}
+
+void X64Emitter::mov_mem64_abs_reg(const void* addr, X64Gpr src) {
+    this->rex(true, uint8_t(src), 0);
+    this->emit8(0x89);
+    this->emit8(uint8_t(0x05 | ((src & 7) << 3))); // mod 00 rm 101, RIP relative
     this->abs_fixups.push_back({this->buf.size(), addr});
     this->emit32(0);
 }

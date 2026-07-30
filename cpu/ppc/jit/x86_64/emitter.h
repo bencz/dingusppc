@@ -52,6 +52,7 @@ enum X64Gpr : uint8_t {
 
 /** Low nibble of the condition, shared by jcc, setcc and cmovcc */
 enum class X64Cond : uint8_t {
+    Overflow   = 0x0, // OF set, the signed overflow of what just ran
     Below      = 0x2, // unsigned <, which is also CF set
     AboveEqual = 0x3, // unsigned >=, which is also CF clear
     Equal      = 0x4, // ZF set
@@ -109,10 +110,13 @@ public:
     void add_reg_reg32(X64Gpr dst, X64Gpr src);   // dst += src
     void sub_reg_reg32(X64Gpr dst, X64Gpr src);   // dst -= src
     void adc_reg_reg32(X64Gpr dst, X64Gpr src);   // dst += src + CF
+    void imul_reg_reg32(X64Gpr dst, X64Gpr src);  // dst *= src, OF on overflow
     void not_reg32(X64Gpr dst);                   // leaves the flags alone
+    void neg_reg32(X64Gpr dst);                   // dst = -dst
     void setcc_reg8(X64Cond cond, X64Gpr dst);    // low byte only
     void and_reg_reg32(X64Gpr dst, X64Gpr src);
     void or_reg_reg32(X64Gpr dst, X64Gpr src);
+    void or_reg_mem32(X64Gpr dst, X64Gpr base, int32_t disp);
     void and_reg_imm32(X64Gpr dst, uint32_t imm);
     void or_reg_imm32(X64Gpr dst, uint32_t imm);
     void xor_reg_imm32(X64Gpr dst, uint32_t imm);
@@ -127,6 +131,8 @@ public:
     // guest address maps to
     void mov_reg64_reg64(X64Gpr dst, X64Gpr src);
     void shr_reg64_imm8(X64Gpr dst, uint8_t sh);
+    void imul_reg64_reg64(X64Gpr dst, X64Gpr src); // full 64 bit product
+    void movsxd_reg64_reg32(X64Gpr dst, X64Gpr src); // sign extend low word
     void mov_reg64_mem(X64Gpr dst, X64Gpr base, int32_t disp);
     void add_reg64_mem(X64Gpr dst, X64Gpr base, int32_t disp);
     void add_reg64_reg64(X64Gpr dst, X64Gpr src);
@@ -174,6 +180,7 @@ public:
         chain slot. Resolved by relocate, like jmp_abs */
     void mov_reg64_mem_abs(X64Gpr dst, const void* addr);
     void cmp_reg_mem32_abs(X64Gpr reg, const void* addr);
+    void mov_mem64_abs_reg(const void* addr, X64Gpr src); // the matching write
 
     void jmp_reg(X64Gpr reg);
     void ret();

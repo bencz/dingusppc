@@ -125,6 +125,7 @@ enum TLBFlags : uint16_t {
 
     tlb_size_mask goes with it and is set once at startup */
 extern TLBEntry* pCurDTLB1;
+extern TLBEntry* pCurITLB1; // likewise, for the chain guard's revalidation
 extern uint32_t  tlb_size_mask;
 
 extern std::function<void(uint32_t bat_reg)> ibat_update;
@@ -147,6 +148,14 @@ extern void tlb_flush_entry(uint32_t ea);
     runs stale code, so every path that touches instruction translation
     counts, even when the flush itself is deferred to the context sync */
 extern uint64_t mmu_itrans_generation;
+
+/** The TLB epochs. The low 12 bits of every tag carry the epoch the entry
+    was filled under, which is what lets a full flush be an increment instead
+    of a sweep; see the note above them in ppcmmu.cpp. Anything comparing a
+    tag by hand, the JIT's inline fast path included, has to fold the right
+    epoch into the value it compares against */
+extern uint32_t g_itlb_epoch;
+extern uint32_t g_dtlb_epoch;
 
 /** Tells the MMU that a physical page started holding translated code.
 

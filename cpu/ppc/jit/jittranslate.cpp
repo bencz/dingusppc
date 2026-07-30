@@ -209,11 +209,19 @@ public:
         this->out.append(in);
     }
 
-    IRValue binary(IROpcode op, IRValue a, IRValue b) {
+    IRValue binary(IROpcode op, IRValue a, IRValue b, bool oe = false) {
         IRInsn in = blank(op);
-        in.a = a;
-        in.b = b;
+        in.a  = a;
+        in.b  = b;
+        in.oe = oe;
         return this->out.append(in);
+    }
+
+    void mtcrf(IRValue a, uint32_t mask) {
+        IRInsn in = blank(IROpcode::MtCrf);
+        in.a   = a;
+        in.imm = mask;
+        this->out.append(in);
     }
 
     IRValue rotl_mask(IRValue a, unsigned sh, unsigned mb, unsigned me) {
@@ -535,7 +543,7 @@ bool decode_branch(Builder& b, uint32_t op) {
     }
 }
 
-/** mfspr and mtspr of the SPRs that are plain storage, plus eieio.
+/** mfspr and mtspr of the SPRs that are plain storage, plus eieio and mtcrf.
 
     LR and CTR bracket every function call as mflr and mtlr, and their helper
     does nothing but move a word; anything with privilege, time or the MMU
@@ -548,6 +556,18 @@ bool decode_spr(Builder& b, uint32_t op) {
     }
 
     if (ext_op(op) == 854) { // eieio
+        return true;
+    }
+
+    if (ext_op(op) == 144) { // mtcrf, whose mask CRM decides once, right here
+        const unsigned crm = (op >> 12) & 0xFF;
+        uint32_t mask = 0;
+        for (int i = 0; i < 8; i++) {
+            if (crm & (0x80 >> i)) {
+                mask |= 0xF0000000UL >> (i * 4);
+            }
+        }
+        b.mtcrf(b.load_gpr((op >> 21) & 31), mask);
         return true;
     }
 
@@ -572,8 +592,9 @@ bool decode_spr(Builder& b, uint32_t op) {
 /** Tries to decode one guest instruction into real operations.
 
     Returns false when the instruction is outside the emitted subset, which
-    leaves the caller to emit a Call. Only forms with Rc and OE clear are
-    taken: the ones that write the condition register wait for lazy flags */
+    leaves the caller to emit a Call. The Rc forms go through SetCR and the
+    OE forms through the oe flag, both picked straight from the boot profile:
+    addco. alone was 8% of a Mac OS 9 boot still running as a helper */
 bool decode_alu(Builder& b, uint32_t op) {
     const unsigned rd = (op >> 21) & 31;
     const unsigned ra = (op >> 16) & 31;
@@ -581,6 +602,11 @@ bool decode_alu(Builder& b, uint32_t op) {
     const unsigned rs = rd; // same field, named by the form
 
     switch (primary_op(op)) {
+    case 7: // mulli
+        b.store_gpr(rd, b.binary(IROpcode::MulLow, b.load_gpr(ra),
+                                 b.constant(uint32_t(int32_t(int16_t(op))))));
+        return true;
+
     case 8: // subfic, whose CA rule the SubCA note in jitir.h explains
         b.store_gpr(rd, b.binary(IROpcode::SubCA,
                                  b.constant(uint32_t(int32_t(int16_t(op)))),
@@ -650,33 +676,52 @@ bool decode_alu(Builder& b, uint32_t op) {
     case 31: {
         IRValue r;
         unsigned dest;
+        // bit 0x200 of the extended opcode is OE wherever both forms exist,
+        // which is why the arithmetic cases below come in pairs
+        const bool oe = (ext_op(op) & 0x200) != 0;
         switch (ext_op(op)) {
-        case 266: // add, with OE clear; the OE form is extended opcode 778
-            r = b.binary(IROpcode::Add, b.load_gpr(ra), b.load_gpr(rb));
+        case 266: case 778: // add, addo
+            r = b.binary(IROpcode::Add, b.load_gpr(ra), b.load_gpr(rb), oe);
             dest = rd;
             break;
-        case 40: // subf
-            r = b.binary(IROpcode::Sub, b.load_gpr(rb), b.load_gpr(ra));
+        case 40: case 552: // subf, subfo
+            r = b.binary(IROpcode::Sub, b.load_gpr(rb), b.load_gpr(ra), oe);
             dest = rd;
             break;
-        case 8: // subfc, rB - rA with CA saying no borrow
-            r = b.binary(IROpcode::SubCA, b.load_gpr(rb), b.load_gpr(ra));
+        case 104: case 616: // neg, nego, which is subf from zero
+            r = b.binary(IROpcode::Sub, b.constant(0), b.load_gpr(ra), oe);
             dest = rd;
             break;
-        case 10: // addc
-            r = b.binary(IROpcode::AddCA, b.load_gpr(ra), b.load_gpr(rb));
+        case 8: case 520: // subfc, subfco, rB - rA with CA saying no borrow
+            r = b.binary(IROpcode::SubCA, b.load_gpr(rb), b.load_gpr(ra), oe);
             dest = rd;
             break;
-        case 138: // adde
-            r = b.binary(IROpcode::AddECA, b.load_gpr(ra), b.load_gpr(rb));
+        case 10: case 522: // addc, addco
+            r = b.binary(IROpcode::AddCA, b.load_gpr(ra), b.load_gpr(rb), oe);
             dest = rd;
             break;
-        case 136: // subfe
-            r = b.binary(IROpcode::SubECA, b.load_gpr(ra), b.load_gpr(rb));
+        case 138: case 650: // adde, addeo
+            r = b.binary(IROpcode::AddECA, b.load_gpr(ra), b.load_gpr(rb), oe);
             dest = rd;
             break;
-        case 202: // addze, which is adde against zero
-            r = b.binary(IROpcode::AddECA, b.load_gpr(ra), b.constant(0));
+        case 136: case 648: // subfe, subfeo
+            r = b.binary(IROpcode::SubECA, b.load_gpr(ra), b.load_gpr(rb), oe);
+            dest = rd;
+            break;
+        case 202: case 714: // addze, addzeo, which is adde against zero
+            r = b.binary(IROpcode::AddECA, b.load_gpr(ra), b.constant(0), oe);
+            dest = rd;
+            break;
+        case 235: case 747: // mullw, mullwo
+            r = b.binary(IROpcode::MulLow, b.load_gpr(ra), b.load_gpr(rb), oe);
+            dest = rd;
+            break;
+        case 75: // mulhw
+            r = b.binary(IROpcode::MulHighS, b.load_gpr(ra), b.load_gpr(rb));
+            dest = rd;
+            break;
+        case 11: // mulhwu
+            r = b.binary(IROpcode::MulHighU, b.load_gpr(ra), b.load_gpr(rb));
             dest = rd;
             break;
         case 444: // or, which is also mr when rs == rb

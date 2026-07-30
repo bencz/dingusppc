@@ -80,13 +80,18 @@ void ppc_code_cache_add(uint32_t phys_addr, uint32_t size, CodeBlockHandle handl
     The MMU asks this when refilling a data TLB entry to decide whether to
     leave PAGE_WRITABLE off.
 
-    A page becomes protected when it receives its first block and stays that
-    way until ppc_code_cache_init, including after its last block is dropped.
-    Saying so costs a scan of every data TLB entry, and a page holding code
-    gains and loses blocks constantly, so letting the answer flap costs far
-    more than protecting a page that no longer needs it. Over-protecting only
-    ever costs speed: the slow store path does everything the fast one does */
+    A page becomes protected when it receives its first block and stays
+    protected while it holds any; the store that finds it empty is what
+    releases it, through ppc_code_cache_store_to_page below */
 bool ppc_code_cache_page_is_protected(uint32_t phys_addr);
+
+/** A store landed on a protected page. Drops only what it overlapped and
+    answers whether the page still holds translated code afterwards; when it
+    does not, the page leaves the protected set and the caller may hand
+    writability back. While it does, the page must stay routed through the
+    slow store path, because healing it while code remains is how a stale
+    mapping lets a store slip past the next block unnoticed */
+bool ppc_code_cache_store_to_page(uint32_t phys_addr, uint32_t size);
 
 /** Drops every block overlapping the range and returns how many went away */
 unsigned ppc_code_cache_invalidate(uint32_t phys_addr, uint32_t size);

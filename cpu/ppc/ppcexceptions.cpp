@@ -29,11 +29,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <stdexcept>
 #include <string>
 
+uint64_t g_exceptions_raised = 0;
+
 #if !defined(PPC_TESTS) && !defined(PPC_BENCHMARKS)
 void ppc_exception_handler(Except_Type exception_type, uint32_t srr1_bits) {
 #ifdef CPU_PROFILING
     exceptions_processed++;
 #endif
+    g_exceptions_raised++;
 
     switch (exception_type) {
     case Except_Type::EXC_SYSTEM_RESET:

@@ -166,6 +166,7 @@ constexpr int32_t TLB_TAG_OFFSET  = int32_t(offsetof(TLBEntry, tag));
 constexpr int32_t TLB_HOSTR_OFFSET = int32_t(offsetof(TLBEntry, host_va_offs_r));
 constexpr int32_t TLB_HOSTW_OFFSET = int32_t(offsetof(TLBEntry, host_va_offs_w));
 constexpr int32_t TLB_FLAGS_OFFSET = int32_t(offsetof(TLBEntry, flags));
+constexpr int32_t TLB_PHYS_OFFSET  = int32_t(offsetof(TLBEntry, phys_tag));
 
 /** What the write fast path insists on. Without PAGE_WRITABLE the page is
     either read only, which is a DSI, or it holds translated code and the
@@ -189,12 +190,13 @@ public:
             return false;
         }
         // the tail holds the chain slots, a few dozen bytes per block worst
-        // case. The pool is sized so a boot flushes rarely: with the chain
-        // thunks a block runs bigger, and two megabytes were filling within
-        // seconds, each flush throwing away thousands of live translations.
-        // DPPC_JIT_POOL shrinks it deliberately, which is how the flush
-        // paths get exercised on demand instead of once in a blue moon
-        size_t pool_mb = 8;
+        // case. The pool is sized so a real boot fits whole: Mac OS 9 keeps
+        // about 26 thousand blocks live, some 50 MB with thunks and slots,
+        // and a pool of 8 MB turned that boot into a flush every other
+        // second, each one throwing away the entire working set. DPPC_JIT_POOL
+        // shrinks it deliberately, which is how the flush paths get exercised
+        // on demand instead of once in a blue moon
+        size_t pool_mb = 64;
         if (const char* env = getenv("DPPC_JIT_POOL")) {
             const long n = strtol(env, nullptr, 0);
             if (n >= 1 && n <= 256) {
@@ -217,7 +219,7 @@ public:
             return nullptr;
         }
 
-        if (!this->code.begin_write()) {
+        if (!this->code.begin_write_range(this->asmb.size())) {
             return nullptr;
         }
 
@@ -226,7 +228,7 @@ public:
             // the region is full. Declining sends this block to the threaded
             // backend; the flag asks the caller for a flush so the next one
             // does not have to go the same way
-            this->code.end_write();
+            this->code.end_write_range();
             this->full = true;
             LOG_F(INFO, "JIT: code memory full after %zu bytes", this->code.used());
             return nullptr;
@@ -239,7 +241,7 @@ public:
         // where the instruction ends up
         const bool relocated = this->asmb.relocate(dst);
 
-        if (!this->code.end_write()) {
+        if (!this->code.end_write_range()) {
             return nullptr;
         }
         if (!relocated) {
@@ -350,6 +352,22 @@ private:
             if (in.opcode == IROpcode::AddCA || in.opcode == IROpcode::AddECA ||
                 in.opcode == IROpcode::SubCA || in.opcode == IROpcode::SubECA) {
                 if (!this->emit_carry(in, i, free_mask)) {
+                    return false;
+                }
+                continue;
+            }
+
+            if (in.opcode == IROpcode::MtCrf) {
+                if (!this->emit_mtcrf(in, i, free_mask)) {
+                    return false;
+                }
+                continue;
+            }
+
+            // the OE forms of the plain arithmetic; the carry family above
+            // deals with its own OE inside emit_carry
+            if (in.oe) {
+                if (!this->emit_ov_op(in, i, free_mask)) {
                     return false;
                 }
                 continue;
@@ -484,12 +502,16 @@ private:
         }
         slot->pred0 = 1; // matches nothing until the resolver binds
         slot->gen0  = 0;
+        slot->phys0 = 0;
         slot->pred1 = 1;
         slot->gen1  = 0;
+        slot->phys1 = 0;
         slot->flip  = 0;
 
         X64Emitter::Label to_dispatch = this->asmb.new_label();
         X64Emitter::Label try_way1    = this->asmb.new_label();
+        X64Emitter::Label probe0      = this->asmb.new_label();
+        X64Emitter::Label probe1      = this->asmb.new_label();
         X64Emitter::Label thunk       = this->asmb.new_label();
 
         if (retired) {
@@ -505,13 +527,13 @@ private:
         // agree on it; the low half of each prediction is the compare, the
         // layout being little endian. The resolver keeps the predictions
         // distinct, so a matching way with a stale generation means no other
-        // way can match and the thunk is the right place to go
+        // way can match and the probe is the right place to go
         this->asmb.mov_reg_reg32(REG_ENTRYPC, RDX);
         this->asmb.cmp_reg_mem32_abs(RDX, &slot->pred0);
         this->asmb.jcc(X64Cond::NotEqual, try_way1);
         this->asmb.mov_reg64_mem_abs(RAX, &slot->gen0);
         this->asmb.cmp_reg64_mem(RAX, REG_TIME, this->gen_disp);
-        this->asmb.jcc(X64Cond::NotEqual, thunk);
+        this->asmb.jcc(X64Cond::NotEqual, probe0);
         this->asmb.xor_reg_reg32(REG_RETIRED, REG_RETIRED);
         this->asmb.jmp_mem_abs(&slot->code0);
 
@@ -520,7 +542,7 @@ private:
         this->asmb.jcc(X64Cond::NotEqual, thunk);
         this->asmb.mov_reg64_mem_abs(RAX, &slot->gen1);
         this->asmb.cmp_reg64_mem(RAX, REG_TIME, this->gen_disp);
-        this->asmb.jcc(X64Cond::NotEqual, thunk);
+        this->asmb.jcc(X64Cond::NotEqual, probe1);
         this->asmb.xor_reg_reg32(REG_RETIRED, REG_RETIRED);
         this->asmb.jmp_mem_abs(&slot->code1);
 
@@ -529,8 +551,51 @@ private:
         this->asmb.xor_reg_reg32(REG_RETIRED, REG_RETIRED);
         this->asmb.jmp_abs(this->dispatch);
 
+        // the stale generation second chance, one per way: reads the primary
+        // ITLB entry for the target and, when it is fresh under the current
+        // epoch and still names the physical page the way was bound to,
+        // restamps the generation and takes the jump without ever leaving
+        // generated code. Mac OS X moves the generation thousands of times a
+        // second without moving the mappings underneath, and this is what
+        // keeps that from unbinding the world each time
+        this->emit_va_probe(probe0, thunk, &slot->phys0, &slot->gen0, &slot->code0);
+        this->emit_va_probe(probe1, thunk, &slot->phys1, &slot->gen1, &slot->code1);
+
         this->va_chain_exits.push_back({slot, 0, thunk});
         return true;
+    }
+
+    /** The inline revalidation emit_va_chained_exit describes. RDX holds the
+        target address and stays untouched for the thunk's sake; RAX and the
+        scratch register are free here, nothing being live at an exit */
+    void emit_va_probe(X64Emitter::Label probe, X64Emitter::Label thunk,
+                       uint32_t* phys, uint64_t* gen, void** code) {
+        this->asmb.bind(probe);
+
+        // entry = pCurITLB1 + ((va >> 12) & tlb_size_mask) * sizeof(TLBEntry)
+        this->asmb.mov_reg_reg32(RAX, RDX);
+        this->asmb.shr_reg_imm8(RAX, PPC_PAGE_SIZE_BITS);
+        this->asmb.and_reg_imm32(RAX, TLB_SIZE - 1);
+        this->asmb.shl_reg_imm8(RAX, TLB_ENTRY_SHIFT);
+        this->asmb.mov_reg_imm64(REG_SCRATCH, uint64_t(uintptr_t(&pCurITLB1)));
+        this->asmb.add_reg64_mem(RAX, REG_SCRATCH, 0);
+
+        // fresh under the current epoch?
+        this->asmb.mov_reg_reg32(REG_SCRATCH, RDX);
+        this->asmb.and_reg_imm32(REG_SCRATCH, PPC_PAGE_MASK);
+        this->asmb.or_reg_mem32(REG_SCRATCH, REG_TIME, this->iepoch_disp);
+        this->asmb.cmp_mem_reg32(RAX, TLB_TAG_OFFSET, REG_SCRATCH);
+        this->asmb.jcc(X64Cond::NotEqual, thunk);
+
+        // still the physical page the binding was made to?
+        this->asmb.mov_reg_mem32(REG_SCRATCH, RAX, TLB_PHYS_OFFSET);
+        this->asmb.cmp_reg_mem32_abs(REG_SCRATCH, phys);
+        this->asmb.jcc(X64Cond::NotEqual, thunk);
+
+        this->asmb.mov_reg64_mem(RAX, REG_TIME, this->gen_disp);
+        this->asmb.mov_mem64_abs_reg(gen, RAX);
+        this->asmb.xor_reg_reg32(REG_RETIRED, REG_RETIRED);
+        this->asmb.jmp_mem_abs(code);
     }
 
     /** One resolver per chained exit, emitted with the block and pointed at
@@ -601,6 +666,9 @@ private:
         case IROpcode::Xor:
         case IROpcode::RotlMask:
         case IROpcode::Exts:
+        case IROpcode::MulLow:
+        case IROpcode::MulHighS:
+        case IROpcode::MulHighU:
             return true;
         default:
             return false;
@@ -660,6 +728,7 @@ private:
         case IROpcode::And:
         case IROpcode::Or:
         case IROpcode::Xor:
+        case IROpcode::MulLow:
             this->emit_commutative(in.opcode, dst, ra, rb);
             break;
         case IROpcode::Sub:
@@ -669,6 +738,29 @@ private:
             if (dst != ra) this->asmb.mov_reg_reg32(dst, ra);
             this->asmb.sub_reg_reg32(dst, rb);
             break;
+        case IROpcode::MulHighS: {
+            // both operands sign extended to 64 bits, full product, top half.
+            // The scratch copy goes first: when dst aliases an operand the
+            // other one has to be read before dst is overwritten
+            const X64Gpr self  = (dst == rb) ? rb : ra;
+            const X64Gpr other = (dst == rb) ? ra : rb;
+            this->asmb.movsxd_reg64_reg32(REG_SCRATCH, other);
+            this->asmb.movsxd_reg64_reg32(dst, self);
+            this->asmb.imul_reg64_reg64(dst, REG_SCRATCH);
+            this->asmb.shr_reg64_imm8(dst, 32);
+            break;
+        }
+        case IROpcode::MulHighU: {
+            // every I32 value leaves its upper half zero, since each producer
+            // is a 32 bit operation, so the operands are already the zero
+            // extended 64 bit values the unsigned product needs
+            const X64Gpr self  = (dst == rb) ? rb : ra;
+            const X64Gpr other = (dst == rb) ? ra : rb;
+            if (dst != self) this->asmb.mov_reg_reg32(dst, self);
+            this->asmb.imul_reg64_reg64(dst, other);
+            this->asmb.shr_reg64_imm8(dst, 32);
+            break;
+        }
         case IROpcode::RotlMask:
             if (dst != ra) this->asmb.mov_reg_reg32(dst, ra);
             this->asmb.rol_reg_imm8(dst, in.sh);
@@ -691,8 +783,10 @@ private:
     }
 
     static bool is_commutative(IROpcode op) {
-        return op == IROpcode::Add || op == IROpcode::And ||
-               op == IROpcode::Or  || op == IROpcode::Xor;
+        return op == IROpcode::Add      || op == IROpcode::And ||
+               op == IROpcode::Or       || op == IROpcode::Xor ||
+               op == IROpcode::MulLow   || op == IROpcode::MulHighS ||
+               op == IROpcode::MulHighU;
     }
 
     /** The XER[CA] family: the operation itself, then the host carry flag
@@ -772,14 +866,28 @@ private:
             break;
         }
 
-        // SubCA wants no-borrow, everything else wants the carry as it is
+        // SubCA wants no-borrow, everything else wants the carry as it is.
+        // Both setcc go first, before anything can disturb the flags; the OE
+        // forms fold the overflow in as SO|OV set together and OV cleared
+        // alone, which is what ppc_setsoov does. The host OF is that overflow
+        // for every shape here, carry in included
         this->asmb.setcc_reg8(in.opcode == IROpcode::SubCA ? X64Cond::AboveEqual
                                                            : X64Cond::Below,
                               REG_SCRATCH);
+        if (in.oe) {
+            this->asmb.setcc_reg8(X64Cond::Overflow, rtmp);
+        }
         this->asmb.movzx_reg8(REG_SCRATCH, REG_SCRATCH);
         this->asmb.shl_reg_imm8(REG_SCRATCH, 29);
+        if (in.oe) {
+            this->asmb.movzx_reg8(rtmp, rtmp);
+            this->asmb.neg_reg32(rtmp); // all ones when it overflowed
+            this->asmb.and_reg_imm32(rtmp, XER::SO | XER::OV);
+            this->asmb.or_reg_reg32(REG_SCRATCH, rtmp);
+        }
         this->asmb.mov_reg_mem32(rtmp, REG_STATE, XER_OFFSET);
-        this->asmb.and_reg_imm32(rtmp, ~uint32_t(XER::CA));
+        this->asmb.and_reg_imm32(rtmp, in.oe ? ~uint32_t(XER::CA | XER::OV)
+                                             : ~uint32_t(XER::CA));
         this->asmb.or_reg_reg32(rtmp, REG_SCRATCH);
         this->asmb.mov_mem_reg32(REG_STATE, XER_OFFSET, rtmp);
 
@@ -789,8 +897,86 @@ private:
         return true;
     }
 
-    /** All four are commutative, so when the destination landed on the second
-        operand the operands simply swap instead of needing a temporary */
+    /** The OE forms outside the carry family: addo, subfo, nego and mullwo.
+        The operation is the plain one, the host OF is the guest overflow, and
+        the XER merge is the same shape emit_carry uses minus the CA bit */
+    bool emit_ov_op(const IRInsn& in, size_t idx, uint32_t& free_mask) {
+        const X64Gpr ra = X64Gpr(this->reg_of[in.a]);
+        const X64Gpr rb = X64Gpr(this->reg_of[in.b]);
+        const bool a_dies = this->last_use[in.a] == idx;
+        const bool b_dies = this->last_use[in.b] == idx;
+        const bool commutative = in.opcode != IROpcode::Sub;
+
+        X64Gpr dst;
+        if (a_dies) {
+            dst = ra;
+        } else if (b_dies && commutative) {
+            dst = rb;
+        } else {
+            if (!free_mask) {
+                return false;
+            }
+            dst = X64Gpr(lowest_bit(free_mask));
+            free_mask &= ~bit(uint8_t(dst));
+        }
+
+        const uint32_t avail = free_mask & ~bit(uint8_t(dst)) &
+                               ~bit(uint8_t(ra)) & ~bit(uint8_t(rb));
+        if (!avail) {
+            return false;
+        }
+        const X64Gpr rtmp = X64Gpr(lowest_bit(avail));
+
+        if (in.opcode == IROpcode::Sub) {
+            if (dst != ra) this->asmb.mov_reg_reg32(dst, ra);
+            this->asmb.sub_reg_reg32(dst, rb);
+        } else {
+            this->emit_commutative(in.opcode, dst, ra, rb);
+        }
+
+        this->asmb.setcc_reg8(X64Cond::Overflow, REG_SCRATCH);
+        this->asmb.movzx_reg8(REG_SCRATCH, REG_SCRATCH);
+        this->asmb.neg_reg32(REG_SCRATCH);
+        this->asmb.and_reg_imm32(REG_SCRATCH, XER::SO | XER::OV);
+        this->asmb.mov_reg_mem32(rtmp, REG_STATE, XER_OFFSET);
+        this->asmb.and_reg_imm32(rtmp, ~uint32_t(XER::OV));
+        this->asmb.or_reg_reg32(rtmp, REG_SCRATCH);
+        this->asmb.mov_mem_reg32(REG_STATE, XER_OFFSET, rtmp);
+
+        if (a_dies && ra != dst) free_mask |= bit(uint8_t(ra));
+        if (b_dies && rb != dst) free_mask |= bit(uint8_t(rb));
+        this->reg_of[idx] = uint8_t(dst);
+        return true;
+    }
+
+    /** mtcrf. The full mask is one store; anything partial merges under a
+        mask that has been a constant since translation */
+    bool emit_mtcrf(const IRInsn& in, size_t idx, uint32_t& free_mask) {
+        const X64Gpr ra = X64Gpr(this->reg_of[in.a]);
+        const bool a_dies = this->last_use[in.a] == idx;
+
+        if (in.imm == 0xFFFFFFFFUL) {
+            this->asmb.mov_mem_reg32(REG_STATE, CR_OFFSET, ra);
+        } else if (in.imm != 0) { // a zero CRM writes nothing at all
+            const uint32_t avail = free_mask & ~bit(uint8_t(ra));
+            if (!avail) {
+                return false;
+            }
+            const X64Gpr rtmp = X64Gpr(lowest_bit(avail));
+            this->asmb.mov_reg_reg32(REG_SCRATCH, ra);
+            this->asmb.and_reg_imm32(REG_SCRATCH, in.imm);
+            this->asmb.mov_reg_mem32(rtmp, REG_STATE, CR_OFFSET);
+            this->asmb.and_reg_imm32(rtmp, ~in.imm);
+            this->asmb.or_reg_reg32(rtmp, REG_SCRATCH);
+            this->asmb.mov_mem_reg32(REG_STATE, CR_OFFSET, rtmp);
+        }
+
+        if (a_dies) free_mask |= bit(uint8_t(ra));
+        return true;
+    }
+
+    /** Every op here is commutative, so when the destination landed on the
+        second operand the operands simply swap instead of needing a temporary */
     void emit_commutative(IROpcode op, X64Gpr dst, X64Gpr a, X64Gpr b) {
         X64Gpr other;
         if (dst == a) {
@@ -802,10 +988,11 @@ private:
             other = b;
         }
         switch (op) {
-        case IROpcode::Add: this->asmb.add_reg_reg32(dst, other); break;
-        case IROpcode::And: this->asmb.and_reg_reg32(dst, other); break;
-        case IROpcode::Or:  this->asmb.or_reg_reg32(dst, other);  break;
-        default:            this->asmb.xor_reg_reg32(dst, other); break;
+        case IROpcode::Add:    this->asmb.add_reg_reg32(dst, other);  break;
+        case IROpcode::And:    this->asmb.and_reg_reg32(dst, other);  break;
+        case IROpcode::Or:     this->asmb.or_reg_reg32(dst, other);   break;
+        case IROpcode::MulLow: this->asmb.imul_reg_reg32(dst, other); break;
+        default:               this->asmb.xor_reg_reg32(dst, other);  break;
         }
     }
 
@@ -1046,9 +1233,11 @@ private:
         this->asmb.mov_reg_imm64(REG_SCRATCH, uint64_t(uintptr_t(&pCurDTLB1)));
         this->asmb.add_reg64_mem(rtmp, REG_SCRATCH, 0);
 
-        // entry->tag == (ea & ~0xFFF) ?
+        // entry->tag == (ea & ~0xFFF) | dtlb_epoch ? An entry filled under an
+        // older epoch mismatches by construction, which is the whole flush
         this->asmb.mov_reg_reg32(rdst, rea);
         this->asmb.and_reg_imm32(rdst, PPC_PAGE_MASK);
+        this->asmb.or_reg_mem32(rdst, REG_TIME, this->depoch_disp);
         this->asmb.cmp_mem_reg32(rtmp, TLB_TAG_OFFSET, rdst);
         this->asmb.jcc(X64Cond::NotEqual, slow);
 
@@ -1215,6 +1404,7 @@ private:
 
         this->asmb.mov_reg_reg32(rtag, rea);
         this->asmb.and_reg_imm32(rtag, PPC_PAGE_MASK);
+        this->asmb.or_reg_mem32(rtag, REG_TIME, this->depoch_disp);
         this->asmb.cmp_mem_reg32(rtmp, TLB_TAG_OFFSET, rtag);
         this->asmb.jcc(X64Cond::NotEqual, slow);
 
@@ -1404,11 +1594,15 @@ private:
         const int64_t dline = disp_from_state(&g_icycles_max);
         const int64_t timer = disp_from_state(const_cast<const bool*>(&exec_timer));
         const int64_t gen   = disp_from_state(&mmu_itrans_generation);
+        const int64_t depo  = disp_from_state(&g_dtlb_epoch);
+        const int64_t iepo  = disp_from_state(&g_itlb_epoch);
 
         if (icyc  < INT32_MIN || icyc  > INT32_MAX ||
             dline < INT32_MIN || dline > INT32_MAX ||
             timer < INT32_MIN || timer > INT32_MAX ||
-            gen   < INT32_MIN || gen   > INT32_MAX) {
+            gen   < INT32_MIN || gen   > INT32_MAX ||
+            depo  < INT32_MIN || depo  > INT32_MAX ||
+            iepo  < INT32_MIN || iepo  > INT32_MAX) {
             return false;
         }
 
@@ -1416,6 +1610,8 @@ private:
         this->deadline_disp = int32_t(dline);
         this->timer_disp    = int32_t(timer);
         this->gen_disp      = int32_t(gen);
+        this->depoch_disp   = int32_t(depo);
+        this->iepoch_disp   = int32_t(iepo);
         return true;
     }
 
@@ -1455,6 +1651,8 @@ private:
     int32_t               deadline_disp = 0;
     int32_t               timer_disp    = 0;
     int32_t               gen_disp      = 0;
+    int32_t               depoch_disp   = 0;
+    int32_t               iepoch_disp   = 0;
 
     /** Guest instructions of the block already handed to the retired counter
         by a settling point, so every exit knows what is still owed */

@@ -70,6 +70,17 @@ inline uint32_t rotl32(uint32_t v, unsigned sh) {
     return sh ? ((v << sh) | (v >> (32 - sh))) : v;
 }
 
+/** ppc_setsoov, word for word: SO and OV set together, OV cleared alone.
+    The caller hands in the same operands the interpreter hands in, which for
+    the add family means ~b rather than b */
+inline void set_soov(uint32_t a, uint32_t b, uint32_t d) {
+    if (int32_t((a ^ b) & (a ^ d)) < 0) {
+        ppc_state.spr[SPR::XER] |= XER::SO | XER::OV;
+    } else {
+        ppc_state.spr[SPR::XER] &= ~XER::OV;
+    }
+}
+
 void threaded_entry(const JitBlock* blk) {
     const ThreadedPayload* payload = static_cast<const ThreadedPayload*>(blk->payload);
 
@@ -102,38 +113,54 @@ void threaded_entry(const JitBlock* blk) {
         case IROpcode::ConstI32:
             vals[i] = in.imm;
             break;
-        case IROpcode::Add:
-            vals[i] = vals[in.a] + vals[in.b];
+        case IROpcode::Add: {
+            const uint32_t a = vals[in.a];
+            const uint32_t b = vals[in.b];
+            const uint32_t d = a + b;
+            if (in.oe) set_soov(a, ~b, d);
+            vals[i] = d;
             break;
-        case IROpcode::Sub:
-            vals[i] = vals[in.a] - vals[in.b];
+        }
+        case IROpcode::Sub: {
+            const uint32_t a = vals[in.a];
+            const uint32_t b = vals[in.b];
+            const uint32_t d = a - b;
+            if (in.oe) set_soov(a, b, d);
+            vals[i] = d;
             break;
+        }
 
         // the XER[CA] family replicates the interpreter helpers word for
         // word, quirks included; jitir.h says which formula belongs to whom
         case IROpcode::AddCA: {
             const uint32_t a = vals[in.a];
-            const uint32_t d = a + vals[in.b];
+            const uint32_t b = vals[in.b];
+            const uint32_t d = a + b;
             if (d < a) ppc_state.spr[SPR::XER] |=  XER::CA;
             else       ppc_state.spr[SPR::XER] &= ~XER::CA;
+            if (in.oe) set_soov(a, ~b, d);
             vals[i] = d;
             break;
         }
         case IROpcode::AddECA: {
             const uint32_t a  = vals[in.a];
+            const uint32_t b  = vals[in.b];
             const uint32_t ca = !!(ppc_state.spr[SPR::XER] & XER::CA);
-            const uint32_t d  = a + vals[in.b] + ca;
+            const uint32_t d  = a + b + ca;
             if ((d < a) || (ca && d == a)) ppc_state.spr[SPR::XER] |=  XER::CA;
             else                           ppc_state.spr[SPR::XER] &= ~XER::CA;
+            if (in.oe) set_soov(a, ~b, d);
             vals[i] = d;
             break;
         }
         case IROpcode::SubCA: {
             const uint32_t a = vals[in.a];
             const uint32_t b = vals[in.b];
+            const uint32_t d = a - b;
             if (a >= b) ppc_state.spr[SPR::XER] |=  XER::CA;
             else        ppc_state.spr[SPR::XER] &= ~XER::CA;
-            vals[i] = a - b;
+            if (in.oe) set_soov(a, b, d);
+            vals[i] = d;
             break;
         }
         case IROpcode::SubECA: {
@@ -145,9 +172,35 @@ void threaded_entry(const JitBlock* blk) {
                 ppc_state.spr[SPR::XER] |=  XER::CA;
             else
                 ppc_state.spr[SPR::XER] &= ~XER::CA;
+            if (in.oe) set_soov(bv, a, d);
             vals[i] = d;
             break;
         }
+
+        case IROpcode::MulLow: {
+            const int64_t product =
+                int64_t(int32_t(vals[in.a])) * int64_t(int32_t(vals[in.b]));
+            if (in.oe) {
+                if (product != int64_t(int32_t(product))) {
+                    ppc_state.spr[SPR::XER] |= XER::SO | XER::OV;
+                } else {
+                    ppc_state.spr[SPR::XER] &= ~XER::OV;
+                }
+            }
+            vals[i] = uint32_t(product);
+            break;
+        }
+        case IROpcode::MulHighS:
+            vals[i] = uint32_t((int64_t(int32_t(vals[in.a])) *
+                                int64_t(int32_t(vals[in.b]))) >> 32);
+            break;
+        case IROpcode::MulHighU:
+            vals[i] = uint32_t((uint64_t(vals[in.a]) * uint64_t(vals[in.b])) >> 32);
+            break;
+
+        case IROpcode::MtCrf:
+            ppc_state.cr = (ppc_state.cr & ~in.imm) | (vals[in.a] & in.imm);
+            break;
         case IROpcode::And:
             vals[i] = vals[in.a] & vals[in.b];
             break;

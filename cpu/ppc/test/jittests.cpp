@@ -154,14 +154,22 @@ static void test_icbi_invalidation(const RunResult& interp) {
     jit_check(ppc_jit_num_blocks() == 2, "and the code translated again");
 }
 
-/** A store into a page holding blocks takes them down through the PAGE_CODE
-    path, without the guest having to run icbi at all */
+/** A store into translated code takes the block down through the PAGE_CODE
+    path, without the guest having to run icbi at all; a store elsewhere on
+    the page leaves the blocks alone and only pays the slow path */
 static void test_store_invalidation(const RunResult& interp) {
     jit_check(ppc_jit_num_blocks() == 2, "starting from two cached blocks");
 
     // somewhere on the code page but past the code itself
     mmu_write_vmem<uint32_t>(NO_OPCODE, CODE_BASE + 0x800, 0x12345678);
-    jit_check(ppc_jit_num_blocks() == 0, "a store to the code page dropped the blocks");
+    jit_check(ppc_jit_num_blocks() == 2, "a store beside the code drops nothing");
+
+    // straight into the first instruction
+    mmu_write_vmem<uint32_t>(NO_OPCODE, CODE_BASE, 0x60000000);
+    jit_check(ppc_jit_num_blocks() < 2, "a store into the code dropped its block");
+
+    // put the original instruction back so the reference run still holds
+    mmu_write_vmem<uint32_t>(NO_OPCODE, CODE_BASE, test_code[0]);
 
     RunResult after = run_test_code();
     jit_check(same_run(interp, after), "the code still runs the same afterwards");
@@ -946,6 +954,116 @@ static void test_carry_subset() {
     }
 }
 
+/*  The OE forms, the multiply family and mtcrf. Overflows and clean results
+    alternate so that OV is seen both raised and cleared while SO sticks, the
+    CA consumers run against a CA a previous instruction produced, and the
+    forms with every operand in one register cover the aliasing rules of the
+    emitter. The second pass starts with SO, OV and CA already set.  */
+static const uint32_t ov_code[] = {
+    0x3C607FFF, // addis  r3, r0, 0x7FFF
+    0x6063FFFF, // ori    r3, r3, 0xFFFF     r3 = 0x7FFFFFFF
+    0x38800001, // li     r4, 1
+    0x39A0FFFE, // li     r13, -2
+    0x7CA32614, // addo   r5, r3, r4         overflow into 0x80000000
+    0x7CC32415, // addco. r6, r3, r4         carry and overflow together
+    0x7CE42614, // addo   r7, r4, r4         clean, OV falls, SO stays
+    0x7D0319D6, // mullwo r8, r3, r3         the product loses its top half
+    0x7D2425D7, // mullwo. r9, r4, r4        clean, with CR0
+    0x1D43FFFE, // mulli  r10, r3, -2
+    0x7D631896, // mulhw  r11, r3, r3
+    0x7D836816, // mulhwu r12, r3, r13       unsigned reading of -2
+    0x7DC36896, // mulhw  r14, r3, r13       signed reading of the same
+    0x7DE41C10, // subfco r15, r4, r3        CA set, no overflow
+    0x7E431D14, // addeo  r18, r3, r3        consumes that CA, overflows
+    0x7E631D10, // subfeo r19, r3, r3        clean, CA falls
+    0x7E850594, // addzeo r20, r5
+    0x7E2504D0, // nego   r17, r5            the one negation that overflows
+    0x7E0304D0, // nego   r16, r3            and the ordinary one after it
+    0x7EA32C50, // subfo  r21, r3, r5        negative minus positive
+    0x7ED6B5D6, // mullwo r22, r22, r22      dst and both operands aliased
+    0x7EF7BD14, // addeo  r23, r23, r23      likewise through the carry path
+    0x7F18C510, // subfeo r24, r24, r24      the flipped operand may not alias
+    0x7F39C896, // mulhw  r25, r25, r25
+    0x7E481120, // mtcrf  0x81, r18          two fields merged
+    0x7DEFF120, // mtcrf  0xFF, r15          the full mask single store
+    0x7C808120, // mtcrf  0x08, r4           one field, from a value with none
+    0x00000000, // illegal on purpose, the program stops here
+};
+
+constexpr uint32_t OV_BASE = 0x8400;
+constexpr uint32_t OV_END  = OV_BASE + uint32_t(sizeof(ov_code) - 4);
+
+static void load_ov_code() {
+    for (size_t i = 0; i < sizeof(ov_code) / sizeof(ov_code[0]); i++) {
+        mmu_write_vmem<uint32_t>(NO_OPCODE, OV_BASE + uint32_t(i) * 4, ov_code[i]);
+    }
+}
+
+static CarryResult run_ov_code(uint32_t xer_in) {
+    for (int i = 0; i < 32; i++) {
+        ppc_state.gpr[i] = 0xA5A50000u | uint32_t(i);
+    }
+    ppc_state.cr = 0x0F0F0F0F;
+    ppc_state.spr[SPR::XER] = xer_in;
+    ppc_state.pc  = OV_BASE;
+    g_icycles     = 0;
+    g_icycles_max = 0;
+    exec_flags    = 0;
+    power_on      = true;
+
+    ppc_exec_until(OV_END);
+
+    CarryResult r;
+    for (int i = 0; i < 32; i++) r.regs.gpr[i] = ppc_state.gpr[i];
+    r.regs.pc      = ppc_state.pc;
+    r.regs.retired = g_icycles;
+    r.xer          = ppc_state.spr[SPR::XER];
+    r.cr           = ppc_state.cr;
+    return r;
+}
+
+/** Emitted overflow reads the host OF where the interpreter compares sign
+    bits by hand, and the two have to agree in XER, in CR and in every
+    register, from a clean XER and from one with everything already up */
+static void test_ov_subset() {
+    load_ov_code();
+
+    for (int pass = 0; pass < 2; pass++) {
+        const uint32_t xer_in = pass ? (XER::SO | XER::OV | XER::CA) : 0;
+
+        ppc_jit_disable();
+        CarryResult interp = run_ov_code(xer_in);
+        jit_check(interp.regs.pc == OV_END,
+                  pass ? "the overflow program stopped where it should, with XER up"
+                       : "the overflow program stopped where it should");
+
+        ppc_jit_enable(JitBackend::threaded);
+        CarryResult threaded = run_ov_code(xer_in);
+        int where = -1;
+        jit_check(same_carry(interp, threaded, &where),
+                  pass ? "the threaded backend agrees on overflow, with XER up"
+                       : "the threaded backend agrees on overflow");
+        report_carry(interp, threaded, where, "threaded");
+
+        ppc_jit_disable();
+        ppc_jit_enable(JitBackend::automatic);
+        CarryResult native = run_ov_code(xer_in);
+
+        if (ppc_jit_native_compiles() == 0) {
+            cout << "  (no emitter on this host, skipping the native comparison)" << endl;
+            return;
+        }
+
+        where = -1;
+        jit_check(same_carry(interp, native, &where),
+                  pass ? "emitted code agrees on overflow, with XER up"
+                       : "emitted code agrees on overflow");
+        report_carry(interp, native, where, "emitted");
+        jit_check(ppc_jit_threaded_compiles() == 0,
+                  "the emitter took every overflow block instead of declining");
+    }
+}
+
 /*  X forms and byte reversed ones: register indexed addressing, lwbrx both
     aligned and unaligned, stwbrx and sthbrx, and the update forms. Reuses
     the load data area at 0x3000 and the store area at 0x5000.  */
@@ -1096,6 +1214,7 @@ int test_jit() {
     test_cr_subset();
     test_branch_subset();
     test_carry_subset();
+    test_ov_subset();
     test_xform_subset();
 
     ppc_jit_disable();

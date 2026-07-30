@@ -117,6 +117,17 @@ enum class IROpcode : uint8_t {
     SubCA,
     SubECA,
 
+    /** The multiply family. MulLow is the low word of the signed product,
+        which is also the low word of the unsigned one, so it serves mulli and
+        mullw both; the high word forms differ and get an opcode each */
+    MulLow,
+    MulHighS,
+    MulHighU,
+
+    /** mtcrf: merges `a` into the condition register under a mask decided at
+        translation time from CRM, carried in imm. No value is defined */
+    MtCrf,
+
     /** A guest branch. The b and bc forms carry their target in the
         instruction; bclr and bcctr take theirs from LR or CTR at run time,
         which `target` distinguishes.
@@ -217,6 +228,11 @@ typedef struct IRInsn {
     bool     cr_signed;   // SetCR compares signed rather than unsigned
     uint8_t  crf;         // SetCR field, already multiplied by four
 
+    /** The OE forms: XER[SO|OV] from the signed overflow of the operation,
+        set together and OV cleared alone, the way ppc_setsoov does it. Valid
+        on Add, Sub, the XER[CA] family and MulLow */
+    bool     oe;
+
     // Branch. bo and bi come straight from the instruction, and everything
     // they select is decided at translation time rather than emitted
     uint8_t  bo, bi;
@@ -285,7 +301,7 @@ enum JitDecodeGroup : uint32_t {
     JIT_DECODE_LOAD    = 1 << 2,
     JIT_DECODE_STORE   = 1 << 3,
     JIT_DECODE_COMPARE = 1 << 4,
-    JIT_DECODE_SPR     = 1 << 5, // mfspr and mtspr of LR and CTR, plus eieio
+    JIT_DECODE_SPR     = 1 << 5, // mfspr and mtspr of LR and CTR, eieio, mtcrf
     JIT_DECODE_ALL     = 0x3F,
 };
 

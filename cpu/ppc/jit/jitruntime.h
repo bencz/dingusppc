@@ -133,11 +133,21 @@ const void* rt_chain_resolve(void** slot) noexcept;
     moment.
 
     The exit compares the target address against pred_va and the translation
-    generation against gen before jumping through code; either mismatch goes
-    back to the resolver the code field started out pointing at. The
-    generation is the mapping guard: mmu_itrans_generation moves whenever an
-    instruction fetch could start translating differently, and a stale
-    binding then fails the compare instead of running the wrong page's code.
+    generation against gen before jumping through code. The generation is the
+    mapping guard: mmu_itrans_generation moves whenever an instruction fetch
+    could start translating differently, and a stale binding then fails the
+    compare instead of running the wrong page's code.
+
+    A stale generation is no longer a trip to the resolver, though. Mac OS X
+    moves the generation thousands of times a second, one tlbie per page it
+    maps and a segment rewrite per kernel crossing, and each of those used to
+    strand every binding in the machine behind a C++ re-resolve. Almost none
+    of those translations actually changed. So the exit revalidates in line:
+    it probes the primary ITLB for the target address, and an entry fresh
+    under the current epoch whose physical page still equals phys means the
+    binding is right, the generation is restamped and the jump taken, all
+    without leaving generated code. Only a probe miss, a page whose mapping
+    really moved, or a genuinely new target reaches the resolver.
 
     Two ways, because the sites that come through here alternate: a return
     pinging between two callers, the 68k emulator's dispatch bouncing between
@@ -158,6 +168,8 @@ typedef struct ChainVaSlot {
     void*       code1;
     const void* resolver;
     uint64_t    flip;   // which way the next eviction lands on
+    uint32_t    phys0;  // physical page the way's target resolved to,
+    uint32_t    phys1;  // what the inline revalidation checks against
 } ChainVaSlot;
 
 /** rt_chain_resolve for a ChainVaSlot. Installs the target into the way

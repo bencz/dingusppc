@@ -201,6 +201,12 @@ extern uint64_t g_icycles_max;
    returning. Diagnostic only, reported by DPPC_STATS */
 extern uint64_t g_unwinds_raised;
 
+/* Full TLB sweeps and exceptions delivered. Diagnostic only, reported by
+   DPPC_STATS: their rate against retired instructions is what tells a guest
+   in a storm of tlbie and faults apart from an executor merely being slow */
+extern uint64_t g_tlb_full_flushes;
+extern uint64_t g_exceptions_raised;
+
 /* Raised from other threads to pull the next event check forward */
 extern volatile bool exec_timer;
 

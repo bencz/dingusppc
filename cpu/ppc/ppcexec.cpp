@@ -361,20 +361,30 @@ static void ppc_report_speed()
         return;
     }
 
+    // the PC is a coarse but honest witness of where the guest actually is,
+    // which is what separates a system booting from a firmware loop that
+    // merely looks busy
     const double seconds = double(report_every_ns) / 1e9;
     if (ppc_jit_is_enabled()) {
         LOG_F(INFO, "speed: %.2f Mips, %llu retired, %llu unwinds, "
-                    "%u blocks held, %u native and %u threaded compiles",
+                    "%u blocks held, %u native and %u threaded compiles, "
+                    "pc 0x%08X, %llu flushes, %llu exceptions, %llu itrans gens",
               double(g_icycles - last_icycles) / seconds / 1e6,
               (unsigned long long)g_icycles,
               (unsigned long long)g_unwinds_raised,
               ppc_jit_num_blocks(), ppc_jit_native_compiles(),
-              ppc_jit_threaded_compiles());
+              ppc_jit_threaded_compiles(), ppc_state.pc,
+              (unsigned long long)g_tlb_full_flushes,
+              (unsigned long long)g_exceptions_raised,
+              (unsigned long long)mmu_itrans_generation);
     } else {
-        LOG_F(INFO, "speed: %.2f Mips, %llu retired, %llu unwinds",
+        LOG_F(INFO, "speed: %.2f Mips, %llu retired, %llu unwinds, "
+                    "pc 0x%08X, %llu flushes, %llu exceptions",
               double(g_icycles - last_icycles) / seconds / 1e6,
               (unsigned long long)g_icycles,
-              (unsigned long long)g_unwinds_raised);
+              (unsigned long long)g_unwinds_raised, ppc_state.pc,
+              (unsigned long long)g_tlb_full_flushes,
+              (unsigned long long)g_exceptions_raised);
     }
 
     last_icycles   = g_icycles;

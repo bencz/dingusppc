@@ -478,10 +478,6 @@ const void* rt_chain_resolve_va(ChainVaSlot* slot) noexcept {
         // Rebinding at all matters as much as the ways do: a policy that
         // only bound virgin slots left every site dead after the first tlbie
         if (chain_allowed) {
-            if (chain_refs >= CHAIN_REF_CAP) [[unlikely]] {
-                unbind_all_chains();
-            }
-
             int way;
             if (slot->pred0 == entry_pc)      way = 0;
             else if (slot->pred1 == entry_pc) way = 1;
@@ -495,11 +491,31 @@ const void* rt_chain_resolve_va(ChainVaSlot* slot) noexcept {
             uint64_t* pred = way ? &slot->pred1 : &slot->pred0;
             uint64_t* gen  = way ? &slot->gen1  : &slot->gen0;
             void**    code = way ? &slot->code1 : &slot->code0;
+            uint32_t* phys = way ? &slot->phys1 : &slot->phys0;
+
+            // the storm case: the way already holds this very binding and
+            // only the generation went stale. The translation was just
+            // re-verified, so restamping it is enough, and the registry
+            // entry from the original bind still covers the way. The exit's
+            // inline probe catches most of these; what reaches here is the
+            // probe missing the primary ITLB, which the translation above
+            // has just refilled. Pushing a duplicate ref instead used to run
+            // the registry into its cap, and the unbind_all that followed
+            // killed every chain in the machine, the same page ones included
+            if (*pred == entry_pc && *code == blk->code) {
+                *gen = mmu_itrans_generation;
+                return blk->code;
+            }
+
+            if (chain_refs >= CHAIN_REF_CAP) [[unlikely]] {
+                unbind_all_chains();
+            }
 
             chain_bindings[blk].push_back({code, slot->resolver, pred});
             chain_refs++;
             *pred = entry_pc;
             *gen  = mmu_itrans_generation;
+            *phys = blk->phys_addr & PPC_PAGE_MASK;
             *code = blk->code;
         }
         return blk->code;

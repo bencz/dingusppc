@@ -132,18 +132,29 @@ static void test_store_invalidation() {
     ppc_code_cache_add(0x3000, PPC_ICACHE_LINE_SIZE, (CodeBlockHandle)13);
     cc_check(ppc_code_cache_num_blocks() == 3, "three blocks spread over two pages");
 
-    // a store anywhere on a code page takes down every block on that page
+    // a store beside the blocks touches none of them, and the page keeps
+    // routing stores through the slow path while any code remains on it
     mmu_write_vmem<uint32_t>(NO_OPCODE, 0x2FF0, 0xDEADBEEF);
-    cc_check(ppc_code_cache_num_blocks() == 1, "a store drops both blocks on its page");
-    cc_check(ppc_code_cache_page_is_protected(0x3000), "the untouched page keeps its block");
+    cc_check(ppc_code_cache_num_blocks() == 3, "a store beside the blocks drops nothing");
+    cc_check(ppc_code_cache_page_is_protected(0x2000),
+             "the page stays protected while code remains");
     cc_check(mmu_read_vmem<uint32_t>(NO_OPCODE, 0x2FF0) == 0xDEADBEEF,
-             "the store that triggered the drop still went through");
+             "the store went through regardless");
 
-    // the page is ordinary memory again now
-    mmu_write_vmem<uint32_t>(NO_OPCODE, 0x2000, 0x12345678);
-    cc_check(ppc_code_cache_num_blocks() == 1, "a later store on that page drops nothing");
-    cc_check(mmu_read_vmem<uint32_t>(NO_OPCODE, 0x2000) == 0x12345678,
-             "the later store landed as well");
+    // a store into a block takes down that block alone
+    mmu_write_vmem<uint32_t>(NO_OPCODE, 0x2010, 0x12345678);
+    cc_check(ppc_code_cache_num_blocks() == 2, "a store into a block drops just that block");
+    cc_check(ppc_code_cache_page_is_protected(0x2000),
+             "its neighbour keeps the page protected");
+    cc_check(mmu_read_vmem<uint32_t>(NO_OPCODE, 0x2010) == 0x12345678,
+             "the store that dropped it landed as well");
+
+    // the store that finds the page empty of code is what releases it
+    mmu_write_vmem<uint32_t>(NO_OPCODE, 0x2800, 0);
+    cc_check(ppc_code_cache_num_blocks() == 1, "a store into the last block empties the page");
+    mmu_write_vmem<uint32_t>(NO_OPCODE, 0x2820, 0);
+    cc_check(!ppc_code_cache_page_is_protected(0x2000), "an emptied page is released");
+    cc_check(ppc_code_cache_page_is_protected(0x3000), "the untouched page keeps its block");
 
     // a store nowhere near a code page changes nothing
     mmu_write_vmem<uint32_t>(NO_OPCODE, 0x5000, 0xA5A5A5A5);

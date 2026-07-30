@@ -47,16 +47,10 @@ std::unordered_map<uint32_t, std::vector<CodeBlock>> blocks_by_page;
 /* Physical pages whose data mappings have been told to route stores through
    the slow path, where an overwrite of translated code is noticed.
 
-   Separate from blocks_by_page and deliberately monotone: a page enters this
-   set once and stays until the cache is reinitialised, even after its last
-   block is dropped. Telling the MMU costs a scan of every data TLB entry in
-   all three translation modes, which is megabytes of walking, and a page
-   that holds code loses and regains blocks constantly as the guest writes
-   near it. Letting that flap re-marked the same pages thousands of times a
-   second and was a quarter of the run time of a real boot.
-
-   Keeping a page marked after its blocks are gone can only cost speed, never
-   correctness: the slow store path does everything the fast one does. */
+   A page enters the set with its first block and leaves it when a store
+   finds it empty of blocks, which is the only moment writability can be
+   handed back without a window where new code sits unguarded. Marking is an
+   epoch bump in the MMU, so neither direction walks anything. */
 std::unordered_set<uint32_t> protected_pages;
 
 std::function<void(CodeBlockHandle)> release_cb;
@@ -73,8 +67,8 @@ inline uint32_t range_last(uint32_t phys_addr, uint32_t size) {
 void ppc_code_cache_init() {
     ppc_code_cache_invalidate_all();
 
-    // the only thing that un-marks a page. The TLBs are being rebuilt around
-    // this call anyway, so nothing is left protected that should not be
+    // the TLBs are being rebuilt around this call anyway, so nothing is
+    // left protected that should not be
     protected_pages.clear();
     release_cb = nullptr;
 }
@@ -112,6 +106,17 @@ bool ppc_code_cache_page_is_protected(uint32_t phys_addr) {
         return false;
     }
     return protected_pages.find(phys_addr & PPC_PAGE_MASK) != protected_pages.end();
+}
+
+bool ppc_code_cache_store_to_page(uint32_t phys_addr, uint32_t size) {
+    ppc_code_cache_invalidate(phys_addr, size);
+
+    const uint32_t page = phys_addr & PPC_PAGE_MASK;
+    if (blocks_by_page.find(page) == blocks_by_page.end()) {
+        protected_pages.erase(page);
+        return false;
+    }
+    return true;
 }
 
 unsigned ppc_code_cache_invalidate(uint32_t phys_addr, uint32_t size) {

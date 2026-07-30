@@ -676,8 +676,8 @@ static TLBEntry* itlb2_refill(uint32_t guest_va)
         if (rgn_desc->type & RT_MMIO) {
             ABORT_F("Instruction fetch from MMIO region at 0x%08X!\n", phys_addr);
         }
-        // refill the secondary TLB
-        const uint32_t tag = guest_va & ~0xFFFUL;
+        // refill the secondary TLB, stamping the entry with the current epoch
+        const uint32_t tag = (guest_va & ~0xFFFUL) | g_itlb_epoch;
         tlb_entry = tlb2_target_entry<TLBType::ITLB>(tag);
         tlb_entry->tag = tag;
         tlb_entry->flags = flags | TLBFlags::PAGE_MEM;
@@ -698,7 +698,7 @@ static TLBEntry* dtlb2_refill(uint32_t guest_va, int is_write, bool is_dbg = fal
     uint16_t flags = 0;
     TLBEntry *tlb_entry;
 
-    const uint32_t tag = guest_va & ~0xFFFUL;
+    const uint32_t tag = (guest_va & ~0xFFFUL) | g_dtlb_epoch;
 
     /* data address translation if enabled */
     if (ppc_state.msr & MSR::DR) {
@@ -857,7 +857,7 @@ uint8_t *mmu_translate_imem(uint32_t vaddr, uint32_t *paddr)
     exec_reads_total++;
 #endif
 
-    const uint32_t tag = vaddr & ~0xFFFUL;
+    const uint32_t tag = (vaddr & ~0xFFFUL) | g_itlb_epoch;
 
     // look up guest virtual address in the primary ITLB
     tlb1_entry = &pCurITLB1[(vaddr >> PPC_PAGE_SIZE_BITS) & tlb_size_mask];
@@ -937,31 +937,19 @@ void tlb_flush_entry(uint32_t ea)
     tlb_flush_secondary_entry(dtlb2_mode3, tag);
 }
 
-template <std::size_t N>
-static void tlb_flush_phys_entries(std::array<TLBEntry, N> &tlb, uint32_t phys_tag)
-{
-    for (auto &tlb_el : tlb) {
-        if (tlb_el.tag != TLB_INVALID_TAG && tlb_el.phys_tag == phys_tag) {
-            tlb_el.tag = TLB_INVALID_TAG;
-        }
-    }
-}
+static void dtlb_epoch_advance();
 
 void mmu_mark_code_page(uint32_t phys_addr)
 {
-    const uint32_t phys_tag = phys_addr & PPC_PAGE_MASK;
+    (void)phys_addr;
 
     /* A physical page can be reached through any number of effective
        addresses and through any of the three translation modes, so there is
-       no shortcut here. Dropping the mappings makes the next refill rebuild
-       them with PAGE_WRITABLE removed. Instruction mappings are left alone
-       because fetches never write. */
-    tlb_flush_phys_entries(dtlb1_mode1, phys_tag);
-    tlb_flush_phys_entries(dtlb2_mode1, phys_tag);
-    tlb_flush_phys_entries(dtlb1_mode2, phys_tag);
-    tlb_flush_phys_entries(dtlb2_mode2, phys_tag);
-    tlb_flush_phys_entries(dtlb1_mode3, phys_tag);
-    tlb_flush_phys_entries(dtlb2_mode3, phys_tag);
+       no per-page shortcut. Advancing the data epoch strands every mapping
+       instead, and the refills rebuild the ones actually in use with
+       PAGE_WRITABLE removed where the code cache says so. Instruction
+       mappings are left alone because fetches never write. */
+    dtlb_epoch_advance();
 }
 
 template <std::size_t N>
@@ -973,34 +961,73 @@ static void tlb_flush_entries(std::array<TLBEntry, N> &tlb, TLBFlags type) {
     }
 }
 
+uint64_t g_tlb_full_flushes = 0;
+
+/** The TLB epochs. A full flush used to walk every entry of six arrays,
+    megabytes of them, and Mac OS X asks for one on nearly every exception
+    because its kernel rewrites the segment registers when it crosses into
+    and out of user space. The boot spent more time sweeping the arrays than
+    running the guest, in both execution engines.
+
+    Instead of sweeping, the low 12 bits of every tag carry the epoch the
+    entry was filled under; a page tag has those bits free by construction.
+    A lookup compares against page | epoch, so advancing the epoch strands
+    every existing entry at the cost of one increment, and the stranded
+    entries fall out through ordinary refills. tlbie stays what it was, a
+    targeted kill, and never advances anything.
+
+    The epoch wraps at 0xFFF rather than using it, for two reasons: an entry
+    left over from the previous lap would come back to life when its number
+    recurs, so the wrap does one honest sweep, the last one there is; and
+    page 0xFFFFF000 under epoch 0xFFF would collide with TLB_INVALID_TAG */
+uint32_t g_itlb_epoch = 0;
+uint32_t g_dtlb_epoch = 0;
+
+constexpr uint32_t TLB_EPOCH_MASK = 0xFFF;
+
+template <std::size_t N>
+static void invalidate_tlb_entries(std::array<TLBEntry, N> &tlb);
+
+static void itlb_epoch_advance()
+{
+    mmu_itrans_generation++;
+    g_itlb_epoch++;
+    if (g_itlb_epoch >= TLB_EPOCH_MASK) {
+        g_itlb_epoch = 0;
+        invalidate_tlb_entries(itlb1_mode1);
+        invalidate_tlb_entries(itlb1_mode2);
+        invalidate_tlb_entries(itlb1_mode3);
+        invalidate_tlb_entries(itlb2_mode1);
+        invalidate_tlb_entries(itlb2_mode2);
+        invalidate_tlb_entries(itlb2_mode3);
+    }
+}
+
+static void dtlb_epoch_advance()
+{
+    g_dtlb_epoch++;
+    if (g_dtlb_epoch >= TLB_EPOCH_MASK) {
+        g_dtlb_epoch = 0;
+        invalidate_tlb_entries(dtlb1_mode1);
+        invalidate_tlb_entries(dtlb1_mode2);
+        invalidate_tlb_entries(dtlb1_mode3);
+        invalidate_tlb_entries(dtlb2_mode1);
+        invalidate_tlb_entries(dtlb2_mode2);
+        invalidate_tlb_entries(dtlb2_mode3);
+    }
+}
+
 template <const TLBType tlb_type>
 void tlb_flush_entries(TLBFlags type)
 {
-    // Mode 1 is real addressing and thus can't contain any PAT entries by definition.
-    bool flush_mode1 = type != TLBE_FROM_PAT;
+    (void)type; // the epoch strands BAT and PAT entries alike; the ones the
+                // finer type would have spared only refill a little sooner
+    g_tlb_full_flushes++;
+
     if (tlb_type == TLBType::ITLB) {
-        mmu_itrans_generation++;
-        if (flush_mode1) {
-            tlb_flush_entries(itlb1_mode1, type);
-        }
-        tlb_flush_entries(itlb1_mode2, type);
-        tlb_flush_entries(itlb1_mode3, type);
-        if (flush_mode1) {
-            tlb_flush_entries(itlb2_mode1, type);
-        }
-        tlb_flush_entries(itlb2_mode2, type);
-        tlb_flush_entries(itlb2_mode3, type);
+        itlb_epoch_advance();
     } else {
-        if (flush_mode1) {
-            tlb_flush_entries(dtlb1_mode1, type);
-        }
-        tlb_flush_entries(dtlb1_mode2, type);
-        tlb_flush_entries(dtlb1_mode3, type);
-        if (flush_mode1) {
-            tlb_flush_entries(dtlb2_mode1, type);
-        }
-        tlb_flush_entries(dtlb2_mode2, type);
-        tlb_flush_entries(dtlb2_mode3, type);
+        dtlb_epoch_advance();
     }
 }
 
@@ -1193,16 +1220,26 @@ void mmu_pat_ctx_changed()
 #endif
 
 // Forward declarations.
-/** A store landed on a page holding translated code. Drop the translations
-    on that page and hand its writability back so the store can go through.
+/** A store landed on a page holding translated code. Drop only what the
+    store actually overlapped; the write itself goes through fine either way,
+    since the slow path reaches memory by host_va_offs_w regardless of the
+    writability flag.
 
-    Everything on the page goes, not just what the store overlapped, which
-    keeps the bookkeeping cheap. Mappings of the same page in the other
-    translation modes heal themselves the next time they are stored to,
-    because the invalidation is a no-op by then. */
-static void mmu_drop_code_page(uint32_t guest_va, uint32_t tag, TLBEntry *tlb_entry)
+    The page keeps routing stores through here while any code remains on it.
+    Handing writability back with code still present was how a real boot ate
+    itself: every TLB epoch bump re-protected the mappings on refill, so the
+    page flapped between protected and healed, and each flap threw away every
+    block on it, kernel data and kernel code sharing pages at a few thousand
+    exceptions a second. It was also a latent hole, because a block added to
+    an already known page told no one, and the healed mapping let stores slip
+    past it unnoticed. Only a page found empty of code heals now. */
+static void mmu_store_to_code_page(uint32_t guest_va, uint32_t size, uint32_t tag,
+                                   TLBEntry *tlb_entry)
 {
-    ppc_code_cache_invalidate(tlb_entry->phys_tag, PPC_PAGE_SIZE);
+    const uint32_t phys = tlb_entry->phys_tag | (guest_va & ~PPC_PAGE_MASK);
+    if (ppc_code_cache_store_to_page(phys, size)) {
+        return; // still holds code, the page stays on the slow path
+    }
 
     tlb_entry->flags = uint16_t((tlb_entry->flags & ~uint16_t(TLBFlags::PAGE_CODE)) |
                                 TLBFlags::PAGE_WRITABLE);
@@ -1236,7 +1273,7 @@ inline T mmu_read_vmem(uint32_t opcode, uint32_t guest_va)
     TLBEntry *tlb1_entry, *tlb2_entry;
     uint8_t *host_va;
 
-    const uint32_t tag = guest_va & ~0xFFFUL;
+    const uint32_t tag = (guest_va & ~0xFFFUL) | g_dtlb_epoch;
 
     // look up guest virtual address in the primary TLB
 #if SUPPORTS_MEMORY_CTRL_ENDIAN_MODE
@@ -1407,7 +1444,7 @@ inline void mmu_write_vmem(uint32_t opcode, uint32_t guest_va, T value)
     TLBEntry *tlb1_entry, *tlb2_entry;
     uint8_t *host_va;
 
-    const uint32_t tag = guest_va & ~0xFFFUL;
+    const uint32_t tag = (guest_va & ~0xFFFUL) | g_dtlb_epoch;
 
     // look up guest virtual address in the primary TLB
 #if SUPPORTS_MEMORY_CTRL_ENDIAN_MODE
@@ -1420,7 +1457,7 @@ inline void mmu_write_vmem(uint32_t opcode, uint32_t guest_va, T value)
 #endif
         if (!(tlb1_entry->flags & TLBFlags::PAGE_WRITABLE)) {
             if (tlb1_entry->flags & TLBFlags::PAGE_CODE) {
-                mmu_drop_code_page(guest_va, tag, tlb1_entry);
+                mmu_store_to_code_page(guest_va, sizeof(T), tag, tlb1_entry);
             } else {
                 ppc_state.spr[SPR::DSISR] = 0x08000000 | (1 << 25);
                 ppc_state.spr[SPR::DAR]   = guest_va;
@@ -1468,7 +1505,7 @@ inline void mmu_write_vmem(uint32_t opcode, uint32_t guest_va, T value)
 
         if (!(tlb2_entry->flags & TLBFlags::PAGE_WRITABLE)) {
             if (tlb2_entry->flags & TLBFlags::PAGE_CODE) {
-                mmu_drop_code_page(guest_va, tag, tlb2_entry);
+                mmu_store_to_code_page(guest_va, sizeof(T), tag, tlb2_entry);
             } else {
                 ppc_state.spr[SPR::DSISR] = 0x08000000 | (1 << 25);
                 ppc_state.spr[SPR::DAR]   = guest_va;
@@ -1990,7 +2027,7 @@ bool mmu_translate_dbg(uint32_t guest_va, uint32_t &guest_pa) {
     try {
         TLBEntry *tlb1_entry, *tlb2_entry;
 
-        const uint32_t tag = guest_va & ~0xFFFUL;
+        const uint32_t tag = (guest_va & ~0xFFFUL) | g_dtlb_epoch;
 
         // look up guest virtual address in the primary TLB
         tlb1_entry = &pCurDTLB1[(guest_va >> PPC_PAGE_SIZE_BITS) & tlb_size_mask];

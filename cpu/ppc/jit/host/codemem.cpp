@@ -177,8 +177,83 @@ bool CodeMem::end_write() {
     return true;
 }
 
+bool CodeMem::begin_write_range(size_t upcoming) {
+    if (!this->base) {
+        return false;
+    }
+    if (this->writable || this->range_open) {
+        return true; // already inside a wider bracket
+    }
+
+    // what alloc will touch: from the current offset, aligned up, plus the
+    // bytes themselves, all rounded out to whole pages. A region too full to
+    // hold it stays untouched and alloc reports the failure
+    const size_t page  = host_page_size();
+    const size_t start = this->offset & ~(page - 1);
+    const size_t end   = round_up(this->offset, 16) + upcoming;
+    if (end > this->size) {
+        this->range_start = 0;
+        this->range_len   = 0;
+        this->range_open  = true;
+        return true;
+    }
+    const size_t len = round_up(end, page) - start;
+
+#if defined(_WIN32)
+    DWORD old;
+    if (!VirtualProtect(this->base + start, len, PAGE_READWRITE, &old)) {
+        LOG_F(ERROR, "JIT: could not make a code range writable");
+        return false;
+    }
+#else
+    if (mprotect(this->base + start, len, PROT_READ | PROT_WRITE) != 0) {
+        LOG_F(ERROR, "JIT: could not make a code range writable");
+        return false;
+    }
+#endif
+    this->range_start = start;
+    this->range_len   = len;
+    this->range_open  = true;
+    return true;
+}
+
+bool CodeMem::end_write_range() {
+    if (!this->base) {
+        return false;
+    }
+    if (this->writable) {
+        return true; // a whole region bracket is open and owns the flip
+    }
+    if (!this->range_open) {
+        return true;
+    }
+
+    this->range_open = false;
+    if (!this->range_len) {
+        return true; // nothing was unprotected
+    }
+
+#if defined(_WIN32)
+    DWORD old;
+    if (!VirtualProtect(this->base + this->range_start, this->range_len,
+                        PAGE_EXECUTE_READ, &old)) {
+        LOG_F(ERROR, "JIT: could not make a code range executable");
+        return false;
+    }
+#else
+    if (mprotect(this->base + this->range_start, this->range_len,
+                 PROT_READ | PROT_EXEC) != 0) {
+        LOG_F(ERROR, "JIT: could not make a code range executable");
+        return false;
+    }
+#endif
+    sync_icache(this->base + this->range_start, this->range_len);
+    this->range_len = 0;
+    return true;
+}
+
 uint8_t* CodeMem::alloc(size_t bytes, size_t alignment) {
-    if (!this->base || !this->writable) {
+    if (!this->base || !(this->writable || this->range_open)) {
         return nullptr;
     }
 
