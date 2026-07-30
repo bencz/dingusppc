@@ -197,6 +197,10 @@ extern uint64_t g_icycles;
 /* Timers get a chance to run once g_icycles passes this */
 extern uint64_t g_icycles_max;
 
+/* How many times an instruction was abandoned by unwinding rather than by
+   returning. Diagnostic only, reported by DPPC_STATS */
+extern uint64_t g_unwinds_raised;
+
 /* Raised from other threads to pull the next event check forward */
 extern volatile bool exec_timer;
 

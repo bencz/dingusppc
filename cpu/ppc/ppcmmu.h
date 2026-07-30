@@ -119,6 +119,14 @@ enum TLBFlags : uint16_t {
                             // taken away so stores to it can be noticed
 };
 
+/** Primary data TLB currently in use. It moves between the per mode arrays
+    whenever translation changes, so a code generator inlining the hit path
+    has to load it rather than bake it in.
+
+    tlb_size_mask goes with it and is set once at startup */
+extern TLBEntry* pCurDTLB1;
+extern uint32_t  tlb_size_mask;
+
 extern std::function<void(uint32_t bat_reg)> ibat_update;
 extern std::function<void(uint32_t bat_reg)> dbat_update;
 
@@ -130,6 +138,15 @@ extern MapDmaResult mmu_map_dma_mem(uint32_t addr, uint32_t size, bool allow_mmi
 extern void mmu_change_mode(void);
 extern void mmu_pat_ctx_changed();
 extern void tlb_flush_entry(uint32_t ea);
+
+/** Bumped whenever what a virtual address translates to for an instruction
+    fetch can have changed: tlbie, an IBAT write, an SDR1 write, or a bulk
+    ITLB flush. The JIT stamps this into every chain binding whose target is
+    only known by virtual address, and a mismatch at the jump sends it back
+    through a full lookup. Over-bumping costs a re-resolve, under-bumping
+    runs stale code, so every path that touches instruction translation
+    counts, even when the flush itself is deferred to the context sync */
+extern uint64_t mmu_itrans_generation;
 
 /** Tells the MMU that a physical page started holding translated code.
 

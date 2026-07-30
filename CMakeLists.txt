@@ -97,6 +97,28 @@ else()
     ADD_DEFINITIONS(-DSUPPORTS_MEMORY_CTRL_ENDIAN_MODE=0)
 endif()
 
+# JIT emitter selection. Architecture and ABI are independent axes: the
+# architecture picks which sources build, the ABI descriptor is picked inside
+# them. Anything without an emitter still gets the portable threaded backend.
+if (EMSCRIPTEN)
+    # no native code generation under WebAssembly, and no mprotect to do it with
+    set(DPPC_JIT_ARCH_DIR "")
+elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    set(DPPC_JIT_ARCH_DIR "x86_64")
+    add_compile_definitions(DPPC_JIT_X86_64=1)
+elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set(DPPC_JIT_ARCH_DIR "aarch64")
+    add_compile_definitions(DPPC_JIT_AARCH64=1)
+else()
+    set(DPPC_JIT_ARCH_DIR "")
+endif()
+
+if (DPPC_JIT_ARCH_DIR)
+    message(STATUS "JIT emitter target: ${DPPC_JIT_ARCH_DIR}")
+else()
+    message(STATUS "JIT emitter target: none, threaded backend only")
+endif()
+
 add_subdirectory("${PROJECT_SOURCE_DIR}/core")
 add_subdirectory("${PROJECT_SOURCE_DIR}/cpu/ppc/")
 add_subdirectory("${PROJECT_SOURCE_DIR}/debugger/")
@@ -259,27 +281,50 @@ endif()
 
 if (DPPC_BUILD_BENCHMARKS)
     add_compile_options("-DPPC_BENCHMARKS")
+    # bench1 rebuilds the CPU sources instead of linking cpu_ppc, so that
+    # PPC_BENCHMARKS reaches them. That means the jit subdirectories have to
+    # be listed here as well, the glob above is not recursive
     file(GLOB BENCH_SOURCES "${PROJECT_SOURCE_DIR}/benchmark/*.cpp"
                             "${PROJECT_SOURCE_DIR}/cpu/ppc/*.cpp"
                             "${PROJECT_SOURCE_DIR}/cpu/ppc/*.h"
+                            "${PROJECT_SOURCE_DIR}/cpu/ppc/jit/*.cpp"
+                            "${PROJECT_SOURCE_DIR}/cpu/ppc/jit/*.h"
+                            "${PROJECT_SOURCE_DIR}/cpu/ppc/jit/threaded/*.cpp"
                             )
-    add_executable(bench1 ${BENCH_SOURCES} $<TARGET_OBJECTS:core>
-                                           # $<TARGET_OBJECTS:cpu_ppc>
-                                           $<TARGET_OBJECTS:debugger>
-                                           $<TARGET_OBJECTS:devices>
-                                           $<TARGET_OBJECTS:machines>
-                                           $<TARGET_OBJECTS:utils>
-                                           $<TARGET_OBJECTS:loguru>)
 
-    target_link_libraries(bench1 PRIVATE cubeb SDL2::SDL2 ${CMAKE_DL_LIBS}
-            ${CMAKE_THREAD_LIBS_INIT})
-    if (WIN32)
-        target_compile_definitions(bench1 PRIVATE SDL_MAIN_HANDLED)
+    if (DPPC_JIT_ARCH_DIR)
+        file(GLOB BENCH_JIT_ARCH_SOURCES
+             "${PROJECT_SOURCE_DIR}/cpu/ppc/jit/host/*.cpp"
+             "${PROJECT_SOURCE_DIR}/cpu/ppc/jit/${DPPC_JIT_ARCH_DIR}/*.cpp")
+        list(APPEND BENCH_SOURCES ${BENCH_JIT_ARCH_SOURCES})
     endif()
 
-    if (DPPC_68K_DEBUGGER)
-        target_link_libraries(bench1 PRIVATE capstone)
-    endif()
+    # one main per benchmark, everything else shared
+    set(BENCH_MAINS "${PROJECT_SOURCE_DIR}/benchmark/bench1.cpp"
+                    "${PROJECT_SOURCE_DIR}/benchmark/benchblk.cpp")
+    list(REMOVE_ITEM BENCH_SOURCES ${BENCH_MAINS})
+
+    foreach(bench_name bench1 benchblk)
+        add_executable(${bench_name}
+            "${PROJECT_SOURCE_DIR}/benchmark/${bench_name}.cpp"
+            ${BENCH_SOURCES} $<TARGET_OBJECTS:core>
+                             # $<TARGET_OBJECTS:cpu_ppc>
+                             $<TARGET_OBJECTS:debugger>
+                             $<TARGET_OBJECTS:devices>
+                             $<TARGET_OBJECTS:machines>
+                             $<TARGET_OBJECTS:utils>
+                             $<TARGET_OBJECTS:loguru>)
+
+        target_link_libraries(${bench_name} PRIVATE cubeb SDL2::SDL2 ${CMAKE_DL_LIBS}
+                ${CMAKE_THREAD_LIBS_INIT})
+        if (WIN32)
+            target_compile_definitions(${bench_name} PRIVATE SDL_MAIN_HANDLED)
+        endif()
+
+        if (DPPC_68K_DEBUGGER)
+            target_link_libraries(${bench_name} PRIVATE capstone)
+        endif()
+    endforeach()
 endif()
 
 if (DPPC_BUILD_PPC_TESTS)

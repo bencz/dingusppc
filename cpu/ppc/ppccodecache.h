@@ -76,9 +76,17 @@ void ppc_code_cache_reset();
     block rule already enforced by ppc_exec_inner */
 void ppc_code_cache_add(uint32_t phys_addr, uint32_t size, CodeBlockHandle handle);
 
-/** True while the page holding phys_addr has at least one block. The MMU asks
-    this when refilling a data TLB entry to decide whether to protect it */
-bool ppc_code_cache_page_has_blocks(uint32_t phys_addr);
+/** True when stores to the page holding phys_addr have to take the slow path.
+    The MMU asks this when refilling a data TLB entry to decide whether to
+    leave PAGE_WRITABLE off.
+
+    A page becomes protected when it receives its first block and stays that
+    way until ppc_code_cache_init, including after its last block is dropped.
+    Saying so costs a scan of every data TLB entry, and a page holding code
+    gains and loses blocks constantly, so letting the answer flap costs far
+    more than protecting a page that no longer needs it. Over-protecting only
+    ever costs speed: the slow store path does everything the fast one does */
+bool ppc_code_cache_page_is_protected(uint32_t phys_addr);
 
 /** Drops every block overlapping the range and returns how many went away */
 unsigned ppc_code_cache_invalidate(uint32_t phys_addr, uint32_t size);

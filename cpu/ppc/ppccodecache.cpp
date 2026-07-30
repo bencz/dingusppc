@@ -26,6 +26,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "ppcmmu.h"
 
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -43,6 +44,21 @@ typedef struct CodeBlock {
    a cache line into a lookup plus a scan over a handful of entries. */
 std::unordered_map<uint32_t, std::vector<CodeBlock>> blocks_by_page;
 
+/* Physical pages whose data mappings have been told to route stores through
+   the slow path, where an overwrite of translated code is noticed.
+
+   Separate from blocks_by_page and deliberately monotone: a page enters this
+   set once and stays until the cache is reinitialised, even after its last
+   block is dropped. Telling the MMU costs a scan of every data TLB entry in
+   all three translation modes, which is megabytes of walking, and a page
+   that holds code loses and regains blocks constantly as the guest writes
+   near it. Letting that flap re-marked the same pages thousands of times a
+   second and was a quarter of the run time of a real boot.
+
+   Keeping a page marked after its blocks are gone can only cost speed, never
+   correctness: the slow store path does everything the fast one does. */
+std::unordered_set<uint32_t> protected_pages;
+
 std::function<void(CodeBlockHandle)> release_cb;
 
 /** Clamps to the end of the address space so a wrapping size cannot turn
@@ -56,6 +72,10 @@ inline uint32_t range_last(uint32_t phys_addr, uint32_t size) {
 
 void ppc_code_cache_init() {
     ppc_code_cache_invalidate_all();
+
+    // the only thing that un-marks a page. The TLBs are being rebuilt around
+    // this call anyway, so nothing is left protected that should not be
+    protected_pages.clear();
     release_cb = nullptr;
 }
 
@@ -77,23 +97,21 @@ void ppc_code_cache_add(uint32_t phys_addr, uint32_t size, CodeBlockHandle handl
         ABORT_F("Code block at 0x%08X spans more than one page", phys_addr);
     }
 
-    auto& page_blocks = blocks_by_page[page];
-    bool  was_empty   = page_blocks.empty();
-
-    page_blocks.push_back({phys_addr, phys_addr + size, handle});
+    blocks_by_page[page].push_back({phys_addr, phys_addr + size, handle});
     ppc_code_cache_count++;
 
-    // stores have to be noticed from now on, but only the transition matters
-    if (was_empty) {
+    // stores have to be noticed from now on. Only the first block ever put on
+    // the page pays for saying so, see protected_pages
+    if (protected_pages.insert(page).second) {
         mmu_mark_code_page(page);
     }
 }
 
-bool ppc_code_cache_page_has_blocks(uint32_t phys_addr) {
-    if (ppc_code_cache_is_empty()) {
+bool ppc_code_cache_page_is_protected(uint32_t phys_addr) {
+    if (protected_pages.empty()) {
         return false;
     }
-    return blocks_by_page.find(phys_addr & PPC_PAGE_MASK) != blocks_by_page.end();
+    return protected_pages.find(phys_addr & PPC_PAGE_MASK) != protected_pages.end();
 }
 
 unsigned ppc_code_cache_invalidate(uint32_t phys_addr, uint32_t size) {

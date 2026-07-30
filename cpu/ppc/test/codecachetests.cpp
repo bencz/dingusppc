@@ -135,7 +135,7 @@ static void test_store_invalidation() {
     // a store anywhere on a code page takes down every block on that page
     mmu_write_vmem<uint32_t>(NO_OPCODE, 0x2FF0, 0xDEADBEEF);
     cc_check(ppc_code_cache_num_blocks() == 1, "a store drops both blocks on its page");
-    cc_check(ppc_code_cache_page_has_blocks(0x3000), "the untouched page keeps its block");
+    cc_check(ppc_code_cache_page_is_protected(0x3000), "the untouched page keeps its block");
     cc_check(mmu_read_vmem<uint32_t>(NO_OPCODE, 0x2FF0) == 0xDEADBEEF,
              "the store that triggered the drop still went through");
 

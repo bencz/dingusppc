@@ -25,6 +25,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "ppcemu.h"
 #include "ppcmmu.h"
 
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -145,7 +146,10 @@ void ppc_exception_handler(Except_Type exception_type, uint32_t srr1_bits) {
 }
 #endif
 
+uint64_t g_unwinds_raised = 0;
+
 void ppc_exception_handler_unwind(Except_Type exception_type, uint32_t srr1_bits) {
+    g_unwinds_raised++;
     ppc_exception_handler(exception_type, srr1_bits);
     throw PPCExcUnwind();
 }

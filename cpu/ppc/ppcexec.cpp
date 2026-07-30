@@ -23,11 +23,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <loguru.hpp>
 #include "ppccodecache.h"
 #include "ppcemu.h"
+#include "ppcjit.h"
 #include "ppcmmu.h"
 #include "ppcdisasm.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -158,10 +160,15 @@ public:
         // Generate top N op counts with readable names.
 #ifdef CPU_PROFILING_OPS
         PPCDisasmContext ctx;
-        ctx.instr_addr = 0;
         ctx.simplified = false;
         std::vector<std::pair<std::string, uint64_t>> op_name_counts;
         for (const auto& pair : num_opcodes) {
+            // disassemble_single advances instr_addr, since it is written for
+            // walking a stream. These opcodes are unrelated to each other, so
+            // the address has to go back to zero every time; otherwise the
+            // same branch shows a different target depending on where it
+            // landed in the map, and one instruction counts as several
+            ctx.instr_addr = 0;
             ctx.instr_code = pair.first;
             auto op_name = disassemble_single(&ctx);
             op_name_counts.emplace_back(op_name, pair.second);
@@ -327,8 +334,57 @@ uint64_t get_virt_time_ns()
     }
 }
 
+/** How fast the guest is actually going, printed every DPPC_STATS seconds.
+
+    Retired guest instructions per second of wall clock, which is the only
+    number that says whether any of this work is paying off on a real boot.
+    Timers come due often enough that hanging it off ppc_process_events costs
+    nothing and covers the interpreter and the JIT alike */
+static void ppc_report_speed()
+{
+    static long long report_every_ns = -1;
+    static long long next_report_ns;
+    static uint64_t  last_icycles;
+
+    if (report_every_ns < 0) {
+        const char* period = getenv("DPPC_STATS");
+        report_every_ns = period ? (atof(period) * 1e9) : 0;
+        next_report_ns  = cpu_now_ns() + report_every_ns;
+        last_icycles    = g_icycles;
+    }
+    if (!report_every_ns) {
+        return;
+    }
+
+    const long long now = cpu_now_ns();
+    if (now < next_report_ns) {
+        return;
+    }
+
+    const double seconds = double(report_every_ns) / 1e9;
+    if (ppc_jit_is_enabled()) {
+        LOG_F(INFO, "speed: %.2f Mips, %llu retired, %llu unwinds, "
+                    "%u blocks held, %u native and %u threaded compiles",
+              double(g_icycles - last_icycles) / seconds / 1e6,
+              (unsigned long long)g_icycles,
+              (unsigned long long)g_unwinds_raised,
+              ppc_jit_num_blocks(), ppc_jit_native_compiles(),
+              ppc_jit_threaded_compiles());
+    } else {
+        LOG_F(INFO, "speed: %.2f Mips, %llu retired, %llu unwinds",
+              double(g_icycles - last_icycles) / seconds / 1e6,
+              (unsigned long long)g_icycles,
+              (unsigned long long)g_unwinds_raised);
+    }
+
+    last_icycles   = g_icycles;
+    next_report_ns = now + report_every_ns;
+}
+
 uint64_t ppc_process_events()
 {
+    ppc_report_speed();
+
     exec_timer = false;
     uint64_t slice_ns = TimerManager::get_instance()->process_timers();
     if (slice_ns == 0) {
@@ -440,6 +496,11 @@ void ppc_exec()
 {
     while (power_on) {
         try {
+            // one test per exception, not per instruction, so the interpreter
+            // pays nothing for the JIT being compiled in
+            if (ppc_jit_is_enabled()) [[unlikely]] {
+                ppc_jit_exec_inner(JitExecType::run, 0);
+            } else
 #if SUPPORTS_PPC_LITTLE_ENDIAN_MODE
             if (ppc_state.is_LE)
                 ppc_exec_inner<main, little_end>(0, 0);
@@ -494,6 +555,9 @@ template void ppc_exec_inner<until, little_end>(uint32_t start_addr, uint32_t si
 void ppc_exec_until(uint32_t goal_addr) {
     while (power_on) {
         try {
+            if (ppc_jit_is_enabled()) [[unlikely]] {
+                ppc_jit_exec_inner(JitExecType::until, goal_addr);
+            } else
 #if SUPPORTS_PPC_LITTLE_ENDIAN_MODE
             if (ppc_state.is_LE)
                 ppc_exec_inner<until, little_end>(goal_addr, 0);
@@ -1006,7 +1070,21 @@ void ppc_cpu_init(MemCtrlBase* mem_ctrl, uint32_t cpu_version, bool do_include_6
     ppc_msr_did_change(new_msr_val, new_msr_val, false);
 
     ppc_mmu_init();
+
+    // the JIT holds blocks keyed to the processor that is going away, and it
+    // owns the code cache release callback that ppc_code_cache_init clears
+    ppc_jit_disable();
     ppc_code_cache_init();
+
+    // no command line flag yet, and the benchmark parses no arguments at all,
+    // so the switch is an environment variable. DPPC_JIT=threaded forces the
+    // portable backend, which is what a comparison run wants
+    if (const char* want_jit = getenv("DPPC_JIT")) {
+        if (strcmp(want_jit, "0") != 0) {
+            ppc_jit_enable(strcmp(want_jit, "threaded") == 0 ? JitBackend::threaded
+                                                             : JitBackend::automatic);
+        }
+    }
 
     /* redirect code execution to reset vector */
     ppc_state.pc = 0xFFF00100;

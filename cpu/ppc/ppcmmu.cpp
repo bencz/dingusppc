@@ -451,6 +451,20 @@ MapDmaResult mmu_map_dma_mem(uint32_t addr, uint32_t size, bool allow_mmio, bool
     if (cur_dma_rgn->type & (RT_ROM | RT_RAM)) {
         host_va  = cur_dma_rgn->mem_ptr + (addr - cur_dma_rgn->start);
         is_writable = cur_dma_rgn->type & RT_RAM;
+
+        // A device is about to be handed a bare pointer into guest memory and
+        // will write through it without the MMU seeing anything, so this is
+        // the last chance to notice that translated code is about to be
+        // overwritten. That is not a corner case: loading a system off a disk
+        // is exactly a DMA engine writing code into RAM.
+        //
+        // Read transfers get invalidated too, since nothing here says which
+        // way the data will go. Redoing a translation costs far less than
+        // running a stale one, and the check below is free while nothing has
+        // been translated at all
+        if (is_writable && !is_dbg && !ppc_code_cache_is_empty()) {
+            ppc_code_cache_invalidate(addr, size);
+        }
     } else { // RT_MMIO
         devobj = cur_dma_rgn->devobj;
         dev_base = cur_dma_rgn->start;
@@ -735,8 +749,13 @@ static TLBEntry* dtlb2_refill(uint32_t guest_va, int is_write, bool is_dbg = fal
     // store to it lands in the slow path and can drop those translations.
     // A page that is already unwritable needs none of this, its stores fault
     // before they can reach the code.
-    if (!ppc_code_cache_is_empty() && (flags & TLBFlags::PAGE_WRITABLE) &&
-        ppc_code_cache_page_has_blocks(phys_addr)) {
+    //
+    // Asking the cache whether it holds any block at all would be wrong here,
+    // however cheap: a page stays protected after its last block is dropped,
+    // and refilling it writable in that window would leave the next block on
+    // it unguarded, since nothing tells the MMU a second time
+    if ((flags & TLBFlags::PAGE_WRITABLE) &&
+        ppc_code_cache_page_is_protected(phys_addr)) {
         flags = uint16_t((flags & ~uint16_t(TLBFlags::PAGE_WRITABLE)) | TLBFlags::PAGE_CODE);
     }
 
@@ -897,8 +916,12 @@ static void tlb_flush_secondary_entry(std::array<TLBEntry, TLB_SIZE*TLB2_WAYS> &
     }
 }
 
+uint64_t mmu_itrans_generation = 0;
+
 void tlb_flush_entry(uint32_t ea)
 {
+    mmu_itrans_generation++;
+
     const uint32_t tag = ea & TLB_VPS_MASK;
     tlb_flush_primary_entry(itlb1_mode1, tag);
     tlb_flush_secondary_entry(itlb2_mode1, tag);
@@ -956,6 +979,7 @@ void tlb_flush_entries(TLBFlags type)
     // Mode 1 is real addressing and thus can't contain any PAT entries by definition.
     bool flush_mode1 = type != TLBE_FROM_PAT;
     if (tlb_type == TLBType::ITLB) {
+        mmu_itrans_generation++;
         if (flush_mode1) {
             tlb_flush_entries(itlb1_mode1, type);
         }
@@ -1065,6 +1089,8 @@ static void mpc601_bat_update(uint32_t bat_reg)
         dbat_entry->valid = false;
     }
 
+    mmu_itrans_generation++;
+
     // MPC601 has unified BATs so we're going to flush both ITLB and DTLB
     if (!gTLBFlushIBatEntries || !gTLBFlushIPatEntries || !gTLBFlushDBatEntries || !gTLBFlushDPatEntries) {
         gTLBFlushIBatEntries = true;
@@ -1098,6 +1124,9 @@ static void ppc_ibat_update(uint32_t bat_reg)
     bat_entry->hi_mask = hi_mask;
     bat_entry->phys_hi = ppc_state.spr[upper_reg_num + 1] & hi_mask;
     bat_entry->bepi    = ppc_state.spr[upper_reg_num] & hi_mask;
+
+    // the BAT array changed right here, ahead of the deferred TLB flush
+    mmu_itrans_generation++;
 
     if (!gTLBFlushIBatEntries || !gTLBFlushIPatEntries) {
         gTLBFlushIBatEntries = true;
@@ -1133,6 +1162,8 @@ static void ppc_dbat_update(uint32_t bat_reg)
 
 void mmu_pat_ctx_changed()
 {
+    mmu_itrans_generation++;
+
     // Page address translation context changed so we need to flush
     // all PAT entries from both ITLB and DTLB
     if (!gTLBFlushIPatEntries || !gTLBFlushDPatEntries) {
