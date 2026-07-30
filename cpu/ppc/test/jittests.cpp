@@ -249,11 +249,11 @@ static void test_native_matches_threaded(const RunResult& interp) {
     jit_check(ppc_jit_native_compiles() == 2, "the second run recompiled nothing");
 }
 
-/*  Um por opcode do subconjunto emitido, mais formas que exercitam a alocacao
-    de registradores: reuso do operando que morre (addi r5,r5,-1), os dois
-    operandos iguais (add r5,r5,r5) e o destino caindo no segundo operando.
+/*  One per opcode of the emitted subset, plus forms that exercise register
+    allocation: reusing the dying operand (addi r5,r5,-1), both operands the
+    same (add r5,r5,r5) and the destination landing on the second operand.
 
-    O ultimo word e ilegal de proposito e marca onde o bloco termina.  */
+    The last word is illegal on purpose and marks where the block ends.  */
 static const uint32_t alu_code[] = {
     0x38601234, // li     r3, 0x1234
     0x3C805678, // addis  r4, r0, 0x5678
@@ -273,7 +273,7 @@ static const uint32_t alu_code[] = {
     0x7CB02B78, // mr     r16, r5
     0x7E232050, // subf   r17, r3, r4
     0x50B2400E, // rlwimi r18, r5, 8, 0, 7
-    0x00000000, // ilegal, o bloco para antes dela
+    0x00000000, // illegal on purpose, the block stops short of it
 };
 
 constexpr uint32_t ALU_BASE = 0x2000;
@@ -293,7 +293,7 @@ static void load_alu_code() {
 
 static AluResult run_alu_code() {
     for (int i = 0; i < 32; i++) {
-        ppc_state.gpr[i] = 0xA5A50000u | uint32_t(i); // padrao reconhecivel
+        ppc_state.gpr[i] = 0xA5A50000u | uint32_t(i); // recognizable pattern
     }
     ppc_state.pc  = ALU_BASE;
     g_icycles     = 0;
@@ -320,24 +320,24 @@ static bool same_alu(const AluResult& a, const AluResult& b, int* first_diff) {
     return a.pc == b.pc && a.retired == b.retired;
 }
 
-/** O subconjunto que o emissor cobre nao pode divergir em nenhum dos 32
-    registradores. Comparar so o resultado final esconderia erro de alocacao
-    que estraga um registrador que o programa nao le depois */
+/** The subset the emitter covers may not diverge in any of the 32
+    registers. Comparing only the final result would hide an allocation bug
+    that ruins a register the program never reads again */
 static void test_alu_subset() {
     load_alu_code();
 
     ppc_jit_disable();
     AluResult interp = run_alu_code();
-    jit_check(interp.pc == ALU_END, "o programa ALU parou onde devia no interpretador");
+    jit_check(interp.pc == ALU_END, "the ALU program stopped where it should on the interpreter");
 
     ppc_jit_enable(JitBackend::threaded);
     AluResult threaded = run_alu_code();
     int diff = -1;
     jit_check(same_alu(interp, threaded, &diff),
-              diff < 0 ? "backend threaded confere com o interpretador"
-                       : "backend threaded diverge num registrador");
+              diff < 0 ? "the threaded backend agrees with the interpreter"
+                       : "the threaded backend diverges in a register");
     if (diff >= 0) {
-        cout << "    r" << diff << ": interpretador 0x" << hex << interp.gpr[diff]
+        cout << "    r" << diff << ": interpreter 0x" << hex << interp.gpr[diff]
              << ", threaded 0x" << threaded.gpr[diff] << dec << endl;
     }
 
@@ -346,34 +346,34 @@ static void test_alu_subset() {
     AluResult native = run_alu_code();
 
     if (ppc_jit_native_compiles() == 0) {
-        cout << "  (sem emissor neste host, comparacao nativa pulada)" << endl;
+        cout << "  (no emitter on this host, skipping the native comparison)" << endl;
         return;
     }
 
     diff = -1;
     jit_check(same_alu(interp, native, &diff),
-              diff < 0 ? "codigo emitido confere com o interpretador"
-                       : "codigo emitido diverge num registrador");
+              diff < 0 ? "emitted code agrees with the interpreter"
+                       : "emitted code diverges in a register");
     if (diff >= 0) {
-        cout << "    r" << diff << ": interpretador 0x" << hex << interp.gpr[diff]
-             << ", emitido 0x" << native.gpr[diff] << dec << endl;
+        cout << "    r" << diff << ": interpreter 0x" << hex << interp.gpr[diff]
+             << ", emitted 0x" << native.gpr[diff] << dec << endl;
     }
 
     jit_check(native.retired == interp.retired,
-              "o codigo emitido contou as mesmas instrucoes retiradas");
+              "emitted code counted the same retired instructions");
 
-    // roda de novo pelo bloco em cache: pega registrador fixado que voltou
-    // errado de uma chamada de helper
+    // run again off the cached block: catches a pinned register coming
+    // back wrong from a helper call
     AluResult again = run_alu_code();
-    jit_check(same_alu(native, again, &diff), "segunda passada pelo bloco em cache confere");
+    jit_check(same_alu(native, again, &diff), "a second pass over the cached block agrees");
 }
 
-/*  Loads em forma D, incluindo os que forcam o caminho lento: acessos nao
-    alinhados, deslocamento negativo e as formas com update, cujo rA so pode
-    ser escrito depois de o acesso dar certo.
+/*  D form loads, including the ones that force the slow path: unaligned
+    accesses, a negative displacement and the update forms, whose rA may only
+    be written after the access succeeds.
 
-    A primeira passada erra o TLB e a segunda acerta, entao rodar duas vezes
-    cobre os dois lados da checagem inline.  */
+    The first pass misses the TLB and the second hits, so running twice
+    covers both sides of the inline check.  */
 static const uint32_t load_code[] = {
     0x3D400000, // addis r10, r0, 0
     0x614A3000, // ori   r10, r10, 0x3000
@@ -382,20 +382,20 @@ static const uint32_t load_code[] = {
     0xA0AA0006, // lhz   r5, 6(r10)
     0xA8CA0008, // lha   r6, 8(r10)
     0xA8EA000A, // lha   r7, 10(r10)
-    0x810A0001, // lwz   r8, 1(r10)    nao alinhado
-    0xA12A0003, // lhz   r9, 3(r10)    nao alinhado
+    0x810A0001, // lwz   r8, 1(r10)    unaligned
+    0xA12A0003, // lhz   r9, 3(r10)    unaligned
     0x856A0010, // lwzu  r11, 16(r10)
     0x8D8A0001, // lbzu  r12, 1(r10)
     0xADAA0003, // lhau  r13, 3(r10)
     0x81CAFFFC, // lwz   r14, -4(r10)
-    0x00000000, // ilegal, o bloco para antes dela
+    0x00000000, // illegal on purpose, the block stops short of it
 };
 
 constexpr uint32_t LOAD_BASE = 0x4000;
 constexpr uint32_t LOAD_END  = LOAD_BASE + uint32_t(sizeof(load_code) - 4);
 constexpr uint32_t LOAD_DATA = 0x3000;
 
-// escolhidos para exercitar extensao de sinal: 0xFFFF negativo, 0x7FFF nao
+// chosen to exercise sign extension: 0xFFFF is negative, 0x7FFF is not
 static const uint32_t load_data[] = {
     0x12345678, 0xAABBCCDD, 0xFFFF7FFF, 0x11223344, 0xDEADBEEF, 0xCAFEBABE,
 };
@@ -428,53 +428,53 @@ static AluResult run_load_code() {
     return r;
 }
 
-/** O caminho rapido inline do TLB tem que dar o mesmo que o interpretador,
-    tanto quando acerta quanto quando cai no rt_read */
+/** The inline TLB fast path has to produce what the interpreter does, both
+    when it hits and when it drops to the slow path */
 static void test_load_subset() {
     load_load_code();
 
     ppc_jit_disable();
     AluResult interp = run_load_code();
-    jit_check(interp.pc == LOAD_END, "o programa de loads parou onde devia");
+    jit_check(interp.pc == LOAD_END, "the load program stopped where it should");
 
     ppc_jit_enable(JitBackend::threaded);
     AluResult threaded = run_load_code();
     int diff = -1;
     jit_check(same_alu(interp, threaded, &diff),
-              "backend threaded confere com o interpretador nos loads");
+              "the threaded backend agrees with the interpreter on loads");
     if (diff >= 0) {
-        cout << "    r" << diff << ": interpretador 0x" << hex << interp.gpr[diff]
+        cout << "    r" << diff << ": interpreter 0x" << hex << interp.gpr[diff]
              << ", threaded 0x" << threaded.gpr[diff] << dec << endl;
     }
 
     ppc_jit_disable();
     ppc_jit_enable(JitBackend::automatic);
 
-    // primeira passada erra o TLB, segunda acerta
+    // the first pass misses the TLB, the second hits
     AluResult miss = run_load_code();
     AluResult hit  = run_load_code();
 
     if (ppc_jit_native_compiles() == 0) {
-        cout << "  (sem emissor neste host, comparacao nativa pulada)" << endl;
+        cout << "  (no emitter on this host, skipping the native comparison)" << endl;
         return;
     }
 
     diff = -1;
-    jit_check(same_alu(interp, miss, &diff), "loads emitidos conferem na primeira passada");
+    jit_check(same_alu(interp, miss, &diff), "emitted loads agree on the first pass");
     if (diff >= 0) {
-        cout << "    r" << diff << ": interpretador 0x" << hex << interp.gpr[diff]
-             << ", emitido 0x" << miss.gpr[diff] << dec << endl;
+        cout << "    r" << diff << ": interpreter 0x" << hex << interp.gpr[diff]
+             << ", emitted 0x" << miss.gpr[diff] << dec << endl;
     }
     diff = -1;
-    jit_check(same_alu(interp, hit, &diff), "e conferem com o TLB ja quente");
+    jit_check(same_alu(interp, hit, &diff), "and agree with the TLB already warm");
     if (diff >= 0) {
-        cout << "    r" << diff << ": interpretador 0x" << hex << interp.gpr[diff]
-             << ", emitido 0x" << hit.gpr[diff] << dec << endl;
+        cout << "    r" << diff << ": interpreter 0x" << hex << interp.gpr[diff]
+             << ", emitted 0x" << hit.gpr[diff] << dec << endl;
     }
 }
 
-/*  Stores em forma D, incluindo nao alinhados e as formas com update, cujo
-    rA so pode ser escrito depois de o acesso dar certo.  */
+/*  D form stores, including unaligned ones and the update forms, whose rA
+    may only be written after the access succeeds.  */
 static const uint32_t store_code[] = {
     0x3D400000, // addis r10, r0, 0
     0x614A5000, // ori   r10, r10, 0x5000
@@ -484,13 +484,13 @@ static const uint32_t store_code[] = {
     0x908A0000, // stw   r4, 0(r10)
     0x986A0004, // stb   r3, 4(r10)
     0xB06A0006, // sth   r3, 6(r10)
-    0x908A0009, // stw   r4, 9(r10)    nao alinhado
-    0xB08A000F, // sth   r4, 15(r10)   nao alinhado
+    0x908A0009, // stw   r4, 9(r10)    unaligned
+    0xB08A000F, // sth   r4, 15(r10)   unaligned
     0x948A0020, // stwu  r4, 32(r10)
     0xB46A0004, // sthu  r3, 4(r10)
     0x9C6A0001, // stbu  r3, 1(r10)
     0x914A0008, // stw   r10, 8(r10)
-    0x00000000, // ilegal, o bloco para antes dela
+    0x00000000, // illegal on purpose, the block stops short of it
 };
 
 constexpr uint32_t STORE_BASE = 0x6000;
@@ -544,20 +544,20 @@ static bool same_store(const StoreResult& a, const StoreResult& b, int* where) {
     return true;
 }
 
-/** Comparar so os registradores nao bastaria num store: o efeito dele esta na
-    memoria, entao a area de dados inteira entra na comparacao */
+/** Comparing only the registers would not do for a store: its effect lives
+    in memory, so the whole data area joins the comparison */
 static void test_store_subset() {
     load_store_code();
 
     ppc_jit_disable();
     StoreResult interp = run_store_code();
-    jit_check(interp.regs.pc == STORE_END, "o programa de stores parou onde devia");
+    jit_check(interp.regs.pc == STORE_END, "the store program stopped where it should");
 
     ppc_jit_enable(JitBackend::threaded);
     StoreResult threaded = run_store_code();
     int where = -1;
     jit_check(same_store(interp, threaded, &where),
-              "backend threaded confere com o interpretador nos stores");
+              "the threaded backend agrees with the interpreter on stores");
 
     ppc_jit_disable();
     ppc_jit_enable(JitBackend::automatic);
@@ -565,29 +565,29 @@ static void test_store_subset() {
     StoreResult hit  = run_store_code();
 
     if (ppc_jit_native_compiles() == 0) {
-        cout << "  (sem emissor neste host, comparacao nativa pulada)" << endl;
+        cout << "  (no emitter on this host, skipping the native comparison)" << endl;
         return;
     }
 
     where = -1;
-    jit_check(same_store(interp, miss, &where), "stores emitidos conferem na primeira passada");
+    jit_check(same_store(interp, miss, &where), "emitted stores agree on the first pass");
     if (where >= 100) {
-        cout << "    memoria +0x" << hex << (where - 100) * 4 << ": interpretador 0x"
-             << interp.mem[where - 100] << ", emitido 0x" << miss.mem[where - 100]
+        cout << "    memory +0x" << hex << (where - 100) * 4 << ": interpreter 0x"
+             << interp.mem[where - 100] << ", emitted 0x" << miss.mem[where - 100]
              << dec << endl;
     } else if (where >= 0) {
-        cout << "    r" << where << ": interpretador 0x" << hex << interp.regs.gpr[where]
-             << ", emitido 0x" << miss.regs.gpr[where] << dec << endl;
+        cout << "    r" << where << ": interpreter 0x" << hex << interp.regs.gpr[where]
+             << ", emitted 0x" << miss.regs.gpr[where] << dec << endl;
     }
 
     where = -1;
-    jit_check(same_store(interp, hit, &where), "e conferem com o TLB ja quente");
+    jit_check(same_store(interp, hit, &where), "and agree with the TLB already warm");
 }
 
-/*  Um campo de CR por instrucao, cobrindo os quatro comparadores, andi. e
-    andis., e as formas com Rc dos opcodes ja emitidos. Roda duas vezes, com
-    XER[SO] apagado e aceso, porque esse bit e copiado para dentro do campo e
-    um erro nele so aparece quando ele esta ligado.  */
+/*  One CR field per instruction, covering the four comparators, andi. and
+    andis., and the Rc forms of the opcodes already emitted. Runs twice, with
+    XER[SO] clear and set, because that bit is copied into the field and a
+    bug in it only shows while it is on.  */
 static const uint32_t cr_code[] = {
     0x38600005, // li     r3, 5
     0x3880FFF9, // li     r4, -7
@@ -604,8 +604,8 @@ static const uint32_t cr_code[] = {
     0x7C692039, // and.   r9, r3, r4
     0x7C8A0775, // extsb. r10, r4
     0x548B2037, // rlwinm. r11, r4, 4, 0, 27
-    0x50852707, // rlwimi. r5, r4, 4, 28, 3   mascara que da a volta
-    0x00000000, // ilegal, o bloco para antes dela
+    0x50852707, // rlwimi. r5, r4, 4, 28, 3   wrapping mask
+    0x00000000, // illegal on purpose, the block stops short of it
 };
 
 constexpr uint32_t CR_BASE = 0x7000;
@@ -658,64 +658,64 @@ static void test_cr_subset() {
         ppc_jit_disable();
         CrResult interp = run_cr_code(so);
         jit_check(interp.regs.pc == CR_END,
-                  so ? "o programa de CR parou onde devia, com XER[SO]"
-                     : "o programa de CR parou onde devia");
+                  so ? "the CR program stopped where it should, with XER[SO]"
+                     : "the CR program stopped where it should");
 
         ppc_jit_enable(JitBackend::threaded);
         int where = -1;
         CrResult threaded = run_cr_code(so);
         jit_check(same_cr(interp, threaded, &where),
-                  so ? "backend threaded confere no CR, com XER[SO]"
-                     : "backend threaded confere no CR");
+                  so ? "the threaded backend agrees on CR, with XER[SO]"
+                     : "the threaded backend agrees on CR");
 
         ppc_jit_disable();
         ppc_jit_enable(JitBackend::automatic);
         CrResult native = run_cr_code(so);
 
         if (ppc_jit_native_compiles() == 0) {
-            cout << "  (sem emissor neste host, comparacao nativa pulada)" << endl;
+            cout << "  (no emitter on this host, skipping the native comparison)" << endl;
             return;
         }
 
         where = -1;
         jit_check(same_cr(interp, native, &where),
-                  so ? "codigo emitido confere no CR, com XER[SO]"
-                     : "codigo emitido confere no CR");
+                  so ? "emitted code agrees on CR, with XER[SO]"
+                     : "emitted code agrees on CR");
         if (where == 200) {
-            cout << "    cr: interpretador 0x" << hex << interp.cr
-                 << ", emitido 0x" << native.cr << dec << endl;
+            cout << "    cr: interpreter 0x" << hex << interp.cr
+                 << ", emitted 0x" << native.cr << dec << endl;
         } else if (where >= 0) {
-            cout << "    r" << where << ": interpretador 0x" << hex
-                 << interp.regs.gpr[where] << ", emitido 0x"
+            cout << "    r" << where << ": interpreter 0x" << hex
+                 << interp.regs.gpr[where] << ", emitted 0x"
                  << native.regs.gpr[where] << dec << endl;
         }
     }
 }
 
-/*  Chamada e retorno de funcao: bl empilha em LR, blr volta por ele, bcctr
-    salta pelo CTR, com mflr, mtctr, mtlr e mfctr no caminho, um bclr
-    condicional nao tomado, e um eieio que decodifica para coisa nenhuma e so
-    conta como retirada.  */
+/*  Function call and return: bl stacks into LR, blr goes back through it,
+    bcctr jumps through CTR, with mflr, mtctr, mtlr and mfctr on the way, a
+    conditional bclr not taken, and an eieio that decodes into nothing and
+    only counts as retired.  */
 static const uint32_t branch_code[] = {
     0x38600000, // +0x00 li     r3, 0
     0x4800001D, // +0x04 bl     +0x1C          -> +0x20
-    0x38630001, // +0x08 addi   r3, r3, 1      <- o blr volta para ca
+    0x38630001, // +0x08 addi   r3, r3, 1      <- blr comes back here
     0x3CC00000, // +0x0C addis  r6, r0, 0
     0x60C68038, // +0x10 ori    r6, r6, 0x8038
     0x7CC903A6, // +0x14 mtctr  r6
     0x4E800420, // +0x18 bcctr  20, 0          -> 0x8038
-    0x00000000, // +0x1C ilegal, nunca roda
+    0x00000000, // +0x1C illegal, never runs
     0x38800005, // +0x20 li     r4, 5
-    0x2C040063, // +0x24 cmpi   cr0, r4, 99    EQ apagado
+    0x2C040063, // +0x24 cmpi   cr0, r4, 99    EQ clear
     0x7CA802A6, // +0x28 mflr   r5             r5 = 0x8008
-    0x4D820020, // +0x2C beqlr                 nao tomado
+    0x4D820020, // +0x2C beqlr                 not taken
     0x4E800020, // +0x30 blr                   -> 0x8008
-    0x00000000, // +0x34 ilegal, nunca roda
+    0x00000000, // +0x34 illegal, never runs
     0x7CC803A6, // +0x38 mtlr   r6
     0x7D0902A6, // +0x3C mfctr  r8             r8 = 0x8038
     0x7C0006AC, // +0x40 eieio
     0x38E00007, // +0x44 li     r7, 7
-    0x00000000, // +0x48 ilegal, o programa para aqui
+    0x00000000, // +0x48 illegal, the program stops here
 };
 
 constexpr uint32_t BR_BASE = 0x8000;
@@ -768,37 +768,37 @@ static bool same_spr(const SprResult& a, const SprResult& b, int* where) {
 static void report_spr(const SprResult& interp, const SprResult& got, int where,
                        const char* label) {
     if (where == 300) {
-        cout << "    lr: interpretador 0x" << hex << interp.lr
+        cout << "    lr: interpreter 0x" << hex << interp.lr
              << ", " << label << " 0x" << got.lr << dec << endl;
     } else if (where == 301) {
-        cout << "    ctr: interpretador 0x" << hex << interp.ctr
+        cout << "    ctr: interpreter 0x" << hex << interp.ctr
              << ", " << label << " 0x" << got.ctr << dec << endl;
     } else if (where == 302) {
-        cout << "    cr: interpretador 0x" << hex << interp.cr
+        cout << "    cr: interpreter 0x" << hex << interp.cr
              << ", " << label << " 0x" << got.cr << dec << endl;
     } else if (where >= 0) {
-        cout << "    r" << where << ": interpretador 0x" << hex
+        cout << "    r" << where << ": interpreter 0x" << hex
              << interp.regs.gpr[where] << ", " << label << " 0x"
              << got.regs.gpr[where] << dec << endl;
     }
 }
 
-/** bclr e bcctr emitidos tem que pousar exatamente onde o interpretador
-    pousa, com o mesmo LR, o mesmo CTR e a mesma contagem de retiradas */
+/** Emitted bclr and bcctr have to land exactly where the interpreter
+    lands, with the same LR, the same CTR and the same retired count */
 static void test_branch_subset() {
     load_branch_code();
 
     ppc_jit_disable();
     SprResult interp = run_branch_code();
-    jit_check(interp.regs.pc == BR_END, "o programa de branch parou onde devia");
+    jit_check(interp.regs.pc == BR_END, "the branch program stopped where it should");
     jit_check(interp.regs.retired == BR_RETIRED,
-              "o interpretador retirou a contagem esperada no programa de branch");
+              "the interpreter retired the expected count in the branch program");
 
     ppc_jit_enable(JitBackend::threaded);
     SprResult threaded = run_branch_code();
     int where = -1;
     jit_check(same_spr(interp, threaded, &where),
-              "backend threaded confere no programa de branch");
+              "the threaded backend agrees on the branch program");
     report_spr(interp, threaded, where, "threaded");
 
     ppc_jit_disable();
@@ -806,27 +806,27 @@ static void test_branch_subset() {
     SprResult native = run_branch_code();
 
     if (ppc_jit_native_compiles() == 0) {
-        cout << "  (sem emissor neste host, comparacao nativa pulada)" << endl;
+        cout << "  (no emitter on this host, skipping the native comparison)" << endl;
         return;
     }
 
     where = -1;
     jit_check(same_spr(interp, native, &where),
-              "codigo emitido confere no programa de branch");
-    report_spr(interp, native, where, "emitido");
+              "emitted code agrees on the branch program");
+    report_spr(interp, native, where, "emitted");
     jit_check(ppc_jit_threaded_compiles() == 0,
-              "o emissor tomou todos os blocos de branch em vez de recusar");
+              "the emitter took every branch block instead of declining");
 
     SprResult again = run_branch_code();
     where = -1;
     jit_check(same_spr(interp, again, &where),
-              "segunda passada pelos blocos de branch em cache confere");
+              "a second pass over the cached branch blocks agrees");
 }
 
-/*  A familia do XER[CA]: addc, adde, addic, addic., subfc, subfe, subfic,
-    addze e subf, com o carry encadeando de uma para a seguinte e as formas
-    com os dois operandos no mesmo registrador, que sao as que quebram um
-    emissor descuidado.  */
+/*  The XER[CA] family: addc, adde, addic, addic., subfc, subfe, subfic,
+    addze and subf, with the carry chaining from one into the next and the
+    forms with both operands in the same register, which are the ones that
+    break a careless emitter.  */
 static const uint32_t carry_code[] = {
     0x3C60FFFF, // addis  r3, r0, 0xFFFF
     0x6063FFFF, // ori    r3, r3, 0xFFFF     r3 = 0xFFFFFFFF
@@ -840,10 +840,10 @@ static const uint32_t carry_code[] = {
     0x2163FFFF, // subfic r11, r3, -1        0, CA=1
     0x7D830194, // addze  r12, r3            0, CA=1
     0x7DA31914, // adde   r13, r3, r3        0xFFFFFFFF, CA=1
-    0x7DC41850, // subf   r14, r4, r3        0xFFFFFFFE, CA fica
-    0x7DEF7910, // subfe  r15, r15, r15      operandos no mesmo registrador
-    0x7E108014, // addc   r16, r16, r16      idem
-    0x00000000, // ilegal, o programa para aqui
+    0x7DC41850, // subf   r14, r4, r3        0xFFFFFFFE, CA stays
+    0x7DEF7910, // subfe  r15, r15, r15      both operands in one register
+    0x7E108014, // addc   r16, r16, r16      likewise
+    0x00000000, // illegal on purpose, the program stops here
 };
 
 constexpr uint32_t CARRY_BASE = 0x8100;
@@ -892,21 +892,21 @@ static bool same_carry(const CarryResult& a, const CarryResult& b, int* where) {
 static void report_carry(const CarryResult& interp, const CarryResult& got,
                          int where, const char* label) {
     if (where == 400) {
-        cout << "    xer: interpretador 0x" << hex << interp.xer
+        cout << "    xer: interpreter 0x" << hex << interp.xer
              << ", " << label << " 0x" << got.xer << dec << endl;
     } else if (where == 401) {
-        cout << "    cr: interpretador 0x" << hex << interp.cr
+        cout << "    cr: interpreter 0x" << hex << interp.cr
              << ", " << label << " 0x" << got.cr << dec << endl;
     } else if (where >= 0) {
-        cout << "    r" << where << ": interpretador 0x" << hex
+        cout << "    r" << where << ": interpreter 0x" << hex
              << interp.regs.gpr[where] << ", " << label << " 0x"
              << got.regs.gpr[where] << dec << endl;
     }
 }
 
-/** O carry emitido usa a flag do host, o interpretador compara na mao, e os
-    dois tem que concordar em todos os registradores e no proprio XER, com o
-    carry entrando apagado e aceso */
+/** Emitted carry uses the host flag while the interpreter compares by
+    hand, and the two have to agree in every register and in XER itself,
+    with the carry coming in both clear and set */
 static void test_carry_subset() {
     load_carry_code();
 
@@ -916,15 +916,15 @@ static void test_carry_subset() {
         ppc_jit_disable();
         CarryResult interp = run_carry_code(ca);
         jit_check(interp.regs.pc == CARRY_END,
-                  ca ? "o programa de carry parou onde devia, com CA"
-                     : "o programa de carry parou onde devia");
+                  ca ? "the carry program stopped where it should, with CA"
+                     : "the carry program stopped where it should");
 
         ppc_jit_enable(JitBackend::threaded);
         CarryResult threaded = run_carry_code(ca);
         int where = -1;
         jit_check(same_carry(interp, threaded, &where),
-                  ca ? "backend threaded confere no carry, com CA"
-                     : "backend threaded confere no carry");
+                  ca ? "the threaded backend agrees on carry, with CA"
+                     : "the threaded backend agrees on carry");
         report_carry(interp, threaded, where, "threaded");
 
         ppc_jit_disable();
@@ -932,23 +932,23 @@ static void test_carry_subset() {
         CarryResult native = run_carry_code(ca);
 
         if (ppc_jit_native_compiles() == 0) {
-            cout << "  (sem emissor neste host, comparacao nativa pulada)" << endl;
+            cout << "  (no emitter on this host, skipping the native comparison)" << endl;
             return;
         }
 
         where = -1;
         jit_check(same_carry(interp, native, &where),
-                  ca ? "codigo emitido confere no carry, com CA"
-                     : "codigo emitido confere no carry");
-        report_carry(interp, native, where, "emitido");
+                  ca ? "emitted code agrees on carry, with CA"
+                     : "emitted code agrees on carry");
+        report_carry(interp, native, where, "emitted");
         jit_check(ppc_jit_threaded_compiles() == 0,
-                  "o emissor tomou todos os blocos de carry em vez de recusar");
+                  "the emitter took every carry block instead of declining");
     }
 }
 
-/*  Formas X e invertidas de byte: indice em registrador, lwbrx alinhado e nao
-    alinhado, stwbrx e sthbrx, e as formas com update. Reusa a area de dados
-    dos loads em 0x3000 e a area de stores em 0x5000.  */
+/*  X forms and byte reversed ones: register indexed addressing, lwbrx both
+    aligned and unaligned, stwbrx and sthbrx, and the update forms. Reuses
+    the load data area at 0x3000 and the store area at 0x5000.  */
 static const uint32_t xform_code[] = {
     0x3E800000, // addis  r20, r0, 0
     0x62943000, // ori    r20, r20, 0x3000
@@ -964,16 +964,16 @@ static const uint32_t xform_code[] = {
     0x7D34B2AE, // lhax   r9, r20, r22
     0x7C60A92E, // stwx   r3, 0, r21
     0x7C95B52C, // stwbrx r4, r21, r22
-    0x7CD5B32E, // sthx   r6, r21, r22      sobrescreve meio do stwbrx
-    0x7CC0AF2C, // sthbrx r6, 0, r21        sobrescreve meio do stwx
+    0x7CD5B32E, // sthx   r6, r21, r22      overwrites the middle of the stwbrx
+    0x7CC0AF2C, // sthbrx r6, 0, r21        overwrites the middle of the stwx
     0x7CF5B1AE, // stbx   r7, r21, r22
     0x3AF40000, // addi   r23, r20, 0
     0x7DB7B06E, // lwzux  r13, r23, r22
     0x3B150000, // addi   r24, r21, 0
     0x7C98B16E, // stwux  r4, r24, r22
     0x3B200001, // li     r25, 1
-    0x7F54CC2C, // lwbrx  r26, r20, r25     nao alinhado, caminho lento
-    0x00000000, // ilegal, o programa para aqui
+    0x7F54CC2C, // lwbrx  r26, r20, r25     unaligned, slow path
+    0x00000000, // illegal on purpose, the program stops here
 };
 
 constexpr uint32_t XFORM_BASE = 0x8200;
@@ -1013,20 +1013,20 @@ static StoreResult run_xform_code() {
     return r;
 }
 
-/** As formas X e as invertidas de byte, registradores e memoria, TLB frio e
-    quente */
+/** The X forms and the byte reversed ones, registers and memory, TLB cold
+    and warm */
 static void test_xform_subset() {
     load_xform_code();
 
     ppc_jit_disable();
     StoreResult interp = run_xform_code();
-    jit_check(interp.regs.pc == XFORM_END, "o programa X-form parou onde devia");
+    jit_check(interp.regs.pc == XFORM_END, "the X form program stopped where it should");
 
     ppc_jit_enable(JitBackend::threaded);
     StoreResult threaded = run_xform_code();
     int where = -1;
     jit_check(same_store(interp, threaded, &where),
-              "backend threaded confere nas formas X");
+              "the threaded backend agrees on the X forms");
 
     ppc_jit_disable();
     ppc_jit_enable(JitBackend::automatic);
@@ -1034,26 +1034,26 @@ static void test_xform_subset() {
     StoreResult hit  = run_xform_code();
 
     if (ppc_jit_native_compiles() == 0) {
-        cout << "  (sem emissor neste host, comparacao nativa pulada)" << endl;
+        cout << "  (no emitter on this host, skipping the native comparison)" << endl;
         return;
     }
 
     where = -1;
     jit_check(same_store(interp, miss, &where),
-              "formas X emitidas conferem na primeira passada");
+              "emitted X forms agree on the first pass");
     if (where >= 100) {
-        cout << "    memoria +0x" << hex << (where - 100) * 4 << ": interpretador 0x"
-             << interp.mem[where - 100] << ", emitido 0x" << miss.mem[where - 100]
+        cout << "    memory +0x" << hex << (where - 100) * 4 << ": interpreter 0x"
+             << interp.mem[where - 100] << ", emitted 0x" << miss.mem[where - 100]
              << dec << endl;
     } else if (where >= 0) {
-        cout << "    r" << where << ": interpretador 0x" << hex << interp.regs.gpr[where]
-             << ", emitido 0x" << miss.regs.gpr[where] << dec << endl;
+        cout << "    r" << where << ": interpreter 0x" << hex << interp.regs.gpr[where]
+             << ", emitted 0x" << miss.regs.gpr[where] << dec << endl;
     }
 
     where = -1;
-    jit_check(same_store(interp, hit, &where), "e conferem com o TLB ja quente");
+    jit_check(same_store(interp, hit, &where), "and agree with the TLB already warm");
     jit_check(ppc_jit_threaded_compiles() == 0,
-              "o emissor tomou todos os blocos X-form em vez de recusar");
+              "the emitter took every X form block instead of declining");
 }
 
 int test_jit() {
