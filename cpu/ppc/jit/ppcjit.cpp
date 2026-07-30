@@ -42,7 +42,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <utility>
 #include <vector>
 
-bool ppc_jit_enabled = false;
+bool ppc_jit_enabled   = false;
+bool ppc_jit_requested = false;
 
 namespace dppc_jit {
 

@@ -66,6 +66,11 @@ enum class JitExecType {
 /** Read by the outer loops on every iteration, so keep it a plain load */
 extern bool ppc_jit_enabled;
 
+/** Set by the --jit command line flag before the machine comes up, read by
+    ppc_cpu_init. The DPPC_JIT environment variable overrides it either way,
+    since that is the diagnostic switch and it can also say `threaded` or 0 */
+extern bool ppc_jit_requested;
+
 inline bool ppc_jit_is_enabled() {
     return ppc_jit_enabled;
 }

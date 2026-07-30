@@ -56,6 +56,19 @@ As of now, the most complete machines are the Power Mac 6100, the Power Mac 7500
 
 To go into to the debugger regardless of how you started the emulator, press Control and C on the terminal window.
 
+## JIT
+
+On x86-64 hosts a JIT compiler for the emulated CPU is built in automatically; no extra build options are needed.
+It is off by default. To turn it on, pass the flag:
+
+```
+./dingusppc --jit -b bootrom.bin
+```
+
+The `DPPC_JIT` environment variable does the same and overrides the flag: `1` enables, `0` disables, and
+`threaded` selects a portable fallback backend that exists for testing. The debugger always runs on the
+interpreter.
+
 ## How to Compile
 
 You need to install development tools first.

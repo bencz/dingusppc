@@ -26,6 +26,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <core/timermanager.h>
 #include <cpu/ppc/ppcdisasm.h>
 #include <cpu/ppc/ppcemu.h>
+#include <cpu/ppc/ppcjit.h>
 #include <cpu/ppc/ppcmmu.h>
 #include <debugger/debugger.h>
 #include <devices/common/ofnvram.h>
@@ -132,6 +133,8 @@ int main(int argc, char** argv) {
         ->check(CLI::ExistingFile);
     app.add_flag("--deterministic", is_deterministic,
         "Make execution deterministic");
+    app.add_flag("--jit", ppc_jit_requested,
+        "Enable JIT compilation of the emulated CPU (off by default)");
 
     bool              log_to_stderr = false;
     loguru::Verbosity log_verbosity = loguru::Verbosity_INFO;

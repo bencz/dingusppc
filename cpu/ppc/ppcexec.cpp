@@ -1076,14 +1076,15 @@ void ppc_cpu_init(MemCtrlBase* mem_ctrl, uint32_t cpu_version, bool do_include_6
     ppc_jit_disable();
     ppc_code_cache_init();
 
-    // no command line flag yet, and the benchmark parses no arguments at all,
-    // so the switch is an environment variable. DPPC_JIT=threaded forces the
-    // portable backend, which is what a comparison run wants
-    if (const char* want_jit = getenv("DPPC_JIT")) {
-        if (strcmp(want_jit, "0") != 0) {
-            ppc_jit_enable(strcmp(want_jit, "threaded") == 0 ? JitBackend::threaded
-                                                             : JitBackend::automatic);
-        }
+    // --jit on the command line, or the DPPC_JIT environment variable, which
+    // the benchmarks use since they parse no arguments. The variable wins
+    // when both are given: it is the diagnostic switch, and it can also say
+    // `threaded` to force the portable backend or 0 to force everything off
+    const char* want_jit = getenv("DPPC_JIT");
+    if (want_jit ? strcmp(want_jit, "0") != 0 : ppc_jit_requested) {
+        ppc_jit_enable(want_jit && strcmp(want_jit, "threaded") == 0
+                           ? JitBackend::threaded
+                           : JitBackend::automatic);
     }
 
     /* redirect code execution to reset vector */
