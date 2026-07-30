@@ -236,14 +236,15 @@ static void read_test_float_data() {
 
         opcode = (uint32_t)stoul(tokens[1], NULL, 16);
 
-        src1        = 0;
-        src2        = 0;
-        check_cr    = 0;
-        check_fpscr = 0;
-        dfp_src1    = 0.0;
-        dfp_src2    = 0.0;
-        dfp_src3    = 0.0;
-        dest_64     = 0;
+        src1          = 0;
+        src2          = 0;
+        check_cr      = 0;
+        check_fpscr   = 0;
+        dfp_src1      = 0.0;
+        dfp_src2      = 0.0;
+        dfp_src3      = 0.0;
+        dest_64       = 0;
+        rounding_mode = "RTN"; // lines without a round= token run round to nearest
 
         // switch to default rounding
         fesetround(FE_TONEAREST);

@@ -99,50 +99,146 @@ inline static bool snan_double_check(int reg_a, int reg_b) {
     return false;
 }
 
-inline static void max_double_check(double value_a, double value_b) {
-    if (((value_a == DBL_MAX) && (value_b == DBL_MAX)) ||
-        ((value_a == -DBL_MAX) && (value_b == -DBL_MAX)))
-        ppc_state.fpscr |= FX | OX | XX | FI;
+// ---- IEEE 754 arithmetic core ----------------------------------------------
+// FPSCR model per the 60x/750 user manuals: invalid operands raise VX* bits,
+// host IEEE flags feed OX/UX/ZX/XX, FR/FI describe the rounding of this
+// instruction and FPRF classifies the delivered result. FX fires on any
+// 0 to 1 transition of an exception bit, FEX mirrors enabled exceptions.
+
+static constexpr uint32_t FPSCR_VX_BITS =
+    FPSCR::VXSNAN | FPSCR::VXISI | FPSCR::VXIDI | FPSCR::VXZDZ | FPSCR::VXIMZ |
+    FPSCR::VXVC | FPSCR::VXSOFT | FPSCR::VXSQRT | FPSCR::VXCVI;
+
+static constexpr uint32_t FPSCR_EXC_BITS =
+    FPSCR::OX | FPSCR::UX | FPSCR::ZX | FPSCR::XX | FPSCR_VX_BITS;
+
+static void fp_set_exceptions(uint32_t exc_bits) {
+    uint32_t fpscr = ppc_state.fpscr;
+    if (exc_bits & ~fpscr & FPSCR_EXC_BITS)
+        exc_bits |= FPSCR::FX;
+    fpscr |= exc_bits;
+    if (fpscr & FPSCR_VX_BITS)
+        fpscr |= FPSCR::VX;
+    else
+        fpscr &= ~FPSCR::VX;
+    if (((fpscr & FPSCR::VX) && (fpscr & FPSCR::VE)) ||
+        ((fpscr & FPSCR::OX) && (fpscr & FPSCR::OE)) ||
+        ((fpscr & FPSCR::UX) && (fpscr & FPSCR::UE)) ||
+        ((fpscr & FPSCR::ZX) && (fpscr & FPSCR::ZE)) ||
+        ((fpscr & FPSCR::XX) && (fpscr & FPSCR::XE)))
+        fpscr |= FPSCR::FEX;
+    else
+        fpscr &= ~FPSCR::FEX;
+    ppc_state.fpscr = fpscr;
 }
 
-inline static bool check_qnan(int check_reg) {
-    uint64_t check_int = FPR_INT(check_reg);
-    return (((check_int & (0x7FFULL << 52)) == (0x7FFULL << 52)) &&
-        ((check_int & (0x1ULL << 51)) == (0x1ULL << 51)));
+// FPRF field for a result; single selects the single precision denormal range
+static uint32_t fp_classify(double r, bool single) {
+    if (std::isnan(r))
+        return 0x11000;    // QNaN
+    if (std::isinf(r))
+        return std::signbit(r) ? 0x9000 : 0x5000;
+    if (r == 0.0)
+        return std::signbit(r) ? 0x12000 : 0x2000;
+    if (std::fabs(r) < (single ? double(FLT_MIN) : DBL_MIN))
+        return std::signbit(r) ? 0x18000 : 0x14000;    // denormalized
+    return std::signbit(r) ? 0x8000 : 0x4000;
 }
 
-static double set_endresult_nan() {
-    ppc_state.fpscr |= (FX | VX);
-    return std::numeric_limits<double>::quiet_NaN();
-}
-
-static void fpresult_update(double set_result) {
-    if (std::isnan(set_result)) {
-        ppc_state.fpscr |= FPCC_FUNAN | FPRCD;
-    } else {
-        if (set_result > 0.0) {
-            ppc_state.fpscr |= FPCC_POS;
-        } else if (set_result < 0.0) {
-            ppc_state.fpscr |= FPCC_NEG;
-        } else {
-            ppc_state.fpscr |= FPCC_ZERO;
+// NaN and invalid operation results; registers are examined in architectural
+// order (frA, frB, frC) and the first NaN found is propagated quieted.
+// An enabled invalid operation leaves frD and FPRF untouched.
+static void fp_nan_result(int reg_d, uint32_t vx_bits, int r1, int r2, int r3 = -1) {
+    uint64_t nan = 0x7FF8000000000000ULL;    // generated QNaN
+    const int regs[3] = {r1, r2, r3};
+    for (int reg : regs) {
+        if (reg >= 0 && std::isnan(GET_FPR(reg))) {
+            nan = FPR_INT(reg) | (1ULL << 51);
+            break;
         }
-
-        if (std::fetestexcept(FE_OVERFLOW)) {
-            ppc_state.fpscr |= (OX + FX);
-        }
-        if (std::fetestexcept(FE_UNDERFLOW)) {
-            ppc_state.fpscr |= (UX + FX);
-        }
-        if (std::fetestexcept(FE_DIVBYZERO)) {
-            ppc_state.fpscr |= (ZX + FX);
-        }
-
-        std::feclearexcept(FE_ALL_EXCEPT);
-
-        if (std::isinf(set_result))
-            ppc_state.fpscr |= FPCC_FUNAN;
     }
+    fp_set_exceptions(vx_bits);
+    ppc_state.fpscr &= ~(FPSCR::FR | FPSCR::FI);
+    if (vx_bits && (ppc_state.fpscr & FPSCR::VE))
+        return;
+    ppc_state.fpscr = (ppc_state.fpscr & ~FPSCR::FPRF_MASK) | 0x11000;
+    ppc_store_fpresult_int(reg_d, nan);
+}
+
+// division of a finite nonzero number by zero
+static void fp_zx_result(int reg_d, double a, double b) {
+    fp_set_exceptions(FPSCR::ZX);
+    ppc_state.fpscr &= ~(FPSCR::FR | FPSCR::FI);
+    if (ppc_state.fpscr & FPSCR::ZE)
+        return;
+    double r = std::numeric_limits<double>::infinity();
+    if (std::signbit(a) != std::signbit(b))
+        r = -r;
+    ppc_state.fpscr = (ppc_state.fpscr & ~FPSCR::FPRF_MASK) | fp_classify(r, false);
+    ppc_store_fpresult_flt(reg_d, r);
+}
+
+// residual of a rounded sum, evaluated with error free transformations in
+// round to nearest; the sign of the returned value equals sign((a + b) - s)
+static double fp_add_residual(double a, double b, double s) {
+    int mode = std::fegetround();
+    std::fesetround(FE_TONEAREST);
+    double sn  = a + b;
+    double bv  = sn - a;
+    double av  = sn - bv;
+    double err = (a - av) + (b - bv);
+    std::fesetround(mode);
+    return (sn - s) + err;
+}
+
+// residual of a rounded fma, sign true against (a * c + b) - r
+static double fp_fma_residual(double a, double c, double b, double r) {
+    int mode = std::fegetround();
+    std::fesetround(FE_TONEAREST);
+    double p  = a * c;
+    double ep = std::fma(a, c, -p);
+    double s  = p + b;
+    double bv = s - p;
+    double pv = s - bv;
+    double es = (p - pv) + (b - bv);
+    std::fesetround(mode);
+    return ((s - r) + es) + ep;
+}
+
+// FR means the significand was rounded up in magnitude; resid carries the
+// sign of (exact - result)
+static inline bool fp_rounded_up(double resid, double r) {
+    return resid != 0.0 && (std::signbit(resid) != std::signbit(r));
+}
+
+// writes a computed result and folds the captured host IEEE flags into the
+// FPSCR; fr is the precomputed FR bit for inexact results
+static void fp_arith_finish(int reg_d, double r, bool single, int flags, bool fr) {
+    uint32_t exc = 0;
+    if (flags & FE_OVERFLOW)
+        exc |= FPSCR::OX;
+    if (flags & FE_UNDERFLOW)
+        exc |= FPSCR::UX;
+    if (flags & FE_INEXACT)
+        exc |= FPSCR::XX;
+    fp_set_exceptions(exc);
+    uint32_t fpscr = ppc_state.fpscr & ~(FPSCR::FR | FPSCR::FI | FPSCR::FPRF_MASK);
+    if (flags & FE_INEXACT) {
+        fpscr |= FPSCR::FI;
+        if (fr)
+            fpscr |= FPSCR::FR;
+    }
+    ppc_state.fpscr = fpscr | fp_classify(r, single);
+    ppc_store_fpresult_flt(reg_d, r);
+}
+
+// the 60x/750 multiplier feeds only the top 25 mantissa bits of frC into
+// single precision operations, rounding at bit 27
+static inline double fp_round_frC(int reg_c) {
+    union { uint64_t i; double d; } v;
+    v.i = FPR_INT(reg_c);
+    v.i = (v.i & 0xFFFFFFFFF8000000ULL) + (v.i & 0x0000000008000000ULL);
+    return v.d;
 }
 
 static void ppc_update_vx() {
@@ -162,32 +258,60 @@ static void ppc_update_fex() {
 }
 
 // Floating Point Arithmetic
+// shared body of fadd/fsub in both precisions; sub negates frB
+template <bool sub, bool single>
+static void fp_addsub(int reg_d, int reg_a, int reg_b) {
+    double a = GET_FPR(reg_a);
+    double b = GET_FPR(reg_b);
+
+    uint32_t vx = 0;
+    if (check_snan(reg_a) || check_snan(reg_b))
+        vx |= FPSCR::VXSNAN;
+    bool any_nan = std::isnan(a) || std::isnan(b);
+    if (!any_nan && std::isinf(a) && std::isinf(b) &&
+        ((std::signbit(a) != std::signbit(b)) != sub))
+        vx |= FPSCR::VXISI;
+
+    if (any_nan || vx) {
+        fp_nan_result(reg_d, vx, reg_a, reg_b);
+        return;
+    }
+
+    double eff_b = sub ? -b : b;
+    std::feclearexcept(FE_ALL_EXCEPT);
+    double rd = a + eff_b;
+    double r  = single ? double(float(rd)) : rd;
+    int flags = std::fetestexcept(FE_OVERFLOW | FE_UNDERFLOW | FE_INEXACT);
+    bool fr = false;
+    if (flags & FE_INEXACT) {
+        double as = a, bs = eff_b, rds = rd, rs = r;
+        if (flags & FE_OVERFLOW) {
+            // FR describes the significand rounding with unbounded exponent,
+            // so redo the sum scaled away from the overflow boundary
+            int ea, eb;
+            std::frexp(a, &ea);
+            std::frexp(eff_b, &eb);
+            int k = ea > eb ? ea : eb;
+            as  = std::scalbn(a, -k);
+            bs  = std::scalbn(eff_b, -k);
+            rds = as + bs;
+            rs  = single ? double(float(rds)) : rds;
+        }
+        double resid = fp_add_residual(as, bs, rds);
+        if (single)
+            resid += rds - rs;
+        fr = fp_rounded_up(resid, rs);
+    }
+    fp_arith_finish(reg_d, r, single, flags, fr);
+}
+
 template <field_rc rec>
 void dppc_interpreter::ppc_fadd(uint32_t opcode) {
-    ppc_grab_regsfpdab(opcode);
+    int reg_d = (opcode >> 21) & 31;
+    int reg_a = (opcode >> 16) & 31;
+    int reg_b = (opcode >> 11) & 31;
 
-    max_double_check(val_reg_a, val_reg_b);
-
-    double ppc_dblresult64_d = val_reg_a + val_reg_b;
-
-    double inf = std::numeric_limits<double>::infinity();
-    if (((val_reg_a == inf) && (val_reg_b == -inf)) || \
-        ((val_reg_a == -inf) && (val_reg_b == inf))) {
-        ppc_state.fpscr |= VXISI;
-        if (std::isnan(ppc_dblresult64_d)) {
-            ppc_dblresult64_d = set_endresult_nan();
-        }
-    }
-
-    if (snan_double_check(reg_a, reg_b)) {
-        uint64_t qnan = 0x7FFC000000000000;
-        ppc_store_fpresult_int(reg_d, qnan);
-    }
-    else {
-        ppc_store_fpresult_flt(reg_d, ppc_dblresult64_d);
-    }
-
-    fpresult_update(ppc_dblresult64_d);
+    fp_addsub<false, false>(reg_d, reg_a, reg_b);
 
     if (rec)
         ppc_update_cr1();
@@ -198,26 +322,11 @@ template void dppc_interpreter::ppc_fadd<RC1>(uint32_t opcode);
 
 template <field_rc rec>
 void dppc_interpreter::ppc_fsub(uint32_t opcode) {
-    ppc_grab_regsfpdab(opcode);
+    int reg_d = (opcode >> 21) & 31;
+    int reg_a = (opcode >> 16) & 31;
+    int reg_b = (opcode >> 11) & 31;
 
-    double ppc_dblresult64_d = val_reg_a - val_reg_b;
-
-    double inf = std::numeric_limits<double>::infinity();
-    if ((val_reg_a == inf) && (val_reg_b == inf)) {
-        ppc_state.fpscr |= VXISI;
-        if (std::isnan(ppc_dblresult64_d)) {
-            ppc_dblresult64_d = set_endresult_nan();
-        }
-    }
-
-    if (snan_double_check(reg_a, reg_b)) {
-        uint64_t qnan = 0x7FFC000000000000;
-        ppc_store_fpresult_int(reg_d, qnan);
-    } else {
-        ppc_store_fpresult_flt(reg_d, ppc_dblresult64_d);
-    }
-
-    fpresult_update(ppc_dblresult64_d);
+    fp_addsub<true, false>(reg_d, reg_a, reg_b);
 
     if (rec)
         ppc_update_cr1();
@@ -226,48 +335,69 @@ void dppc_interpreter::ppc_fsub(uint32_t opcode) {
 template void dppc_interpreter::ppc_fsub<RC0>(uint32_t opcode);
 template void dppc_interpreter::ppc_fsub<RC1>(uint32_t opcode);
 
-template <field_rc rec>
-void dppc_interpreter::ppc_fdiv(uint32_t opcode) {
-    ppc_grab_regsfpdab(opcode);
+template <bool single>
+static void fp_divide(int reg_d, int reg_a, int reg_b) {
+    double a = GET_FPR(reg_a);
+    double b = GET_FPR(reg_b);
 
-    double ppc_dblresult64_d;
-
-    if (is_601 && FPR_INT(reg_b) == 0x8000000000000000 && val_reg_a > 0) {
-        ppc_dblresult64_d = val_reg_b;
-        fpresult_update(ppc_dblresult64_d);
-
-        if (rec)
-            ppc_update_cr1();
-
+    if (is_601 && FPR_INT(reg_b) == 0x8000000000000000ULL && a > 0) {
+        // the 601 delivers negative zero for positive / -0.0
+        fp_arith_finish(reg_d, b, single, 0, false);
         return;
     }
 
-    ppc_dblresult64_d = val_reg_a / val_reg_b;
-
-    if (val_reg_b == 0.0) {
-        ppc_state.fpscr |= FX | VX;
+    uint32_t vx = 0;
+    if (check_snan(reg_a) || check_snan(reg_b))
+        vx |= FPSCR::VXSNAN;
+    bool any_nan = std::isnan(a) || std::isnan(b);
+    if (!any_nan) {
+        if (std::isinf(a) && std::isinf(b))
+            vx |= FPSCR::VXIDI;
+        if (a == 0.0 && b == 0.0)
+            vx |= FPSCR::VXZDZ;
     }
 
-    if (std::isinf(val_reg_a) && std::isinf(val_reg_b)) {
-        ppc_state.fpscr |= VXIDI;
+    if (any_nan || vx) {
+        fp_nan_result(reg_d, vx, reg_a, reg_b);
+        return;
     }
 
-    if ((val_reg_a == 0.0) && (val_reg_b == 0.0)) {
-        ppc_state.fpscr |= VXZDZ;
-        if (std::isnan(ppc_dblresult64_d)) {
-            ppc_dblresult64_d = set_endresult_nan();
+    if (b == 0.0 && !std::isinf(a)) {
+        fp_zx_result(reg_d, a, b);
+        return;
+    }
+
+    std::feclearexcept(FE_ALL_EXCEPT);
+    double rd = a / b;
+    double r  = single ? double(float(rd)) : rd;
+    int flags = std::fetestexcept(FE_OVERFLOW | FE_UNDERFLOW | FE_INEXACT);
+    bool fr = false;
+    if (flags & FE_INEXACT) {
+        double as = a, bs = b, rds = rd, rs = r;
+        if (flags & FE_OVERFLOW) {
+            int ea, eb;
+            std::frexp(a, &ea);
+            std::frexp(b, &eb);
+            as  = std::scalbn(a, -ea);
+            bs  = std::scalbn(b, -eb);
+            rds = as / bs;
+            rs  = single ? double(float(rds)) : rds;
         }
+        double resid = -std::fma(rds, bs, -as) / bs;
+        if (single)
+            resid += rds - rs;
+        fr = fp_rounded_up(resid, rs);
     }
+    fp_arith_finish(reg_d, r, single, flags, fr);
+}
 
-    if (snan_double_check(reg_a, reg_b)) {
-        uint64_t qnan = 0x7FFC000000000000;
-        ppc_store_fpresult_int(reg_d, qnan);
-    }
-    else {
-        ppc_store_fpresult_flt(reg_d, ppc_dblresult64_d);
-    }
+template <field_rc rec>
+void dppc_interpreter::ppc_fdiv(uint32_t opcode) {
+    int reg_d = (opcode >> 21) & 31;
+    int reg_a = (opcode >> 16) & 31;
+    int reg_b = (opcode >> 11) & 31;
 
-    fpresult_update(ppc_dblresult64_d);
+    fp_divide<false>(reg_d, reg_a, reg_b);
 
     if (rec)
         ppc_update_cr1();
@@ -276,32 +406,56 @@ void dppc_interpreter::ppc_fdiv(uint32_t opcode) {
 template void dppc_interpreter::ppc_fdiv<RC0>(uint32_t opcode);
 template void dppc_interpreter::ppc_fdiv<RC1>(uint32_t opcode);
 
+template <bool single>
+static void fp_multiply(int reg_d, int reg_a, int reg_c) {
+    double a = GET_FPR(reg_a);
+    double c = GET_FPR(reg_c);
+
+    uint32_t vx = 0;
+    if (check_snan(reg_a) || check_snan(reg_c))
+        vx |= FPSCR::VXSNAN;
+    bool any_nan = std::isnan(a) || std::isnan(c);
+    if (!any_nan &&
+        ((std::isinf(a) && c == 0.0) || (std::isinf(c) && a == 0.0)))
+        vx |= FPSCR::VXIMZ;
+
+    if (any_nan || vx) {
+        fp_nan_result(reg_d, vx, reg_a, reg_c);
+        return;
+    }
+
+    double cm = single ? fp_round_frC(reg_c) : c;
+    std::feclearexcept(FE_ALL_EXCEPT);
+    double rd = a * cm;
+    double r  = single ? double(float(rd)) : rd;
+    int flags = std::fetestexcept(FE_OVERFLOW | FE_UNDERFLOW | FE_INEXACT);
+    bool fr = false;
+    if (flags & FE_INEXACT) {
+        double as = a, cs = cm, rds = rd, rs = r;
+        if (flags & FE_OVERFLOW) {
+            int ea, ec;
+            std::frexp(a, &ea);
+            std::frexp(cm, &ec);
+            as  = std::scalbn(a, -ea);
+            cs  = std::scalbn(cm, -ec);
+            rds = as * cs;
+            rs  = single ? double(float(rds)) : rds;
+        }
+        double resid = std::fma(as, cs, -rds);
+        if (single)
+            resid += rds - rs;
+        fr = fp_rounded_up(resid, rs);
+    }
+    fp_arith_finish(reg_d, r, single, flags, fr);
+}
+
 template <field_rc rec>
 void dppc_interpreter::ppc_fmul(uint32_t opcode) {
-    ppc_grab_regsfpdac(opcode);
+    int reg_d = (opcode >> 21) & 31;
+    int reg_a = (opcode >> 16) & 31;
+    int reg_c = (opcode >> 6) & 31;
 
-    double ppc_dblresult64_d = val_reg_a * val_reg_c;
-
-    if ((std::isinf(val_reg_a) && (val_reg_c == 0.0)) ||
-        (std::isinf(val_reg_c) && (val_reg_a == 0.0))) {
-        ppc_state.fpscr |= VXIMZ;
-        if (std::isnan(ppc_dblresult64_d)) {
-            ppc_dblresult64_d = set_endresult_nan();
-        }
-    }
-
-    if (std::isnan(val_reg_a) || std::isnan(val_reg_c)) {
-        ppc_dblresult64_d = std::numeric_limits<double>::quiet_NaN();
-    }
-
-    if (snan_double_check(reg_a, reg_c)) {
-        uint64_t qnan = 0x7FFC000000000000;
-        ppc_store_fpresult_int(reg_d, qnan);
-    } else {
-        ppc_store_fpresult_flt(reg_d, ppc_dblresult64_d);
-    }
-
-    fpresult_update(ppc_dblresult64_d);
+    fp_multiply<false>(reg_d, reg_a, reg_c);
 
     if (rec)
         ppc_update_cr1();
@@ -310,37 +464,71 @@ void dppc_interpreter::ppc_fmul(uint32_t opcode) {
 template void dppc_interpreter::ppc_fmul<RC0>(uint32_t opcode);
 template void dppc_interpreter::ppc_fmul<RC1>(uint32_t opcode);
 
+// shared body of the fmadd family; sub negates frB, neg negates the final
+// result unless it is a NaN
+template <bool sub, bool neg, bool single>
+static void fp_fmadd_family(uint32_t opcode) {
+    int reg_d = (opcode >> 21) & 31;
+    int reg_a = (opcode >> 16) & 31;
+    int reg_b = (opcode >> 11) & 31;
+    int reg_c = (opcode >> 6) & 31;
+    double a = GET_FPR(reg_a);
+    double b = GET_FPR(reg_b);
+    double c = GET_FPR(reg_c);
+
+    uint32_t vx = 0;
+    if (check_snan(reg_a) || check_snan(reg_b) || check_snan(reg_c))
+        vx |= FPSCR::VXSNAN;
+    bool nan_ac = std::isnan(a) || std::isnan(c);
+    bool imz = !nan_ac &&
+        ((std::isinf(a) && c == 0.0) || (std::isinf(c) && a == 0.0));
+    if (imz)
+        vx |= FPSCR::VXIMZ;
+    if (!nan_ac && !std::isnan(b) && !imz &&
+        (std::isinf(a) || std::isinf(c)) && std::isinf(b)) {
+        bool prod_neg   = std::signbit(a) != std::signbit(c);
+        bool addend_neg = std::signbit(b) != sub;
+        if (prod_neg != addend_neg)
+            vx |= FPSCR::VXISI;
+    }
+
+    if (nan_ac || std::isnan(b) || vx) {
+        fp_nan_result(reg_d, vx, reg_a, reg_b, reg_c);
+        return;
+    }
+
+    double cm    = single ? fp_round_frC(reg_c) : c;
+    double eff_b = sub ? -b : b;
+    std::feclearexcept(FE_ALL_EXCEPT);
+    double rd = std::fma(a, cm, eff_b);
+    double r  = single ? double(float(rd)) : rd;
+    int flags = std::fetestexcept(FE_OVERFLOW | FE_UNDERFLOW | FE_INEXACT);
+    bool fr = false;
+    if (flags & FE_INEXACT) {
+        double as = a, cs = cm, bs = eff_b, rds = rd, rs = r;
+        if (flags & FE_OVERFLOW) {
+            int ea, ec;
+            std::frexp(a, &ea);
+            std::frexp(cm, &ec);
+            as  = std::scalbn(a, -ea);
+            cs  = std::scalbn(cm, -ec);
+            bs  = std::scalbn(eff_b, -(ea + ec));
+            rds = std::fma(as, cs, bs);
+            rs  = single ? double(float(rds)) : rds;
+        }
+        double resid = fp_fma_residual(as, cs, bs, rds);
+        if (single)
+            resid += rds - rs;
+        fr = fp_rounded_up(resid, rs);
+    }
+    if (neg)
+        r = -r;
+    fp_arith_finish(reg_d, r, single, flags, fr);
+}
+
 template <field_rc rec>
 void dppc_interpreter::ppc_fmadd(uint32_t opcode) {
-    ppc_grab_regsfpdabc(opcode);
-
-    double ppc_dblresult64_d = std::fma(val_reg_a, val_reg_c, val_reg_b);
-
-    double inf = std::numeric_limits<double>::infinity();
-    if (((val_reg_a == inf) && (val_reg_b == -inf)) || \
-        ((val_reg_a == -inf) && (val_reg_b == inf))) {
-        ppc_state.fpscr |= VXISI;
-        if (std::isnan(ppc_dblresult64_d)) {
-            ppc_dblresult64_d = set_endresult_nan();
-        }
-    }
-
-    if ((std::isinf(val_reg_a) && (val_reg_c == 0.0)) ||
-        (std::isinf(val_reg_c) && (val_reg_a == 0.0))) {
-        ppc_state.fpscr |= VXIMZ;
-        if (std::isnan(ppc_dblresult64_d)) {
-            ppc_dblresult64_d = set_endresult_nan();
-        }
-    }
-
-    if (snan_single_check(reg_a) || snan_single_check(reg_b) || snan_single_check(reg_c)) {
-        uint64_t qnan = 0x7FFC000000000000;
-        ppc_store_fpresult_int(reg_d, qnan);
-    } else {
-        ppc_store_fpresult_flt(reg_d, ppc_dblresult64_d);
-    }
-
-    fpresult_update(ppc_dblresult64_d);
+    fp_fmadd_family<false, false, false>(opcode);
 
     if (rec)
         ppc_update_cr1();
@@ -351,38 +539,7 @@ template void dppc_interpreter::ppc_fmadd<RC1>(uint32_t opcode);
 
 template <field_rc rec>
 void dppc_interpreter::ppc_fmsub(uint32_t opcode) {
-    ppc_grab_regsfpdabc(opcode);
-
-    double ppc_dblresult64_d = std::fma(val_reg_a, val_reg_c, -val_reg_b);
-
-    if ((std::isinf(val_reg_a) && (val_reg_c == 0.0)) ||
-        (std::isinf(val_reg_c) && (val_reg_a == 0.0))) {
-        ppc_state.fpscr |= VXIMZ;
-        if (std::isnan(ppc_dblresult64_d)) {
-            ppc_dblresult64_d = set_endresult_nan();
-        }
-    }
-
-    double inf = std::numeric_limits<double>::infinity();
-    if (((val_reg_a == inf) && (val_reg_b == -inf)) || ((val_reg_a == -inf) && (val_reg_b == inf))) {
-        ppc_state.fpscr |= VXISI;
-        if (std::isnan(ppc_dblresult64_d)) {
-            ppc_dblresult64_d = set_endresult_nan();
-        }
-    }
-
-    if (std::isnan(val_reg_a) || std::isnan(val_reg_b) || std::isnan(val_reg_c)) {
-        ppc_dblresult64_d = std::numeric_limits<double>::quiet_NaN();
-    }
-
-    if (snan_single_check(reg_a) || snan_single_check(reg_b) || snan_single_check(reg_c)) {
-        uint64_t qnan = 0x7FFC000000000000;
-        ppc_store_fpresult_int(reg_d, qnan);
-    } else {
-        ppc_store_fpresult_flt(reg_d, ppc_dblresult64_d);
-    }
-
-    fpresult_update(ppc_dblresult64_d);
+    fp_fmadd_family<true, false, false>(opcode);
 
     if (rec)
         ppc_update_cr1();
@@ -393,39 +550,7 @@ template void dppc_interpreter::ppc_fmsub<RC1>(uint32_t opcode);
 
 template <field_rc rec>
 void dppc_interpreter::ppc_fnmadd(uint32_t opcode) {
-    ppc_grab_regsfpdabc(opcode);
-
-    double ppc_dblresult64_d = -std::fma(val_reg_a, val_reg_c, val_reg_b);
-
-    if (std::isnan(ppc_dblresult64_d)) {
-        ppc_dblresult64_d = std::numeric_limits<double>::quiet_NaN();
-    }
-
-    double inf = std::numeric_limits<double>::infinity();
-    if (((val_reg_a == inf) && (val_reg_b == -inf)) || ((val_reg_a == -inf) && (val_reg_b == inf))) {
-        ppc_state.fpscr |= VXISI;
-        if (std::isnan(ppc_dblresult64_d)) {
-            ppc_dblresult64_d = set_endresult_nan();
-        }
-    }
-
-    if ((std::isinf(val_reg_a) && (val_reg_c == 0.0)) ||
-        (std::isinf(val_reg_c) && (val_reg_a == 0.0))) {
-        ppc_state.fpscr |= VXIMZ;
-        if (std::isnan(ppc_dblresult64_d)) {
-            ppc_dblresult64_d = set_endresult_nan();
-        }
-    }
-
-    if (snan_single_check(reg_a) || snan_single_check(reg_b) || snan_single_check(reg_c)) {
-        uint64_t qnan = 0x7FFC000000000000;
-        ppc_store_fpresult_int(reg_d, qnan);
-    } 
-    else {
-        ppc_store_fpresult_flt(reg_d, ppc_dblresult64_d);
-    }
-
-    fpresult_update(ppc_dblresult64_d);
+    fp_fmadd_family<false, true, false>(opcode);
 
     if (rec)
         ppc_update_cr1();
@@ -436,34 +561,7 @@ template void dppc_interpreter::ppc_fnmadd<RC1>(uint32_t opcode);
 
 template <field_rc rec>
 void dppc_interpreter::ppc_fnmsub(uint32_t opcode) {
-    ppc_grab_regsfpdabc(opcode);
-
-    double ppc_dblresult64_d = -std::fma(val_reg_a, val_reg_c, -val_reg_b);
-
-    if ((std::isinf(val_reg_a) && (val_reg_c == 0.0)) ||
-        (std::isinf(val_reg_c) && (val_reg_a == 0.0))) {
-        ppc_state.fpscr |= VXIMZ;
-        if (std::isnan(ppc_dblresult64_d)) {
-            ppc_dblresult64_d = set_endresult_nan();
-        }
-    }
-
-    double inf = std::numeric_limits<double>::infinity();
-    if (((val_reg_a == inf) && (val_reg_b == -inf)) || ((val_reg_a == -inf) && (val_reg_b == inf))) {
-        ppc_state.fpscr |= VXISI;
-        if (std::isnan(ppc_dblresult64_d)) {
-            ppc_dblresult64_d = set_endresult_nan();
-        }
-    }
-
-    if (snan_single_check(reg_a) || snan_single_check(reg_b) || snan_single_check(reg_c)) {
-        uint64_t qnan = 0x7FFC000000000000;
-        ppc_store_fpresult_int(reg_d, qnan);
-    } else {
-        ppc_store_fpresult_flt(reg_d, ppc_dblresult64_d);
-    }
-
-    fpresult_update(ppc_dblresult64_d);
+    fp_fmadd_family<true, true, false>(opcode);
 
     if (rec)
         ppc_update_cr1();
@@ -474,28 +572,11 @@ template void dppc_interpreter::ppc_fnmsub<RC1>(uint32_t opcode);
 
 template <field_rc rec>
 void dppc_interpreter::ppc_fadds(uint32_t opcode) {
-    ppc_grab_regsfpdab(opcode);
+    int reg_d = (opcode >> 21) & 31;
+    int reg_a = (opcode >> 16) & 31;
+    int reg_b = (opcode >> 11) & 31;
 
-    max_double_check(val_reg_a, val_reg_b);
-
-    double ppc_dblresult64_d = (float)(val_reg_a + val_reg_b);
-
-    double inf = std::numeric_limits<double>::infinity();
-    if (((val_reg_a == inf) && (val_reg_b == -inf)) || ((val_reg_a == -inf) && (val_reg_b == inf))) {
-        ppc_state.fpscr |= VXISI;
-        if (std::isnan(ppc_dblresult64_d)) {
-            ppc_dblresult64_d = set_endresult_nan();
-        }
-    }
-
-    if (snan_double_check(reg_a, reg_b)) {
-        uint64_t qnan = 0x7FFC000000000000;
-        ppc_store_fpresult_int(reg_d, qnan);
-    } else {
-        ppc_store_fpresult_flt(reg_d, ppc_dblresult64_d);
-    }
-
-    fpresult_update(ppc_dblresult64_d);
+    fp_addsub<false, true>(reg_d, reg_a, reg_b);
 
     if (rec)
         ppc_update_cr1();
@@ -506,27 +587,11 @@ template void dppc_interpreter::ppc_fadds<RC1>(uint32_t opcode);
 
 template <field_rc rec>
 void dppc_interpreter::ppc_fsubs(uint32_t opcode) {
-    ppc_grab_regsfpdab(opcode);
+    int reg_d = (opcode >> 21) & 31;
+    int reg_a = (opcode >> 16) & 31;
+    int reg_b = (opcode >> 11) & 31;
 
-    double ppc_dblresult64_d = (float)(val_reg_a - val_reg_b);
-
-    double inf = std::numeric_limits<double>::infinity();
-    if (((val_reg_a == inf) && (val_reg_b == inf)) ||
-        ((val_reg_a == -inf) && (val_reg_b == -inf))) {
-        ppc_state.fpscr |= VXISI;
-        if (std::isnan(ppc_dblresult64_d)) {
-            ppc_dblresult64_d = set_endresult_nan();
-        }
-    }
-
-    if (snan_double_check(reg_a, reg_b)) {
-        uint64_t qnan = 0x7FFC000000000000;
-        ppc_store_fpresult_int(reg_d, qnan);
-    } else {
-        ppc_store_fpresult_flt(reg_d, ppc_dblresult64_d);
-    }
-
-    fpresult_update(ppc_dblresult64_d);
+    fp_addsub<true, true>(reg_d, reg_a, reg_b);
 
     if (rec)
         ppc_update_cr1();
@@ -537,36 +602,11 @@ template void dppc_interpreter::ppc_fsubs<RC1>(uint32_t opcode);
 
 template <field_rc rec>
 void dppc_interpreter::ppc_fdivs(uint32_t opcode) {
-    ppc_grab_regsfpdab(opcode);
+    int reg_d = (opcode >> 21) & 31;
+    int reg_a = (opcode >> 16) & 31;
+    int reg_b = (opcode >> 11) & 31;
 
-    double ppc_dblresult64_d = (float)(val_reg_a / val_reg_b);
-    if (val_reg_b == 0.0) {
-        ppc_state.fpscr |= FX | VX;
-    }
-
-    if (std::isinf(val_reg_a) && std::isinf(val_reg_b)) {
-        ppc_state.fpscr |= VXIDI;
-    }
-
-    if ((val_reg_a == 0.0) && (val_reg_b == 0.0)) {
-        ppc_state.fpscr |= VXZDZ;
-        if (std::isnan(ppc_dblresult64_d)) {
-            ppc_dblresult64_d = set_endresult_nan();
-        }
-    }
-
-    if (std::isnan(val_reg_a) || std::isnan(val_reg_b)) {
-        ppc_dblresult64_d = std::numeric_limits<double>::quiet_NaN();
-    }
-
-    if (snan_double_check(reg_a, reg_b)) {
-        uint64_t qnan = 0x7FFC000000000000;
-        ppc_store_fpresult_int(reg_d, qnan);
-    } else {
-        ppc_store_fpresult_flt(reg_d, ppc_dblresult64_d);
-    }
-
-    fpresult_update(ppc_dblresult64_d);
+    fp_divide<true>(reg_d, reg_a, reg_b);
 
     if (rec)
         ppc_update_cr1();
@@ -577,30 +617,11 @@ template void dppc_interpreter::ppc_fdivs<RC1>(uint32_t opcode);
 
 template <field_rc rec>
 void dppc_interpreter::ppc_fmuls(uint32_t opcode) {
-    ppc_grab_regsfpdac(opcode);
+    int reg_d = (opcode >> 21) & 31;
+    int reg_a = (opcode >> 16) & 31;
+    int reg_c = (opcode >> 6) & 31;
 
-    double ppc_dblresult64_d = (float)(val_reg_a * val_reg_c);
-
-    if ((std::isinf(val_reg_a) && (val_reg_c == 0.0)) ||
-        (std::isinf(val_reg_c) && (val_reg_a == 0.0))) {
-        ppc_state.fpscr |= VXIMZ;
-        if (std::isnan(ppc_dblresult64_d)) {
-            ppc_dblresult64_d = set_endresult_nan();
-        }
-    }
-
-    if (std::isnan(val_reg_a) || std::isnan(val_reg_c)) {
-        ppc_dblresult64_d = std::numeric_limits<double>::quiet_NaN();
-    }
-
-    if (snan_double_check(reg_a, reg_c)) {
-        uint64_t qnan = 0x7FFC000000000000;
-        ppc_store_fpresult_int(reg_d, qnan);
-    } else {
-        ppc_store_fpresult_flt(reg_d, ppc_dblresult64_d);
-    }
-
-    fpresult_update(ppc_dblresult64_d);
+    fp_multiply<true>(reg_d, reg_a, reg_c);
 
     if (rec)
         ppc_update_cr1();
@@ -611,30 +632,7 @@ template void dppc_interpreter::ppc_fmuls<RC1>(uint32_t opcode);
 
 template <field_rc rec>
 void dppc_interpreter::ppc_fmadds(uint32_t opcode) {
-    ppc_grab_regsfpdabc(opcode);
-
-    double ppc_dblresult64_d = (float)std::fma(val_reg_a, val_reg_c, val_reg_b);
-
-    double inf = std::numeric_limits<double>::infinity();
-    if (((val_reg_a == inf) && (val_reg_b == -inf)) || ((val_reg_a == -inf) && (val_reg_b == inf)))
-        ppc_state.fpscr |= VXISI;
-
-    if ((std::isinf(val_reg_a) && (val_reg_c == 0.0)) ||
-        (std::isinf(val_reg_c) && (val_reg_a == 0.0))) {
-        ppc_state.fpscr |= VXIMZ;
-        if (std::isnan(ppc_dblresult64_d)) {
-            ppc_dblresult64_d = set_endresult_nan();
-        }
-    }
-
-    if (snan_single_check(reg_a) || snan_single_check(reg_b) || snan_single_check(reg_c)) {
-        uint64_t qnan = 0x7FFC000000000000;
-        ppc_store_fpresult_int(reg_d, qnan);
-    } else {
-        ppc_store_fpresult_flt(reg_d, ppc_dblresult64_d);
-    }
-
-    fpresult_update(ppc_dblresult64_d);
+    fp_fmadd_family<false, false, true>(opcode);
 
     if (rec)
         ppc_update_cr1();
@@ -645,30 +643,7 @@ template void dppc_interpreter::ppc_fmadds<RC1>(uint32_t opcode);
 
 template <field_rc rec>
 void dppc_interpreter::ppc_fmsubs(uint32_t opcode) {
-    ppc_grab_regsfpdabc(opcode);
-
-    double ppc_dblresult64_d = (float)std::fma(val_reg_a, val_reg_c, -val_reg_b);
-
-    if ((std::isinf(val_reg_a) && (val_reg_c == 0.0)) ||
-        (std::isinf(val_reg_c) && (val_reg_a == 0.0))) {
-        ppc_state.fpscr |= VXIMZ;
-        if (std::isnan(ppc_dblresult64_d)) {
-            ppc_dblresult64_d = set_endresult_nan();
-        }
-    }
-
-    double inf = std::numeric_limits<double>::infinity();
-    if ((val_reg_a == inf) && (val_reg_b == inf))
-        ppc_state.fpscr |= VXISI;
-
-    if (snan_single_check(reg_a) || snan_single_check(reg_b) || snan_single_check(reg_c)) {
-        uint64_t qnan = 0x7FFC000000000000;
-        ppc_store_fpresult_int(reg_d, qnan);
-    } else {
-        ppc_store_fpresult_flt(reg_d, ppc_dblresult64_d);
-    }
-
-    fpresult_update(ppc_dblresult64_d);
+    fp_fmadd_family<true, false, true>(opcode);
 
     if (rec)
         ppc_update_cr1();
@@ -679,33 +654,7 @@ template void dppc_interpreter::ppc_fmsubs<RC1>(uint32_t opcode);
 
 template <field_rc rec>
 void dppc_interpreter::ppc_fnmadds(uint32_t opcode) {
-    ppc_grab_regsfpdabc(opcode);
-
-    double ppc_dblresult64_d = -(float)std::fma(val_reg_a, val_reg_c, val_reg_b);
-    if (std::isnan(ppc_dblresult64_d)) {
-        ppc_dblresult64_d = std::numeric_limits<double>::quiet_NaN();
-    }
-
-    double inf = std::numeric_limits<double>::infinity();
-    if (((val_reg_a == inf) && (val_reg_b == -inf)) || ((val_reg_a == -inf) && (val_reg_b == inf)))
-        ppc_state.fpscr |= VXISI;
-
-    if ((std::isinf(val_reg_a) && (val_reg_c == 0.0)) ||
-        (std::isinf(val_reg_c) && (val_reg_a == 0.0))) {
-        ppc_state.fpscr |= VXIMZ;
-        if (std::isnan(ppc_dblresult64_d)) {
-            ppc_dblresult64_d = set_endresult_nan();
-        }
-    }
-
-    if (snan_single_check(reg_a) || snan_single_check(reg_b) || snan_single_check(reg_c)) {
-        uint64_t qnan = 0x7FFC000000000000;
-        ppc_store_fpresult_int(reg_d, qnan);
-    } else {
-        ppc_store_fpresult_flt(reg_d, ppc_dblresult64_d);
-    }
-
-    fpresult_update(ppc_dblresult64_d);
+    fp_fmadd_family<false, true, true>(opcode);
 
     if (rec)
         ppc_update_cr1();
@@ -716,37 +665,7 @@ template void dppc_interpreter::ppc_fnmadds<RC1>(uint32_t opcode);
 
 template <field_rc rec>
 void dppc_interpreter::ppc_fnmsubs(uint32_t opcode) {
-    ppc_grab_regsfpdabc(opcode);
-
-    snan_double_check(reg_a, reg_c);
-    snan_single_check(reg_b);
-
-    double ppc_dblresult64_d = -(float)std::fma(val_reg_a, val_reg_c, -val_reg_b);
-
-    if ((std::isinf(val_reg_a) && (val_reg_c == 0.0)) ||
-        (std::isinf(val_reg_c) && (val_reg_a == 0.0))) {
-        ppc_state.fpscr |= VXIMZ;
-        if (std::isnan(ppc_dblresult64_d)) {
-            ppc_dblresult64_d = set_endresult_nan();
-        }
-    }
-
-    double inf = std::numeric_limits<double>::infinity();
-    if ((val_reg_a == inf) && (val_reg_b == inf))
-        ppc_state.fpscr |= VXISI;
-
-    if (std::isnan(val_reg_a) || std::isnan(val_reg_b) || std::isnan(val_reg_c)) {
-        ppc_dblresult64_d = std::numeric_limits<double>::quiet_NaN();
-    }
-
-    if (snan_single_check(reg_a) || snan_single_check(reg_b) || snan_single_check(reg_c)) {
-        uint64_t qnan = 0x7FFC000000000000;
-        ppc_store_fpresult_int(reg_d, qnan);
-    } else {
-        ppc_store_fpresult_flt(reg_d, ppc_dblresult64_d);
-    }
-
-    fpresult_update(ppc_dblresult64_d);
+    fp_fmadd_family<true, true, true>(opcode);
 
     if (rec)
         ppc_update_cr1();
@@ -1322,13 +1241,17 @@ void dppc_interpreter::ppc_fcmpo(uint32_t opcode) {
 
     if (std::isnan(db_test_a) || std::isnan(db_test_b)) {
         cmp_c |= CRx_bit::CR_SO;
-        ppc_state.fpscr |= FX | VX;
+        uint32_t vx;
         if (check_snan(reg_a) || check_snan(reg_b)) {
-            ppc_state.fpscr |= VXSNAN;
+            vx = FPSCR::VXSNAN;
+            // an ordered compare on a quiet operand raises VXVC even for
+            // SNaNs when the invalid exception is disabled
+            if (!(ppc_state.fpscr & FPSCR::VE))
+                vx |= FPSCR::VXVC;
+        } else {
+            vx = FPSCR::VXVC;
         }
-        if (!(ppc_state.fpscr & FEX) || check_qnan(reg_a) || check_qnan(reg_b)) {
-            ppc_state.fpscr |= VXVC;
-        }
+        fp_set_exceptions(vx);
     }
     else if (db_test_a < db_test_b) {
         cmp_c |= CRx_bit::CR_LT;
@@ -1340,7 +1263,6 @@ void dppc_interpreter::ppc_fcmpo(uint32_t opcode) {
         cmp_c |= CRx_bit::CR_EQ;
     }
 
-    ppc_state.fpscr &= ~VE; //kludge to pass tests
     ppc_state.fpscr = (ppc_state.fpscr & ~FPSCR::FPCC_MASK) | (cmp_c >> 16); // update FPCC
     ppc_state.cr = ((ppc_state.cr & ~(0xF0000000 >> crf_d)) | (cmp_c >> crf_d));
 }
@@ -1352,9 +1274,8 @@ void dppc_interpreter::ppc_fcmpu(uint32_t opcode) {
 
     if (std::isnan(db_test_a) || std::isnan(db_test_b)) {
         cmp_c |= CRx_bit::CR_SO;
-        if (check_snan(reg_a) || check_snan(reg_b)) {
-            ppc_state.fpscr |= FX | VX | VXSNAN;
-        }
+        if (check_snan(reg_a) || check_snan(reg_b))
+            fp_set_exceptions(FPSCR::VXSNAN);
     }
     else if (db_test_a < db_test_b) {
         cmp_c |= CRx_bit::CR_LT;
@@ -1366,7 +1287,6 @@ void dppc_interpreter::ppc_fcmpu(uint32_t opcode) {
         cmp_c |= CRx_bit::CR_EQ;
     }
 
-    ppc_state.fpscr &= ~VE; //kludge to pass tests
     ppc_state.fpscr = (ppc_state.fpscr & ~FPSCR::FPCC_MASK) | (cmp_c >> 16); // update FPCC
     ppc_state.cr    = ((ppc_state.cr & ~(0xF0000000UL >> crf_d)) | (cmp_c >> crf_d));
 }
