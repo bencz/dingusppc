@@ -382,6 +382,11 @@ extern bool jit_cross_follow;
     DPPC_JIT_BLRFOLLOW=0 keeps every leaf blr ending its block */
 extern bool jit_blr_follow;
 
+/** Whether a branch may test the host FLAGS a compare just left behind
+    instead of reloading its CR field from memory.
+    DPPC_JIT_CRFUSE=0 makes every branch read the architected CR */
+extern bool jit_cr_fuse;
+
 /** Settles the retired count before every call into a helper rather than only
     before the ones that read virtual time.
 

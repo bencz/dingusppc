@@ -227,6 +227,25 @@ void X64Emitter::lea_reg_mem(X64Gpr dst, X64Gpr base, int32_t disp) {
     this->modrm_mem(uint8_t(dst), uint8_t(base), disp);
 }
 
+/** The flag preserving register add: lea dst, [base + index]. Used where an
+    or of disjoint pieces must not scratch the FLAGS a compare left behind */
+void X64Emitter::lea_reg_reg32(X64Gpr dst, X64Gpr base, X64Gpr index) {
+    uint8_t b = uint8_t(base);
+    uint8_t x = uint8_t(index);
+    if (x == 4) { // rsp cannot be an index; the sum is commutative
+        const uint8_t t = b; b = x; x = t;
+    }
+    this->rex(false, uint8_t(dst), b, x);
+    this->emit8(0x8D);
+    // rm 100 selects the SIB; an rbp or r13 base has to carry a disp8 of 0
+    const bool needs_disp = (b & 7) == 5;
+    this->emit8(uint8_t(((needs_disp ? 1 : 0) << 6) | ((uint8_t(dst) & 7) << 3) | 4));
+    this->emit8(uint8_t(((x & 7) << 3) | (b & 7)));
+    if (needs_disp) {
+        this->emit8(0);
+    }
+}
+
 /** ALU forms with a 32 bit immediate share opcode 0x81 and differ only in the
     ModRM extension: /0 add, /1 or, /4 and, /6 xor, /7 cmp */
 void X64Emitter::alu_reg_imm32(uint8_t ext, X64Gpr dst, uint32_t imm) {

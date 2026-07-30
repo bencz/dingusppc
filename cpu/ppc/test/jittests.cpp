@@ -1264,6 +1264,189 @@ static void test_leaf_called_twice() {
     ppc_jit_disable();
 }
 
+/*  The compare and branch fusion: a branch may ride the FLAGS of the
+    compare that wrote its CR field, but only while nothing in between
+    scratched them. The add after the first compare leaves FLAGS that say
+    the opposite of the CR, which is the trap a missed invalidation falls
+    into, and the second compare feeds two branches in a row, which is the
+    fall through side keeping the FLAGS alive.  */
+static const uint32_t fuse_code[] = {
+    0x38600005, // 0x8300 li    r3, 5
+    0x38800009, // 0x8304 li    r4, 9
+    0x7C032000, // 0x8308 cmpw  cr0, r3, r4     LT
+    0x7CA42214, // 0x830C add   r5, r4, r4      FLAGS now say the opposite
+    0x41800008, // 0x8310 blt   -> 0x8318       taken off the CR, not the add
+    0x38C00001, // 0x8314 li    r6, 1           jumped over
+    0x38E00002, // 0x8318 li    r7, 2
+    0x7C041800, // 0x831C cmpw  cr0, r4, r3     GT
+    0x4180000C, // 0x8320 blt   -> 0x832C       not taken, FLAGS stay live
+    0x41810008, // 0x8324 bgt   -> 0x832C       taken off the same compare
+    0x39000003, // 0x8328 li    r8, 3           jumped over
+    // the shape the ROM nap gate broke on: a compare into cr7, a dot form
+    // rewriting cr0, a branch on cr7 whose reload test scratches the FLAGS,
+    // then a branch on cr0 that must not ride them
+    0x39200004, // 0x832C li    r9, 4
+    0x2F890007, // 0x8330 cmpwi cr7, r9, 7      LT, EQ clear
+    0x7C6A0379, // 0x8334 or.   r10, r3, r0     r10 negative, cr0 = LT
+    0x419E000C, // 0x8338 beq   cr7 -> 0x8344   not taken, reload test runs
+    0x41800010, // 0x833C blt   cr0 -> 0x834C   taken off cr0, not the test
+    0x39600006, // 0x8340 li    r11, 6          jumped over
+    0x39800007, // 0x8344 li    r12, 7          jumped over
+    0x39A00008, // 0x8348 li    r13, 8          jumped over
+    0x00000000, // 0x834C illegal, the program stops here
+};
+
+constexpr uint32_t FUSE_BASE = 0x8300;
+constexpr uint32_t FUSE_END  = FUSE_BASE + 0x4C;
+
+static SprResult run_fuse_code() {
+    for (int i = 0; i < 32; i++) {
+        ppc_state.gpr[i] = 0xC3C30000u | uint32_t(i);
+    }
+    ppc_state.spr[SPR::LR]  = 0;
+    ppc_state.spr[SPR::CTR] = 0;
+    ppc_state.cr  = 0;
+    ppc_state.pc  = FUSE_BASE;
+    g_icycles     = 0;
+    g_icycles_max = 0;
+    exec_flags    = 0;
+    power_on      = true;
+
+    ppc_exec_until(FUSE_END);
+
+    SprResult r;
+    for (int i = 0; i < 32; i++) r.regs.gpr[i] = ppc_state.gpr[i];
+    r.regs.pc      = ppc_state.pc;
+    r.regs.retired = g_icycles;
+    r.lr  = ppc_state.spr[SPR::LR];
+    r.ctr = ppc_state.spr[SPR::CTR];
+    r.cr  = ppc_state.cr;
+    return r;
+}
+
+/*  Every fusible shape, exhaustively: branch on bit set and clear, all
+    three testable bits, both compare signednesses and every outcome of
+    the compare, as a forward side exit off a fused compare.  */
+static void test_cr_fusion_matrix() {
+    static const uint32_t operands[3][2] = {
+        {5, 9},          // lt
+        {7, 7},          // eq
+        {0x80000000, 2}, // gt signed, lt unsigned
+    };
+
+    for (int form = 0; form < 4; form++) {  // rr, rr cr7, imm, imm lk
+        for (int uns = 0; uns <= 1; uns++) {
+        for (int bo = 4; bo <= 12; bo += 8) {
+            for (int bi = 0; bi <= 2; bi++) {
+                for (int val = 0; val < 3; val++) {
+                    uint32_t cmp_op, bc_bi = uint32_t(bi);
+                    switch (form) {
+                    case 0: // register form on cr0
+                        cmp_op = uns ? 0x7C032040u : 0x7C032000u;
+                        break;
+                    case 1: // register form on cr7
+                        cmp_op = (uns ? 0x7C032040u : 0x7C032000u) | (7u << 23);
+                        bc_bi += 28;
+                        break;
+                    default: // immediate form, r3 against 7
+                        cmp_op = (uns ? 0x28030000u : 0x2C030000u) | 7u;
+                        break;
+                    }
+                    const uint32_t bc_op = 0x40000008u |
+                        (uint32_t(bo) << 21) | (bc_bi << 16) |
+                        (form == 3 ? 1u : 0u);
+                    const uint32_t prog[] = {
+                        cmp_op,
+                        bc_op,          // forward side exit over one word
+                        0x38C00001,     // li r6, 1, the jumped over word
+                        0x38E00002,     // li r7, 2
+                        0x00000000,     // illegal, the program stops here
+                    };
+                    for (size_t i = 0; i < sizeof(prog) / 4; i++) {
+                        mmu_write_vmem<uint32_t>(NO_OPCODE,
+                            FUSE_BASE + 0x40 + uint32_t(i) * 4, prog[i]);
+                    }
+
+                    SprResult res[3];
+                    for (int run = 0; run < 3; run++) {
+                        ppc_jit_disable();
+                        if (run == 1) ppc_jit_enable(JitBackend::threaded);
+                        if (run == 2) ppc_jit_enable(JitBackend::automatic);
+                        for (int i = 0; i < 32; i++)
+                            ppc_state.gpr[i] = 0xC3C30000u | uint32_t(i);
+                        ppc_state.gpr[3] = operands[val][0];
+                        ppc_state.gpr[4] = operands[val][1];
+                        ppc_state.spr[SPR::LR]  = 0;
+                        ppc_state.spr[SPR::CTR] = 0;
+                        ppc_state.cr  = 0;
+                        ppc_state.pc  = FUSE_BASE + 0x40;
+                        g_icycles     = 0;
+                        g_icycles_max = 0;
+                        exec_flags    = 0;
+                        power_on      = true;
+                        ppc_exec_until(FUSE_BASE + 0x50);
+                        for (int i = 0; i < 32; i++)
+                            res[run].regs.gpr[i] = ppc_state.gpr[i];
+                        res[run].regs.pc      = ppc_state.pc;
+                        res[run].regs.retired = g_icycles;
+                        res[run].lr  = ppc_state.spr[SPR::LR];
+                        res[run].ctr = ppc_state.spr[SPR::CTR];
+                        res[run].cr  = ppc_state.cr;
+                    }
+                    ppc_jit_disable();
+
+                    int where = -1;
+                    if (!same_spr(res[0], res[1], &where) ||
+                        !same_spr(res[0], res[2], &where)) {
+                        std::printf("  fusion matrix: form=%d uns=%d bo=%d bi=%d val=%d "
+                                    "r6 int=%08X thr=%08X emit=%08X pc %08X/%08X/%08X\n",
+                                    form, uns, bo, bi, val,
+                                    res[0].regs.gpr[6], res[1].regs.gpr[6],
+                                    res[2].regs.gpr[6], res[0].regs.pc,
+                                    res[1].regs.pc, res[2].regs.pc);
+                        jit_check(false, "a fusible shape diverged");
+                    }
+                }
+            }
+        }
+        }
+    }
+    jit_check(true, "every fusible compare and branch shape agrees");
+}
+
+static void test_cr_fusion() {
+    for (size_t i = 0; i < sizeof(fuse_code) / 4; i++) {
+        mmu_write_vmem<uint32_t>(NO_OPCODE, FUSE_BASE + uint32_t(i) * 4,
+                                 fuse_code[i]);
+    }
+
+    ppc_jit_disable();
+    SprResult interp = run_fuse_code();
+    jit_check(interp.regs.pc == FUSE_END && interp.regs.retired == 14 &&
+              interp.regs.gpr[6] == (0xC3C30000u | 6) &&
+              interp.regs.gpr[8] == (0xC3C30000u | 8) &&
+              interp.regs.gpr[11] == (0xC3C30000u | 11) &&
+              interp.regs.gpr[7] == 2 && interp.regs.gpr[9] == 4 &&
+              interp.regs.gpr[10] == 0xC3C30005u,
+              "the fusion program behaves on the interpreter");
+
+    ppc_jit_enable(JitBackend::threaded);
+    SprResult threaded = run_fuse_code();
+    int where = -1;
+    jit_check(same_spr(interp, threaded, &where),
+              "compare and branch agree with the interpreter (threaded)");
+    report_spr(interp, threaded, where, "threaded");
+
+    ppc_jit_disable();
+    ppc_jit_enable(JitBackend::automatic);
+    SprResult native = run_fuse_code();
+    where = -1;
+    jit_check(same_spr(interp, native, &where),
+              "a branch riding the compare's FLAGS stays exact (emitted)");
+    report_spr(interp, native, where, "emitted");
+    ppc_jit_disable();
+}
+
 /*  The XER[CA] family: addc, adde, addic, addic., subfc, subfe, subfic,
     addze and subf, with the carry chaining from one into the next and the
     forms with both operands in the same register, which are the ones that
@@ -1659,6 +1842,8 @@ int test_jit() {
     test_cross_page_call();
     test_leaf_lr_write();
     test_leaf_called_twice();
+    test_cr_fusion();
+    test_cr_fusion_matrix();
     test_carry_subset();
     test_ov_subset();
     test_xform_subset();

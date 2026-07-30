@@ -31,6 +31,7 @@ bool     jit_sync_every_call = false;
 bool     jit_superblocks     = true;
 bool     jit_cross_follow    = true;
 bool     jit_blr_follow      = true;
+bool     jit_cr_fuse         = true;
 
 const char* block_end_name(BlockEnd reason) {
     switch (reason) {

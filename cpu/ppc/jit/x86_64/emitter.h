@@ -57,8 +57,11 @@ enum class X64Cond : uint8_t {
     AboveEqual = 0x3, // unsigned >=, which is also CF clear
     Equal      = 0x4, // ZF set
     NotEqual   = 0x5, // ZF clear
+    BelowEqual = 0x6, // unsigned <=
     Above      = 0x7, // unsigned >
     Less       = 0xC, // signed <
+    GreaterEqual = 0xD, // signed >=
+    LessEqual  = 0xE, // signed <=
     Greater    = 0xF, // signed >
 };
 
@@ -105,6 +108,7 @@ public:
     void mov_reg_mem32(X64Gpr dst, X64Gpr base, int32_t disp);
     void mov_mem_reg32(X64Gpr base, int32_t disp, X64Gpr src);
     void lea_reg_mem(X64Gpr dst, X64Gpr base, int32_t disp);
+    void lea_reg_reg32(X64Gpr dst, X64Gpr base, X64Gpr index); // dst = base + index, FLAGS untouched
 
     // arithmetic and tests
     void add_reg_reg32(X64Gpr dst, X64Gpr src);   // dst += src

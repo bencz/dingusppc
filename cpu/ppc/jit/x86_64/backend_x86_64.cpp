@@ -338,6 +338,7 @@ private:
         this->va_chain_exits.clear();
         this->accounted = 0;
         this->cur_virt_addr = ir.virt_addr;
+        this->live_cmp.valid = false;
         this->plan_lifetimes(ir);
 
         const X64Gpr arg0 = X64Gpr(this->abi.int_arg_regs[0]);
@@ -349,6 +350,15 @@ private:
 
         for (size_t i = 0; i < ir.insns.size(); i++) {
             const IRInsn& in = ir.insns[i];
+
+            // whether the FLAGS a fusible compare left behind survive this
+            // instruction: the pure moves do, everything else scratches
+            // them. SetCR manages its own record and Branch consumes it,
+            // clobbering only on the CTR path it emits itself
+            if (in.opcode != IROpcode::SetCR && in.opcode != IROpcode::Branch &&
+                !flags_survive(in.opcode)) {
+                this->live_cmp.valid = false;
+            }
 
             if (in.opcode == IROpcode::SetCR) {
                 if (!this->emit_set_cr(in, i, free_mask)) {
@@ -902,6 +912,13 @@ private:
 
         this->reg_of[idx] = uint8_t(dst);
         return true;
+    }
+
+    static bool flags_survive(IROpcode op) {
+        return op == IROpcode::StoreGPR || op == IROpcode::StoreSPR ||
+               op == IROpcode::LoadGPR  || op == IROpcode::LoadSPR  ||
+               op == IROpcode::ConstI32 || op == IROpcode::PcRel    ||
+               op == IROpcode::Exts;
     }
 
     static bool is_commutative(IROpcode op) {
@@ -1458,29 +1475,66 @@ private:
             return false;
         }
         const X64Gpr rtmp = X64Gpr(lowest_bit(avail));
+        avail &= ~bit(uint8_t(rtmp));
 
         const X64Cond gt = in.cr_signed ? X64Cond::Greater : X64Cond::Above;
         const X64Cond lt = in.cr_signed ? X64Cond::Less    : X64Cond::Below;
 
-        this->asmb.cmp_reg_reg32(ra, rb);
+        if (avail) {
+            // fusible ordering, one scratch register more: everything that
+            // scratches FLAGS runs before the compare, and after it only
+            // mov, cmov and lea touch the field, so the compare's FLAGS
+            // survive into whatever follows. A branch on this field can
+            // then jump straight off them instead of reloading CR
+            const X64Gpr rcr = X64Gpr(lowest_bit(avail));
 
-        this->asmb.mov_reg_imm32(rfield, CRx_bit::CR_EQ);
-        this->asmb.mov_reg_imm32(rtmp, CRx_bit::CR_GT);
-        this->asmb.cmov_reg_reg32(gt, rfield, rtmp);
-        this->asmb.mov_reg_imm32(rtmp, CRx_bit::CR_LT);
-        this->asmb.cmov_reg_reg32(lt, rfield, rtmp);
+            // XER[SO] sits three bits above where CR wants it
+            this->asmb.mov_reg_mem32(rcr, REG_STATE, XER_OFFSET);
+            this->asmb.and_reg_imm32(rcr, XER::SO);
+            this->asmb.shr_reg_imm8(rcr, 3 + in.crf);
+            this->asmb.mov_reg_mem32(rtmp, REG_STATE, CR_OFFSET);
+            this->asmb.and_reg_imm32(rtmp, ~(0xF0000000UL >> in.crf));
+            // the pieces are disjoint, so the adds below are the or
+            this->asmb.lea_reg_reg32(rcr, rcr, rtmp);
 
-        // XER[SO] sits three bits above where CR wants it
-        this->asmb.mov_reg_mem32(rtmp, REG_STATE, XER_OFFSET);
-        this->asmb.and_reg_imm32(rtmp, XER::SO);
-        this->asmb.shr_reg_imm8(rtmp, 3);
-        this->asmb.or_reg_reg32(rfield, rtmp);
+            this->asmb.cmp_reg_reg32(ra, rb);
 
-        this->asmb.shr_reg_imm8(rfield, in.crf);
-        this->asmb.mov_reg_mem32(rtmp, REG_STATE, CR_OFFSET);
-        this->asmb.and_reg_imm32(rtmp, ~(0xF0000000UL >> in.crf));
-        this->asmb.or_reg_reg32(rtmp, rfield);
-        this->asmb.mov_mem_reg32(REG_STATE, CR_OFFSET, rtmp);
+            this->asmb.mov_reg_imm32(rfield, CRx_bit::CR_EQ >> in.crf);
+            this->asmb.mov_reg_imm32(rtmp, CRx_bit::CR_GT >> in.crf);
+            this->asmb.cmov_reg_reg32(gt, rfield, rtmp);
+            this->asmb.mov_reg_imm32(rtmp, CRx_bit::CR_LT >> in.crf);
+            this->asmb.cmov_reg_reg32(lt, rfield, rtmp);
+            this->asmb.lea_reg_reg32(rfield, rfield, rcr);
+            this->asmb.mov_mem_reg32(REG_STATE, CR_OFFSET, rfield);
+
+            this->live_cmp.valid = jit_cr_fuse;
+            this->live_cmp.sig   = in.cr_signed;
+            this->live_cmp.crf   = in.crf;
+        } else {
+            // two scratch registers: the legacy ordering, FLAGS do not
+            // survive it
+            this->asmb.cmp_reg_reg32(ra, rb);
+
+            this->asmb.mov_reg_imm32(rfield, CRx_bit::CR_EQ);
+            this->asmb.mov_reg_imm32(rtmp, CRx_bit::CR_GT);
+            this->asmb.cmov_reg_reg32(gt, rfield, rtmp);
+            this->asmb.mov_reg_imm32(rtmp, CRx_bit::CR_LT);
+            this->asmb.cmov_reg_reg32(lt, rfield, rtmp);
+
+            // XER[SO] sits three bits above where CR wants it
+            this->asmb.mov_reg_mem32(rtmp, REG_STATE, XER_OFFSET);
+            this->asmb.and_reg_imm32(rtmp, XER::SO);
+            this->asmb.shr_reg_imm8(rtmp, 3);
+            this->asmb.or_reg_reg32(rfield, rtmp);
+
+            this->asmb.shr_reg_imm8(rfield, in.crf);
+            this->asmb.mov_reg_mem32(rtmp, REG_STATE, CR_OFFSET);
+            this->asmb.and_reg_imm32(rtmp, ~(0xF0000000UL >> in.crf));
+            this->asmb.or_reg_reg32(rtmp, rfield);
+            this->asmb.mov_mem_reg32(REG_STATE, CR_OFFSET, rtmp);
+
+            this->live_cmp.valid = false;
+        }
 
         if (a_dies) free_mask |= bit(uint8_t(ra));
         if (b_dies) free_mask |= bit(uint8_t(rb));
@@ -1637,6 +1691,7 @@ private:
         // ctr_ok: BO2 set skips the test; otherwise BO3 picks whether the
         // branch wants the counter at zero or away from it
         if (!(in.bo & 0x04)) {
+            this->live_cmp.valid = false; // the counter test owns FLAGS now
             if (spares_ctr) {
                 this->asmb.cmp_reg_imm32(RDX, 0);
             } else {
@@ -1647,11 +1702,43 @@ private:
         }
 
         // cnd_ok: BO0 set skips the test; otherwise BO1 picks whether the
-        // branch wants the CR bit set or clear
+        // branch wants the CR bit set or clear. When the FLAGS of the
+        // compare that wrote this very field are still live, the branch
+        // jumps straight off them; the fall through side keeps them live,
+        // so a second branch on the same compare fuses too
         if (!(in.bo & 0x10)) {
-            this->asmb.test_mem_imm32(REG_STATE, CR_OFFSET, 0x80000000UL >> in.bi);
-            this->asmb.jcc((in.bo & 0x08) ? X64Cond::Equal : X64Cond::NotEqual,
-                           not_taken);
+            const uint8_t cr_bit = in.bi & 3;
+            if (this->live_cmp.valid && this->live_cmp.crf == (in.bi & 0x1C) &&
+                cr_bit != 3) {
+                X64Cond set_c, clr_c;
+                switch (cr_bit) {
+                case 0: // LT
+                    set_c = this->live_cmp.sig ? X64Cond::Less : X64Cond::Below;
+                    clr_c = this->live_cmp.sig ? X64Cond::GreaterEqual
+                                               : X64Cond::AboveEqual;
+                    break;
+                case 1: // GT
+                    set_c = this->live_cmp.sig ? X64Cond::Greater : X64Cond::Above;
+                    clr_c = this->live_cmp.sig ? X64Cond::LessEqual
+                                               : X64Cond::BelowEqual;
+                    break;
+                default: // EQ
+                    set_c = X64Cond::Equal;
+                    clr_c = X64Cond::NotEqual;
+                    break;
+                }
+                this->asmb.jcc((in.bo & 0x08) ? clr_c : set_c, not_taken);
+            } else {
+                // the reload test scratches the FLAGS a compare left behind,
+                // so a later branch on the compare's own field must not ride
+                // them anymore. The shape that bites: compare into one field,
+                // a dot form writing cr0, a branch on the first field falling
+                // back to this test, then a branch on cr0
+                this->live_cmp.valid = false;
+                this->asmb.test_mem_imm32(REG_STATE, CR_OFFSET, 0x80000000UL >> in.bi);
+                this->asmb.jcc((in.bo & 0x08) ? X64Cond::Equal : X64Cond::NotEqual,
+                               not_taken);
+            }
         }
 
         // taken. The interpreter reports this by raising EXEF_BRANCH and
@@ -1756,6 +1843,15 @@ private:
         this->asmb.mov_reg_imm64(REG_SCRATCH, target);
         this->asmb.call_reg(REG_SCRATCH);
     }
+
+    /** The compare whose FLAGS are still in the host's, left by the last
+        fusible emit_set_cr: while nothing since scratched them, a branch
+        testing that CR field jumps straight off the compare */
+    struct {
+        bool    valid;
+        bool    sig;
+        uint8_t crf;
+    } live_cmp = {};
 
     const AbiDesc&        abi;
     const int32_t         pad;

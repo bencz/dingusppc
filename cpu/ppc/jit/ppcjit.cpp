@@ -750,6 +750,13 @@ bool ppc_jit_enable(JitBackend choice) {
         }
     }
 
+    if (const char* cf = getenv("DPPC_JIT_CRFUSE")) {
+        dppc_jit::jit_cr_fuse = strtol(cf, nullptr, 0) != 0;
+        if (!dppc_jit::jit_cr_fuse) {
+            LOG_F(INFO, "JIT: compare and branch fusion off");
+        }
+    }
+
     if (const char* heat = getenv("DPPC_JIT_HEAT")) {
         const long n = strtol(heat, nullptr, 0);
         if (n >= 0 && n <= 1000000) {
