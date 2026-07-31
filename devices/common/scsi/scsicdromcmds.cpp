@@ -29,6 +29,13 @@ ScsiCdromCmds::ScsiCdromCmds() {
     this->set_phys_block_dev(this);
 
     this->enable_cmd(ScsiCommand::READ_TOC);
+    this->enable_cmd(ScsiCommand::SET_CD_SPEED);
+
+    this->add_page_getter(this, ModePage::CDROM_AUDIO_CONTROL,
+                          &ScsiCdromCmds::get_cdrom_audio_control_page);
+
+    this->add_page_getter(this, ModePage::CDROM_CAPABILITIES,
+                          &ScsiCdromCmds::get_cd_capabilities_page);
 }
 
 void ScsiCdromCmds::process_command() {
@@ -39,7 +46,10 @@ void ScsiCdromCmds::process_command() {
 
     switch(this->cdb_ptr[0]) {
     case ScsiCommand::READ_TOC:
-        next_phase = this->read_toc_new();
+        next_phase = this->read_toc();
+        break;
+    case ScsiCommand::SET_CD_SPEED:
+        next_phase = this->set_cd_speed();
         break;
     default:
         ScsiBlockCmds::process_command();
@@ -49,7 +59,7 @@ void ScsiCdromCmds::process_command() {
     phy_impl->switch_phase(next_phase);
 }
 
-int ScsiCdromCmds:: read_toc_new() {
+int ScsiCdromCmds:: read_toc() {
     uint8_t start_track, session_num;
     int     tot_tracks, resp_len = 0;
 
@@ -211,4 +221,87 @@ int ScsiCdromCmds:: read_toc_new() {
     phy_impl->set_xfer_len(std::min(alloc_len, resp_len));
 
     return ScsiPhase::DATA_IN;
+}
+
+int ScsiCdromCmds::set_cd_speed() {
+    phy_impl->set_status(ScsiStatus::GOOD);
+
+    uint16_t new_rd_speed = READ_WORD_BE_U(&this->cdb_ptr[2]);
+
+    if (new_rd_speed == 0xFFFFU || new_rd_speed > this->max_rd_speed)
+        this->cur_rd_speed = this->max_rd_speed;
+    else
+        this->cur_rd_speed = new_rd_speed;
+
+    LOG_F(INFO, "SET_CD_SPEED: drive speed set to %d kBps", this->cur_rd_speed);
+
+    return ScsiPhase::STATUS;
+}
+
+int ScsiCdromCmds::get_cd_capabilities_page(uint8_t subpage, uint8_t ctrl,
+                                            uint8_t *out_ptr, int avail_len)
+{
+    if (subpage && subpage != 0xFFU)
+        return FORMAT_ERR_BAD_SUBPAGE;
+
+    if (ctrl == 3)
+        return FORMAT_ERR_BAD_CONTROL;
+
+    int page_size = 28; // min length defined in MMC-3
+
+    if (page_size > avail_len)
+        return FORMAT_ERR_DATA_TOO_BIG;
+
+    std::memset(out_ptr, 0, page_size); // clear everything
+
+    out_ptr[ 0] = this->read_cap;
+    out_ptr[ 1] = this->write_cap;
+    out_ptr[ 2] = this->fmt_support;
+    out_ptr[ 3] = this->ext_support;
+    out_ptr[ 4] = (this->mech_type    << 5) | this->sw_lock_sup         |
+                  (this->drive_locked << 1) | (this->prevent_jump << 2) |
+                  (this->sw_eject_sup << 3);
+    out_ptr[ 5] = this->more_support;
+    out_ptr[15] = this->dgt_out_desc;
+
+    WRITE_WORD_BE_A(&out_ptr[ 6], this->max_rd_speed); // max read speed
+    WRITE_WORD_BE_A(&out_ptr[ 8], this->max_vol_levs); // max of volume levels
+    WRITE_WORD_BE_A(&out_ptr[10], (this->cache_size / 1024)); // buffer size kB
+    WRITE_WORD_BE_A(&out_ptr[12], this->cur_rd_speed); // current read speed
+
+    return page_size;
+}
+
+int ScsiCdromCmds::get_cdrom_audio_control_page(uint8_t subpage, uint8_t ctrl,
+                                                uint8_t *out_ptr, int avail_len)
+{
+    if (subpage && subpage != 0xFFU)
+        return FORMAT_ERR_BAD_SUBPAGE;
+
+    if (ctrl == 3)
+        return FORMAT_ERR_BAD_CONTROL;
+
+    int page_size = 14;
+
+    if (page_size > avail_len)
+        return FORMAT_ERR_DATA_TOO_BIG;
+
+    std::memset(out_ptr, 0, page_size); // clear everything
+
+    out_ptr[ 0] = (1 << 2); // Immed defaults to 1, SOTC defaults to 0
+
+    // logical block per second of audio playback defaults to 75
+    WRITE_WORD_BE_A(&out_ptr[4], 75);
+
+    out_ptr[ 6] = 0x01; // Left Channel
+    out_ptr[ 7] = 0xFF; // Volume (0-255)
+    out_ptr[ 8] = 0x02; // Right Channel
+    out_ptr[ 9] = 0xFF; // Volume (0-255)
+
+    out_ptr[10] = 0x04; // Output Port 2
+    out_ptr[11] = 0x00; // Volume (0-255)
+    out_ptr[12] = 0x08; // Output Port 3
+    out_ptr[13] = 0x00; // Volume (0-255)
+
+    return page_size;
 }
