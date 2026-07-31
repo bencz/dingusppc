@@ -186,6 +186,10 @@ bool CodeMem::ensure_slot_committed(size_t end) {
 }
 
 void CodeMem::reset() {
+    // every recycled extent lived above the floor, so the rewind orphans
+    // the offsets wholesale
+    this->recycle_bins.clear();
+
     // the pages above the floor carry nothing anyone will run again; handing
     // them back is what keeps the footprint at the working set instead of
     // the high water mark of the worst storm so far
@@ -260,30 +264,13 @@ bool CodeMem::end_write() {
     return true;
 }
 
-bool CodeMem::begin_write_range(size_t upcoming) {
-    if (!this->base) {
-        return false;
-    }
-    if (this->writable || this->range_open) {
-        return true; // already inside a wider bracket
-    }
-
-    // what alloc will touch: from the current offset, aligned up, plus the
-    // bytes themselves, all rounded out to whole pages. A region too full to
-    // hold it stays untouched and alloc reports the failure
+bool CodeMem::open_range(size_t begin_off, size_t end_off) {
     const size_t page  = host_page_size();
-    const size_t start = this->offset & ~(page - 1);
-    const size_t end   = round_up(this->offset, 16) + upcoming;
-    if (end > this->size) {
-        this->range_start = 0;
-        this->range_len   = 0;
-        this->range_open  = true;
-        return true;
-    }
-    if (!this->ensure_code_committed(round_up(end, page))) {
+    const size_t start = begin_off & ~(page - 1);
+    if (!this->ensure_code_committed(round_up(end_off, page))) {
         return false;
     }
-    const size_t len = round_up(end, page) - start;
+    const size_t len = round_up(end_off, page) - start;
 
 #if defined(_WIN32)
     DWORD old;
@@ -301,6 +288,27 @@ bool CodeMem::begin_write_range(size_t upcoming) {
     this->range_len   = len;
     this->range_open  = true;
     return true;
+}
+
+bool CodeMem::begin_write_range(size_t upcoming) {
+    if (!this->base) {
+        return false;
+    }
+    if (this->writable || this->range_open) {
+        return true; // already inside a wider bracket
+    }
+
+    // what alloc will touch: from the current offset, aligned up, plus the
+    // bytes themselves, all rounded out to whole pages. A region too full to
+    // hold it stays untouched and alloc reports the failure
+    const size_t end = round_up(this->offset, 16) + upcoming;
+    if (end > this->size) {
+        this->range_start = 0;
+        this->range_len   = 0;
+        this->range_open  = true;
+        return true;
+    }
+    return this->open_range(this->offset, end);
 }
 
 bool CodeMem::end_write_range() {
@@ -350,6 +358,49 @@ uint8_t* CodeMem::alloc(size_t bytes, size_t alignment) {
 
     this->offset = start + bytes;
     return this->base + start;
+}
+
+uint8_t* CodeMem::alloc_writable(size_t bytes) {
+    if (!this->base || this->writable || this->range_open) {
+        return nullptr; // this entry point owns its own bracket
+    }
+
+    const size_t cls     = (bytes + RECYCLE_CLASS - 1) / RECYCLE_CLASS;
+    const size_t rounded = cls * RECYCLE_CLASS;
+
+    if (cls < this->recycle_bins.size() && !this->recycle_bins[cls].empty()) {
+        const size_t off = this->recycle_bins[cls].back();
+        if (!this->open_range(off, off + rounded)) {
+            return nullptr;
+        }
+        this->recycle_bins[cls].pop_back();
+        return this->base + off;
+    }
+
+    const size_t start = round_up(this->offset, 16);
+    if (start + rounded > this->size) {
+        return nullptr; // full, the caller declines and asks for a flush
+    }
+    if (!this->open_range(this->offset, start + rounded)) {
+        return nullptr;
+    }
+    this->offset = start + rounded;
+    return this->base + start;
+}
+
+void CodeMem::recycle(uint8_t* p, size_t bytes) {
+    if (!this->base) {
+        return;
+    }
+    const size_t off = size_t(p - this->base);
+    if (off < this->floor || off >= this->size) {
+        return; // permanent stubs and foreign pointers stay out
+    }
+    const size_t cls = (bytes + RECYCLE_CLASS - 1) / RECYCLE_CLASS;
+    if (this->recycle_bins.size() <= cls) {
+        this->recycle_bins.resize(cls + 1);
+    }
+    this->recycle_bins[cls].push_back(off);
 }
 
 uint8_t* CodeMem::slot_alloc(size_t bytes, size_t alignment) {

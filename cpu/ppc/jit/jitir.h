@@ -387,6 +387,13 @@ extern bool jit_blr_follow;
     DPPC_JIT_CRFUSE=0 makes every branch read the architected CR */
 extern bool jit_cr_fuse;
 
+/** Whether a dead block's emitted bytes go back to the pool for reuse.
+    Off by default and DPPC_JIT_RECYCLE=1 opts in: measured on the Cheetah
+    boot, reuse scatters hot code into cold holes and costs ~7% of the
+    storm and ~2% of the plateau for ~45 MB of peak footprint. The bump
+    keeps compile order, which is close to execution order */
+extern bool jit_pool_recycle;
+
 /** Settles the retired count before every call into a helper rather than only
     before the ones that read virtual time.
 

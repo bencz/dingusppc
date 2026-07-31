@@ -32,6 +32,7 @@ bool     jit_superblocks     = true;
 bool     jit_cross_follow    = true;
 bool     jit_blr_follow      = true;
 bool     jit_cr_fuse         = true;
+bool     jit_pool_recycle    = false;
 
 const char* block_end_name(BlockEnd reason) {
     switch (reason) {

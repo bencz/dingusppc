@@ -43,6 +43,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include <cstddef>
 #include <cinttypes>
+#include <vector>
 
 namespace dppc_jit {
 
@@ -107,6 +108,17 @@ public:
         Only valid between begin_write and end_write */
     uint8_t* alloc(size_t bytes, size_t alignment = 16);
 
+    /** Picks a home for one block: a recycled extent of the right size
+        class when one exists, the bump otherwise. Opens the write bracket
+        over exactly those pages and returns the spot, nullptr when the
+        region is full. Pair with end_write_range */
+    uint8_t* alloc_writable(size_t bytes);
+
+    /** Hands a dead block's bytes back for the next compile of its size.
+        Only sound at a block boundary, when nothing can be executing them;
+        extents below the floor are permanent and stay */
+    void recycle(uint8_t* p, size_t bytes);
+
     /** Space in the data tail, or nullptr when it is full. Usable at any
         time, the tail is never write protected. Nothing here is freed one
         at a time either; reset takes the whole tail back, which is right
@@ -122,6 +134,16 @@ private:
         these are no-ops */
     bool ensure_code_committed(size_t end);
     bool ensure_slot_committed(size_t end);
+
+    /** Opens the ranged bracket over the byte span [begin, end), page
+        rounded and committed. The begin/end are offsets into the code part */
+    bool open_range(size_t begin_off, size_t end_off);
+
+    /** Dead extents by size class, as offsets into the region. Every extent
+        is exactly its class in bytes, allocations round up to match, so any
+        request of a class fits any extent in its bin */
+    static constexpr size_t RECYCLE_CLASS = 256;
+    std::vector<std::vector<size_t>> recycle_bins;
 
     uint8_t* base    = nullptr;
     size_t   size    = 0;      // code bytes only, the tail comes after

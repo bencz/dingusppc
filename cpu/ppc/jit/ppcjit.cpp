@@ -757,6 +757,13 @@ bool ppc_jit_enable(JitBackend choice) {
         }
     }
 
+    if (const char* rc = getenv("DPPC_JIT_RECYCLE")) {
+        dppc_jit::jit_pool_recycle = strtol(rc, nullptr, 0) != 0;
+        if (dppc_jit::jit_pool_recycle) {
+            LOG_F(INFO, "JIT: dead block recycling on");
+        }
+    }
+
     if (const char* heat = getenv("DPPC_JIT_HEAT")) {
         const long n = strtol(heat, nullptr, 0);
         if (n >= 0 && n <= 1000000) {

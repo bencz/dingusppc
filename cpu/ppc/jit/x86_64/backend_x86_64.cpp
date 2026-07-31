@@ -239,16 +239,11 @@ public:
             return nullptr;
         }
 
-        if (!this->code.begin_write_range(this->asmb.size())) {
-            return nullptr;
-        }
-
-        uint8_t* dst = this->code.alloc(this->asmb.size());
+        uint8_t* dst = this->code.alloc_writable(this->asmb.size());
         if (!dst) {
             // the region is full. Declining sends this block to the threaded
             // backend; the flag asks the caller for a flush so the next one
             // does not have to go the same way
-            this->code.end_write_range();
             this->full = true;
             LOG_F(INFO, "JIT: code memory full after %zu bytes", this->code.used());
             return nullptr;
@@ -294,6 +289,7 @@ public:
         blk->payload    = nullptr; // the code is the payload, and it is pooled
         blk->heat       = 0;
         blk->code       = dst;
+        blk->code_bytes = uint32_t(this->asmb.size());
         blk->owner      = nullptr; // the facade fills this in
         blk->chain_in     = nullptr;
         blk->chained_prev = nullptr;
@@ -310,8 +306,13 @@ public:
     }
 
     void release(JitBlock* blk) override {
-        // the code itself stays where it is. Handing one block's bytes back
-        // would only fragment the pool, and a full flush reclaims all of it
+        // the dead block's bytes feed the next compile of their size. The
+        // caller only drains at a block boundary, where nothing is executing
+        // them and every chain into the block was already unbound. Off under
+        // the map log, whose addresses must keep meaning one block each
+        if (jit_pool_recycle && blk->code_bytes && !map_log()) {
+            this->code.recycle(static_cast<uint8_t*>(blk->code), blk->code_bytes);
+        }
         delete blk;
     }
 

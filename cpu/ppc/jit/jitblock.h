@@ -83,6 +83,10 @@ struct JitBlock {
         the loop in ppcjit.cpp picks it up. rt_dispatch is what reads this */
     void*       code;
 
+    /** Emitted bytes behind `code`, what release hands back to the pool for
+        the next compile of this size. Zero when nothing was emitted */
+    uint32_t    code_bytes = 0;
+
     /** Who produced it. A native backend declining a block sends it to the
         threaded one, so within a single run blocks can come from either and
         each has to go home to be released */
