@@ -205,8 +205,6 @@ static void read_test_float_data() {
     uint64_t dest_64;
     //float sfp_dest, sfp_src1, sfp_src2, sfp_src3;
     double dfp_src1, dfp_src2, dfp_src3;
-    string rounding_mode;
-
     ifstream tf2stream("ppcfloattests.csv");
     if (!tf2stream.is_open()) {
         cout << "Could not open tests CSV file. Exiting..." << endl;
@@ -234,6 +232,8 @@ static void read_test_float_data() {
             continue;
         }
 
+        string rounding_mode;
+
         opcode = (uint32_t)stoul(tokens[1], NULL, 16);
 
         src1          = 0;
@@ -244,7 +244,6 @@ static void read_test_float_data() {
         dfp_src2      = 0.0;
         dfp_src3      = 0.0;
         dest_64       = 0;
-        rounding_mode = "RTN"; // lines without a round= token run round to nearest
 
         // switch to default rounding
         fesetround(FE_TONEAREST);
@@ -271,6 +270,11 @@ static void read_test_float_data() {
             }
         }
 
+        if (rounding_mode.empty()) {
+            cout << "Missing round= parameter in line " << lineno << ". Exiting..." << endl;
+            exit(1);
+        }
+
         if (rounding_mode.compare("RTN") == 0) {
             update_fpscr(0);
         } else if (rounding_mode.compare("RTZ") == 0) {
@@ -282,9 +286,9 @@ static void read_test_float_data() {
         } else if (rounding_mode.compare("VEN") == 0) {
             update_fpscr(FPSCR::VE);
         } else {
-            cout << "ILLEGAL ROUNDING METHOD: " << tokens[i] << " in line " << lineno
+            cout << "ILLEGAL ROUNDING METHOD: " << rounding_mode << " in line " << lineno
                  << ". Exiting..." << endl;
-            exit(0);
+            exit(1);
         }
 
         ppc_state.gpr[3] = src1;
