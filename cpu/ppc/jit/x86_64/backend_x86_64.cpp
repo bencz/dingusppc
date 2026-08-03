@@ -871,10 +871,26 @@ private:
             }
         }
 
+        // A folded constant with no consumer needs no code. A constant whose
+        // only consumer is StoreGPR can use x86's memory-immediate form and
+        // likewise needs no host register. The latter is the common li/lis
+        // and addis+ori address-construction shape.
+        for (size_t i = 0; i < ir.insns.size(); i++) {
+            const IRInsn& in = ir.insns[i];
+            if (in.opcode != IROpcode::ConstI32) {
+                continue;
+            }
+            const bool direct_store = use_count[i] == 1 &&
+                ir.insns[this->last_use[i]].opcode == IROpcode::StoreGPR;
+            if (use_count[i] == 0 || direct_store) {
+                this->immediate_const[i] = 1;
+                this->immediate_value[i] = in.imm;
+            }
+        }
+
         // x86 can consume one constant operand without first materialising
         // it in a host register. Restrict this to a single-use value and one
-        // operand per instruction: every skipped ConstI32 then has exactly
-        // one immediate consumer, while all other backends keep seeing the
+        // operand per instruction. All other backends keep seeing the
         // ordinary, backend-neutral IR.
         for (size_t i = 0; i < ir.insns.size(); i++) {
             const IRInsn& in = ir.insns[i];
@@ -926,10 +942,19 @@ private:
         const bool a_dies = in.a != IR_NO_VALUE && this->last_use[in.a] == idx;
         const bool b_dies = in.b != IR_NO_VALUE && this->last_use[in.b] == idx;
 
-        // A selected single-use constant is emitted by its consumer below.
+        // A selected constant is either unused or emitted by its consumer.
         // Giving it no register removes both the mov-immediate and its
         // register pressure from the generated block.
         if (in.opcode == IROpcode::ConstI32 && this->immediate_const[idx]) {
+            return true;
+        }
+
+        if (in.opcode == IROpcode::StoreGPR &&
+            this->immediate_const[in.a]) {
+            if (!this->dead_gpr_store[idx]) {
+                this->asmb.mov_mem_imm32(REG_STATE, gpr_offset(in.reg),
+                                         this->immediate_value[in.a]);
+            }
             return true;
         }
 

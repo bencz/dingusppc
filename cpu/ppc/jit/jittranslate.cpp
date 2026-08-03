@@ -378,6 +378,24 @@ public:
     }
 
     IRValue binary(IROpcode op, IRValue a, IRValue b, bool oe = false) {
+        // The immediate forms often build an address or mask a half at a
+        // time. Once both inputs are already constants there is no run-time
+        // operation left to do. Keep this deliberately to the side-effect
+        // free word operations: carry and overflow families still have
+        // architected state to update even when their numeric result is known.
+        const IRInsn& lhs = this->out.insns[a];
+        const IRInsn& rhs = this->out.insns[b];
+        if (!oe && lhs.opcode == IROpcode::ConstI32 &&
+            rhs.opcode == IROpcode::ConstI32) {
+            switch (op) {
+            case IROpcode::Add: return this->constant(lhs.imm + rhs.imm);
+            case IROpcode::And: return this->constant(lhs.imm & rhs.imm);
+            case IROpcode::Or:  return this->constant(lhs.imm | rhs.imm);
+            case IROpcode::Xor: return this->constant(lhs.imm ^ rhs.imm);
+            default: break;
+            }
+        }
+
         IRInsn in = blank(op);
         in.a  = a;
         in.b  = b;

@@ -558,6 +558,43 @@ static void test_alu_subset() {
     jit_check(same_alu(native, again, &diff), "a second pass over the cached block agrees");
 }
 
+/** Constant-only arithmetic is settled while building the IR. Besides
+    guarding the folded value, this makes the intended optimisation visible
+    without depending on a particular native emitter or disassembler. */
+static void test_constant_fold_ir() {
+    constexpr uint32_t words[] = {
+        0x3C801234, // addis r4, r0, 0x1234
+        0x60845678, // ori   r4, r4, 0x5678
+        0x00000000, // illegal: ends the block before it
+    };
+    alignas(4) uint8_t code[sizeof(words)];
+    for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+        code[i * 4 + 0] = uint8_t(words[i] >> 24);
+        code[i * 4 + 1] = uint8_t(words[i] >> 16);
+        code[i * 4 + 2] = uint8_t(words[i] >> 8);
+        code[i * 4 + 3] = uint8_t(words[i]);
+    }
+
+    dppc_jit::IRBlock ir;
+    const bool translated = dppc_jit::translate_block(0x1000, 0x1000, code, 0, ir);
+    jit_check(translated, "the constant construction translated to IR");
+
+    dppc_jit::IRValue last_r4 = dppc_jit::IR_NO_VALUE;
+    bool has_runtime_alu = false;
+    for (const dppc_jit::IRInsn& in : ir.insns) {
+        if (in.opcode == dppc_jit::IROpcode::StoreGPR && in.reg == 4) {
+            last_r4 = in.a;
+        }
+        has_runtime_alu |= in.opcode == dppc_jit::IROpcode::Add ||
+                           in.opcode == dppc_jit::IROpcode::Or;
+    }
+    const bool final_constant = last_r4 != dppc_jit::IR_NO_VALUE &&
+        ir.insns[last_r4].opcode == dppc_jit::IROpcode::ConstI32 &&
+        ir.insns[last_r4].imm == 0x12345678;
+    jit_check(final_constant, "addis plus ori folded to the exact word");
+    jit_check(!has_runtime_alu, "the folded construction has no run-time ALU operation");
+}
+
 /*  D form loads, including the ones that force the slow path: unaligned
     accesses, a negative displacement and the update forms, whose rA may only
     be written after the access succeeds.
@@ -2380,6 +2417,7 @@ int test_jit() {
     test_mid_block_goal(interp_mid);
     test_native_matches_threaded(interp);
     test_interpreter_heat_gate();
+    test_constant_fold_ir();
     test_alu_subset();
     test_load_subset();
     test_store_subset();
