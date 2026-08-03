@@ -157,6 +157,15 @@ void X64Emitter::pop(X64Gpr reg) {
     this->emit8(uint8_t(0x58 + (reg & 7)));
 }
 
+void X64Emitter::nop8() {
+    // Intel's canonical eight-byte NOP: one decoded instruction, no state.
+    static constexpr uint8_t bytes[] = {0x0F, 0x1F, 0x84, 0x00,
+                                        0x00, 0x00, 0x00, 0x00};
+    for (uint8_t byte : bytes) {
+        this->emit8(byte);
+    }
+}
+
 void X64Emitter::sub_rsp(int32_t bytes) {
     if (bytes == 0) {
         return;

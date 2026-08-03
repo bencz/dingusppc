@@ -456,6 +456,8 @@ static const uint32_t alu_code[] = {
     0x7E232050, // subf   r17, r3, r4
     0x50B2400E, // rlwimi r18, r5, 8, 0, 7
     0x3A63007F, // addi   r19, r3, 127   signed imm8 upper edge
+    0x7E770034, // cntlzw r23, r19        helper must observe the first r19
+    0x3A630005, // addi   r19, r3, 5      overwrites r19 only after the helper
     0x3A830080, // addi   r20, r3, 128   needs the full immediate
     0x3AA3FF80, // addi   r21, r3, -128  signed imm8 lower edge
     0x3AC3FF7F, // addi   r22, r3, -129  needs the full immediate
@@ -515,6 +517,8 @@ static void test_alu_subset() {
     ppc_jit_disable();
     AluResult interp = run_alu_code();
     jit_check(interp.pc == ALU_END, "the ALU program stopped where it should on the interpreter");
+    jit_check(interp.gpr[23] == 19,
+              "a helper observed the GPR value stored before it");
 
     ppc_jit_enable(JitBackend::threaded);
     AluResult threaded = run_alu_code();
@@ -574,6 +578,7 @@ static const uint32_t load_code[] = {
     0x8D8A0001, // lbzu  r12, 1(r10)
     0xADAA0003, // lhau  r13, 3(r10)
     0x81CAFFFC, // lwz   r14, -4(r10)
+    0x39400000, // li    r10, 0          may not erase state loads observed
     0x00000000, // illegal on purpose, the block stops short of it
 };
 
@@ -676,6 +681,7 @@ static const uint32_t store_code[] = {
     0xB46A0004, // sthu  r3, 4(r10)
     0x9C6A0001, // stbu  r3, 1(r10)
     0x914A0008, // stw   r10, 8(r10)
+    0x38600000, // li    r3, 0           may not erase state stores observed
     0x00000000, // illegal on purpose, the block stops short of it
 };
 
@@ -1018,7 +1024,7 @@ static const uint32_t superblock_code[] = {
     0x38600000, // +0x00 li     r3, 0
     0x2C030000, // +0x04 cmpwi  cr0, r3, 0     EQ set
     0x41820010, // +0x08 beq    +0x10          -> +0x18, taken side exit
-    0x3880000B, // +0x0C li     r4, 11         skipped
+    0x3860000B, // +0x0C li     r3, 11         skipped; must not erase first r3
     0x38A00016, // +0x10 li     r5, 22         skipped
     0x4800000C, // +0x14 b      +0x0C          -> +0x20, never runs
     0x38C00021, // +0x18 li     r6, 33
@@ -1078,6 +1084,8 @@ static void test_superblock_subset() {
               "the superblock program stopped where it should");
     jit_check(interp.regs.retired == SB_RETIRED,
               "the interpreter retired the expected count in the superblock program");
+    jit_check(interp.regs.gpr[3] == 0,
+              "the taken side exit preserved the GPR value stored before it");
 
     ppc_jit_enable(JitBackend::threaded);
     SprResult threaded = run_superblock_code();
@@ -1162,10 +1170,11 @@ static void test_superblock_budget_edge() {
 }
 
 /*  A call into another page, walked through into one block guarded by an
-    ItransGuard at the seam. Three things have to hold: the walked block
-    agrees with the interpreter, a store into the CALLEE page kills it
-    through its second invalidation range, and a flushed ITLB entry makes
-    the seam guard fail into an honest fetch instead of running stale.  */
+    ItransGuard at the seam. The walked block must agree with the interpreter
+    and expose the caller's GPR state past the guard. A store into the CALLEE
+    page must kill it through its second invalidation range, and a flushed
+    ITLB entry must make the seam guard fail into an honest fetch instead of
+    running stale.  */
 static const uint32_t cross_caller_code[] = {
     0x38600005, // 0xA000 li   r3, 5
     0x48000FFD, // 0xA004 bl   -> 0xB000
@@ -1173,15 +1182,16 @@ static const uint32_t cross_caller_code[] = {
     0x00000000, // 0xA00C illegal, the program stops here
 };
 static const uint32_t cross_callee_code[] = {
-    0x38800007, // 0xB000 li   r4, 7
-    0x7CA802A6, // 0xB004 mflr r5             r5 = 0xA008
-    0x4E800020, // 0xB008 blr
+    0x7C641B78, // 0xB000 mr   r4, r3           guard must expose caller's r3
+    0x38600007, // 0xB004 li   r3, 7            overwrite only after the guard
+    0x7CA802A6, // 0xB008 mflr r5               r5 = 0xA008
+    0x4E800020, // 0xB00C blr
 };
 
 constexpr uint32_t CC_BASE   = 0xA000;
 constexpr uint32_t CC_CALLEE = 0xB000;
 constexpr uint32_t CC_END    = CC_BASE + 0x0C;
-constexpr uint64_t CC_RETIRED = 6;
+constexpr uint64_t CC_RETIRED = 7;
 
 static void load_cross_code() {
     for (size_t i = 0; i < sizeof(cross_caller_code) / 4; i++) {
@@ -1224,7 +1234,8 @@ static void test_cross_page_call() {
 
     ppc_jit_disable();
     SprResult interp = run_cross_code();
-    jit_check(interp.regs.pc == CC_END && interp.regs.retired == CC_RETIRED,
+    jit_check(interp.regs.pc == CC_END && interp.regs.retired == CC_RETIRED &&
+              interp.regs.gpr[4] == 5 && interp.regs.gpr[3] == 7,
               "the cross page call program behaves on the interpreter");
 
     ppc_jit_enable(JitBackend::threaded);
@@ -1248,7 +1259,7 @@ static void test_cross_page_call() {
 
     // a store into the CALLEE page has to reach the walked through block
     // through its second invalidation range: rerunning must see the new
-    // value, and a stale 7 here means the range dangled
+    // value, and a stale 5 here means the range dangled
     mmu_write_vmem<uint32_t>(NO_OPCODE, CC_CALLEE, 0x38800008); // li r4, 8
     SprResult patched = run_cross_code();
     jit_check(patched.regs.gpr[4] == 8 && patched.regs.retired == CC_RETIRED,
@@ -1256,7 +1267,7 @@ static void test_cross_page_call() {
 
     // with the callee's ITLB entry flushed, the seam guard must fail into
     // an honest fetch and still come out with the interpreter's answer
-    mmu_write_vmem<uint32_t>(NO_OPCODE, CC_CALLEE, 0x38800007);
+    mmu_write_vmem<uint32_t>(NO_OPCODE, CC_CALLEE, 0x7C641B78); // mr r4, r3
     tlb_flush_entry(CC_CALLEE);
     SprResult reguarded = run_cross_code();
     where = -1;

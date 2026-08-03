@@ -98,6 +98,7 @@ public:
     // stack
     void push(X64Gpr reg);
     void pop(X64Gpr reg);
+    void nop8();
     void sub_rsp(int32_t bytes);
     void add_rsp(int32_t bytes);
 
