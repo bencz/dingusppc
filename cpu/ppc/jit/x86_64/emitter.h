@@ -110,6 +110,7 @@ public:
     void mov_mem_reg32(X64Gpr base, int32_t disp, X64Gpr src);
     void movbe_reg_mem32(X64Gpr dst, X64Gpr base, int32_t disp);
     void movbe_mem_reg32(X64Gpr base, int32_t disp, X64Gpr src);
+    void movbe_mem_reg16(X64Gpr base, int32_t disp, X64Gpr src);
     void lea_reg_mem(X64Gpr dst, X64Gpr base, int32_t disp);
     void lea_reg_reg32(X64Gpr dst, X64Gpr base, X64Gpr index); // dst = base + index, FLAGS untouched
 

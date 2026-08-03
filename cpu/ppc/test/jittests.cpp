@@ -68,16 +68,18 @@ static void test_movbe_encoding() {
     dppc_jit::X64Emitter emitter;
     emitter.movbe_reg_mem32(dppc_jit::R9, dppc_jit::R10, 0x7F);
     emitter.movbe_mem_reg32(dppc_jit::R10, -4, dppc_jit::R9);
+    emitter.movbe_mem_reg16(dppc_jit::R10, -8, dppc_jit::R9);
 
     constexpr uint8_t expected[] = {
         0x45, 0x0F, 0x38, 0xF0, 0x4A, 0x7F,
         0x45, 0x0F, 0x38, 0xF1, 0x4A, 0xFC,
+        0x66, 0x45, 0x0F, 0x38, 0xF1, 0x4A, 0xF8,
     };
     bool same = emitter.size() == sizeof(expected);
     for (size_t i = 0; same && i < sizeof(expected); i++) {
         same = emitter.bytes()[i] == expected[i];
     }
-    jit_check(same, "MOVBE load and store have the exact x64 encoding");
+    jit_check(same, "MOVBE word and halfword forms have the exact x64 encoding");
 }
 #endif
 

@@ -1823,6 +1823,10 @@ private:
                 this->asmb.mov_mem_reg16(rtmp, 0, rval);
                 break;
             }
+            if (this->use_movbe) {
+                this->asmb.movbe_mem_reg16(rtmp, 0, rval);
+                break;
+            }
             // the value must not be disturbed, it may be live past this
             this->asmb.mov_reg_reg32(rtag, rval);
             this->asmb.rol_reg16_imm8(rtag, 8);
