@@ -1597,15 +1597,12 @@ private:
             this->asmb.movzx_reg8_mem(rdst, rtmp, 0);
             break;
         case 2:
-            // bswap works on the whole 32 bit register, so the halfword lands
-            // in the top half and comes back down. A rol of 8 would only be
-            // right on a 16 bit operand and silently produces 0x00DDCC00
-            // where 0x0000CCDD was wanted. lhbrx wants the bytes as the host
-            // reads them, so it is the raw movzx and nothing else
+            // A 16 bit rotate exchanges the two bytes without the extra shift
+            // needed by a 32 bit bswap. lhbrx wants the bytes exactly as the
+            // host reads them, so it remains the raw movzx and nothing else
             this->asmb.movzx_reg16_mem(rdst, rtmp, 0);
             if (!in.byte_reverse) {
-                this->asmb.bswap_reg32(rdst);
-                this->asmb.shr_reg_imm8(rdst, 16);
+                this->asmb.rol_reg16_imm8(rdst, 8);
                 if (in.signed_load) {
                     this->asmb.movsx_reg16(rdst, rdst);
                 }
@@ -1797,8 +1794,7 @@ private:
             }
             // the value must not be disturbed, it may be live past this
             this->asmb.mov_reg_reg32(rtag, rval);
-            this->asmb.bswap_reg32(rtag);
-            this->asmb.shr_reg_imm8(rtag, 16);
+            this->asmb.rol_reg16_imm8(rtag, 8);
             this->asmb.mov_mem_reg16(rtmp, 0, rtag);
             break;
         default:

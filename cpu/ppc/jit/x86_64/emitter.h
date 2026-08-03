@@ -126,6 +126,7 @@ public:
     void or_reg_imm32(X64Gpr dst, uint32_t imm);
     void xor_reg_imm32(X64Gpr dst, uint32_t imm);
     void rol_reg_imm8(X64Gpr dst, uint8_t sh);
+    void rol_reg16_imm8(X64Gpr dst, uint8_t sh);
     void shr_reg_imm8(X64Gpr dst, uint8_t sh);
     void shl_reg_imm8(X64Gpr dst, uint8_t sh);
     void bswap_reg32(X64Gpr dst);

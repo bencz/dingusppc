@@ -383,6 +383,17 @@ void X64Emitter::rol_reg_imm8(X64Gpr dst, uint8_t sh) {
     this->emit8(sh & 31);
 }
 
+void X64Emitter::rol_reg16_imm8(X64Gpr dst, uint8_t sh) {
+    if ((sh & 15) == 0) {
+        return;
+    }
+    this->emit8(0x66); // operand size override must precede REX
+    this->rex(false, 0, uint8_t(dst));
+    this->emit8(0xC1);
+    this->modrm_reg(0, uint8_t(dst)); // /0 is rol
+    this->emit8(sh & 15);
+}
+
 void X64Emitter::shr_reg_imm8(X64Gpr dst, uint8_t sh) {
     if ((sh & 31) == 0) return;
     this->rex(false, 0, uint8_t(dst));
