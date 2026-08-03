@@ -36,6 +36,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "../ppcemu.h"
 #include "../ppcjit.h"
 #include "../ppcmmu.h"
+#include "devices/common/mmiodevice.h"
 #include "devices/memctrl/mpc106.h"
 
 #include <cstdlib>
@@ -53,6 +54,36 @@ static void jit_check(bool passed, const char* what) {
         jit_failed++;
     }
 }
+
+/** A device access is part of the guest instruction stream, so it must see
+    every instruction retired before it even when the block executor normally
+    batches cycle accounting until the exit. */
+class JitCycleMmio final : public MMIODevice {
+public:
+    JitCycleMmio() {
+        this->set_name("JIT cycle test");
+    }
+
+    uint32_t read(uint32_t, uint32_t, int) override {
+        this->read_cycle = g_icycles;
+        return uint32_t(g_icycles);
+    }
+
+    void write(uint32_t, uint32_t, uint32_t value, int) override {
+        this->write_cycle = g_icycles;
+        this->write_value = value;
+    }
+
+    void reset() {
+        this->read_cycle  = UINT64_MAX;
+        this->write_cycle = UINT64_MAX;
+        this->write_value = 0;
+    }
+
+    uint64_t read_cycle  = UINT64_MAX;
+    uint64_t write_cycle = UINT64_MAX;
+    uint32_t write_value = 0;
+};
 
 /*  li     r3, 0
     li     r4, 10
@@ -1790,6 +1821,102 @@ static void test_xform_subset() {
               "the emitter took every X form block instead of declining");
 }
 
+/*  Six ordinary instructions precede an MMIO load, and the loaded value is
+    then written back to the device. The read must observe six retired guest
+    instructions and the following write must observe seven. */
+static const uint32_t mmio_cycle_code[] = {
+    0x38600000, // li    r3, 0
+    0x38630001, // addi  r3, r3, 1
+    0x38630001, // addi  r3, r3, 1
+    0x38630001, // addi  r3, r3, 1
+    0x3D40F000, // lis   r10, 0xF000
+    0x614A0000, // ori   r10, r10, 0
+    0x808A0000, // lwz   r4, 0(r10)
+    0x908A0004, // stw   r4, 4(r10)
+    0x00000000, // illegal on purpose, marks the end
+};
+
+constexpr uint32_t MMIO_CYCLE_BASE = 0xE000;
+constexpr uint32_t MMIO_CYCLE_END  = MMIO_CYCLE_BASE + uint32_t(sizeof(mmio_cycle_code) - 4);
+constexpr uint32_t MMIO_CYCLE_ADDR = 0xF0000000;
+
+struct MmioCycleResult {
+    uint32_t loaded;
+    uint32_t written;
+    uint32_t pc;
+    uint64_t read_cycle;
+    uint64_t write_cycle;
+    uint64_t retired;
+};
+
+static void load_mmio_cycle_code() {
+    for (size_t i = 0; i < sizeof(mmio_cycle_code) / sizeof(mmio_cycle_code[0]); i++) {
+        mmu_write_vmem<uint32_t>(NO_OPCODE, MMIO_CYCLE_BASE + uint32_t(i) * 4,
+                                 mmio_cycle_code[i]);
+    }
+}
+
+static MmioCycleResult run_mmio_cycle_code(JitCycleMmio& device) {
+    device.reset();
+    ppc_state.pc      = MMIO_CYCLE_BASE;
+    ppc_state.gpr[3]  = 0;
+    ppc_state.gpr[4]  = 0;
+    ppc_state.gpr[10] = 0;
+    g_icycles         = 0;
+    g_icycles_max     = UINT64_MAX;
+    exec_timer        = false;
+    exec_flags        = 0;
+    power_on          = true;
+
+    ppc_exec_until(MMIO_CYCLE_END);
+
+    return {ppc_state.gpr[4], device.write_value, ppc_state.pc,
+            device.read_cycle, device.write_cycle, g_icycles};
+}
+
+static bool same_mmio_cycle(const MmioCycleResult& a, const MmioCycleResult& b) {
+    return a.loaded == b.loaded && a.written == b.written && a.pc == b.pc &&
+           a.read_cycle == b.read_cycle && a.write_cycle == b.write_cycle &&
+           a.retired == b.retired;
+}
+
+static void test_mmio_cycle_visibility(MPC106* host_bridge) {
+    static JitCycleMmio device;
+    if (!host_bridge->add_mmio_region(MMIO_CYCLE_ADDR, 0x1000, &device)) {
+        jit_check(false, "the MMIO cycle test region was registered");
+        return;
+    }
+    load_mmio_cycle_code();
+
+    ppc_jit_disable();
+    const MmioCycleResult interp = run_mmio_cycle_code(device);
+    jit_check(interp.read_cycle == 6 && interp.loaded == 6,
+              "the interpreter exposes prior cycles to an MMIO read");
+    jit_check(interp.write_cycle == 7 && interp.written == 6,
+              "the interpreter exposes prior cycles to an MMIO write");
+    jit_check(interp.retired == 8 && interp.pc == MMIO_CYCLE_END,
+              "the MMIO program retired exactly eight instructions");
+
+    ppc_jit_enable(JitBackend::threaded);
+    const MmioCycleResult threaded = run_mmio_cycle_code(device);
+    jit_check(same_mmio_cycle(interp, threaded),
+              "the threaded backend exposes the same cycles to MMIO");
+
+    ppc_jit_disable();
+    ppc_jit_enable(JitBackend::automatic);
+    const MmioCycleResult native = run_mmio_cycle_code(device);
+    if (ppc_jit_native_compiles() == 0) {
+        cout << "  (no emitter on this host, skipping native MMIO timing)" << endl;
+    } else {
+        jit_check(same_mmio_cycle(interp, native),
+                  "emitted code exposes the same cycles to MMIO");
+
+        const MmioCycleResult cached = run_mmio_cycle_code(device);
+        jit_check(same_mmio_cycle(interp, cached),
+                  "a cached native block keeps MMIO cycle visibility exact");
+    }
+}
+
 int test_jit() {
     jit_tested = 0;
     jit_failed = 0;
@@ -1847,6 +1974,7 @@ int test_jit() {
     test_carry_subset();
     test_ov_subset();
     test_xform_subset();
+    test_mmio_cycle_visibility(host_bridge);
 
     ppc_jit_disable();
     jit_check(!ppc_jit_is_enabled(), "the JIT reports itself disabled again");

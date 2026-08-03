@@ -240,30 +240,46 @@ void threaded_entry(const JitBlock* blk) {
            block adds over the interpreter is grouping, and grouping may not
            split an instruction; jitir.h tells the story of the device read
            that was retried because rd was still unwritten */
-        case IROpcode::Load:
+        case IROpcode::Load: {
+            const uint32_t guest_idx = in.insn_idx;
             ppc_state.pc = entry_pc + in.offset;
+            if (!rt_sync_cycles(guest_idx - accounted)) {
+                retired   = guest_idx;
+                accounted = guest_idx;
+                goto done;
+            }
+            accounted = guest_idx;
             if (!rt_call_op(in.helper, in.imm)) {
-                retired = in.insn_idx;
+                retired = guest_idx;
                 goto done;
             }
             vals[i] = ppc_state.gpr[in.reg];
             if (exec_flags) {
-                retired = in.insn_idx + 1;
+                retired = guest_idx + 1;
                 goto done;
             }
             break;
+        }
 
-        case IROpcode::Store:
+        case IROpcode::Store: {
+            const uint32_t guest_idx = in.insn_idx;
             ppc_state.pc = entry_pc + in.offset;
+            if (!rt_sync_cycles(guest_idx - accounted)) {
+                retired   = guest_idx;
+                accounted = guest_idx;
+                goto done;
+            }
+            accounted = guest_idx;
             if (!rt_call_op(in.helper, in.imm)) {
-                retired = in.insn_idx;
+                retired = guest_idx;
                 goto done;
             }
             if (exec_flags) {
-                retired = in.insn_idx + 1;
+                retired = guest_idx + 1;
                 goto done;
             }
             break;
+        }
 
         case IROpcode::SetCR: {
             // same shape as ppc_cmpi and ppc_changecrf0: one of the three

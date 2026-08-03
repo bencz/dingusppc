@@ -1281,8 +1281,8 @@ private:
         return true;
     }
 
-    /** Brings g_icycles forward to just before the guest instruction at
-        `guest_idx` and lets timers run if their deadline has passed.
+    /** Adds the cycle prefix a path still owes and lets timers run if their
+        deadline has passed.
 
         A block used to do this only when it ended, which meant an instruction
         in the middle saw virtual time from before the block started. Every
@@ -1292,17 +1292,16 @@ private:
         that already costs twenty.
 
         ppc_state.pc must already name the instruction about to run: it has
-        not run, and that is where an exception delivered here resumes */
-    bool emit_cycle_sync(uint32_t guest_idx) {
-        const uint32_t owed = guest_idx - this->accounted;
-
+        not run, and that is where an exception delivered here resumes. The
+        caller decides whether this prefix belongs to every runtime path and
+        therefore changes `accounted`, or to a slow path that exits here. */
+    bool emit_cycle_sync_owed(uint32_t owed) {
         X64Emitter::Label service = this->asmb.new_label();
         X64Emitter::Label done    = this->asmb.new_label();
 
         if (owed) {
             this->asmb.add_mem64_imm32(REG_TIME, this->icycles_disp, owed);
         }
-        this->accounted = guest_idx;
 
         this->asmb.mov_reg64_mem(RAX, REG_TIME, this->icycles_disp);
         this->asmb.cmp_reg64_mem(RAX, REG_TIME, this->deadline_disp);
@@ -1324,6 +1323,53 @@ private:
         return true;
     }
 
+    bool emit_cycle_sync(uint32_t guest_idx) {
+        const uint32_t owed = guest_idx - this->accounted;
+        this->accounted     = guest_idx;
+        return this->emit_cycle_sync_owed(owed);
+    }
+
+    /** Runs a memory instruction through its interpreter helper after the
+        inline TLB path declined it. MMIO and every other slow access can
+        observe virtual time, so the cycles preceding the instruction have
+        to be visible first.
+
+        This path always leaves through dispatch. Rejoining the fast path
+        would make `accounted` describe two different runtime histories: the
+        slow path settled its prefix while the fast one did not. Dispatching
+        also keeps a device access that changed mappings or executable pages
+        from running the rest of a translation whose assumptions just moved. */
+    bool emit_memory_slow_call(const IRInsn& in, X64Gpr pc_tmp,
+                               X64Gpr arg0, X64Gpr arg1)
+    {
+        this->asmb.lea_reg_mem(pc_tmp, REG_ENTRYPC, int32_t(in.offset));
+        this->asmb.mov_mem_reg32(REG_STATE, PC_OFFSET, pc_tmp);
+
+        if (!this->emit_cycle_sync_owed(in.insn_idx - this->accounted)) {
+            return false;
+        }
+
+        this->asmb.mov_reg_imm64(arg0, uint64_t(uintptr_t(in.helper)));
+        this->asmb.mov_reg_imm32(arg1, in.imm);
+        this->asmb.call_reg(REG_CALLOP);
+
+        // The prefix was settled above, so this helper contributes only its
+        // own retirement: one when it returned and raised, zero when it
+        // unwound. emit_cold_exits picks that bit out of the return register.
+        X64Emitter::Label cold = this->asmb.new_label();
+        this->cold_exits.push_back({cold, 0});
+        this->asmb.cmp_mem_imm8(REG_FLAGS, 0, 0);
+        this->asmb.jcc(X64Cond::NotEqual, cold);
+
+        // A completed load/store retires here. rt_dispatch accounts that one
+        // instruction and resumes at the following PC.
+        this->asmb.lea_reg_mem(pc_tmp, REG_ENTRYPC, int32_t(in.offset) + 4);
+        this->asmb.mov_mem_reg32(REG_STATE, PC_OFFSET, pc_tmp);
+        this->asmb.mov_reg_imm32(REG_RETIRED, 1);
+        this->asmb.jmp_abs(this->dispatch);
+        return true;
+    }
+
     /** A guest load, with the primary TLB hit inlined.
 
         The fast path is a tag compare and an alignment test, plus the rA
@@ -1335,9 +1381,8 @@ private:
         would leave rd unwritten while the guest, sent back to the same
         instruction, read the device a second time.
 
-        The helper leaves the loaded value in the destination register, so
-        the slow path reloads it from there and both paths meet with the SSA
-        value equal to what rd holds.
+        A slow access leaves through dispatch after the helper. Only the
+        inline memory path reaches the SSA continuation below.
 
         The translator drops the register cache at every load, so the address
         is the one value live at this point and the call is free to clobber
@@ -1428,20 +1473,9 @@ private:
         this->asmb.jmp(done);
 
         this->asmb.bind(slow);
-        this->asmb.lea_reg_mem(rtmp, REG_ENTRYPC, int32_t(in.offset));
-        this->asmb.mov_mem_reg32(REG_STATE, PC_OFFSET, rtmp);
-        this->asmb.mov_reg_imm64(arg0, uint64_t(uintptr_t(in.helper)));
-        this->asmb.mov_reg_imm32(arg1, in.imm);
-        this->asmb.call_reg(REG_CALLOP);
-
-        X64Emitter::Label cold = this->asmb.new_label();
-        this->cold_exits.push_back({cold, in.insn_idx - this->accounted});
-        this->asmb.cmp_mem_imm8(REG_FLAGS, 0, 0);
-        this->asmb.jcc(X64Cond::NotEqual, cold);
-
-        // the helper wrote rd; picking the value up from there spares the
-        // slow path from repeating the width and byte order shuffling
-        this->asmb.mov_reg_mem32(rdst, REG_STATE, gpr_offset(in.reg));
+        if (!this->emit_memory_slow_call(in, rtmp, arg0, arg1)) {
+            return false;
+        }
 
         this->asmb.bind(done);
 
@@ -1634,16 +1668,9 @@ private:
         this->asmb.jmp(done);
 
         this->asmb.bind(slow);
-        this->asmb.lea_reg_mem(rtmp, REG_ENTRYPC, int32_t(in.offset));
-        this->asmb.mov_mem_reg32(REG_STATE, PC_OFFSET, rtmp);
-        this->asmb.mov_reg_imm64(arg0, uint64_t(uintptr_t(in.helper)));
-        this->asmb.mov_reg_imm32(arg1, in.imm);
-        this->asmb.call_reg(REG_CALLOP);
-
-        X64Emitter::Label cold = this->asmb.new_label();
-        this->cold_exits.push_back({cold, in.insn_idx - this->accounted});
-        this->asmb.cmp_mem_imm8(REG_FLAGS, 0, 0);
-        this->asmb.jcc(X64Cond::NotEqual, cold);
+        if (!this->emit_memory_slow_call(in, rtmp, arg0, arg1)) {
+            return false;
+        }
 
         this->asmb.bind(done);
 
