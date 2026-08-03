@@ -66,6 +66,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "../backend.h"
 #include "../jitruntime.h"
 #include "../host/codemem.h"
+#include "../host/host_cpu_features.h"
 #include "../../ppcmmu.h"
 #include "emitter.h"
 
@@ -212,7 +213,8 @@ class X86_64Backend : public Backend {
 public:
     explicit X86_64Backend(const AbiDesc& abi)
         : abi(abi), pad(frame_padding(abi)),
-          pool(abi_usable_gprs(abi) & abi.volatile_gprs & ~bit(REG_SCRATCH)) {}
+          pool(abi_usable_gprs(abi) & abi.volatile_gprs & ~bit(REG_SCRATCH)),
+          use_movbe(host_cpu_features().x86_movbe) {}
 
     bool init() {
         if (!this->measure_runtime_globals()) {
@@ -1635,8 +1637,12 @@ private:
             break;
         default:
             // same story: lwbrx on a big endian guest is the host's own order
-            this->asmb.mov_reg_mem32(rdst, rtmp, 0);
-            if (!in.byte_reverse) {
+            if (!in.byte_reverse && this->use_movbe) {
+                this->asmb.movbe_reg_mem32(rdst, rtmp, 0);
+            } else {
+                this->asmb.mov_reg_mem32(rdst, rtmp, 0);
+            }
+            if (!in.byte_reverse && !this->use_movbe) {
                 this->asmb.bswap_reg32(rdst);
             }
             break;
@@ -1825,6 +1831,10 @@ private:
         default:
             if (in.byte_reverse) {
                 this->asmb.mov_mem_reg32(rtmp, 0, rval);
+                break;
+            }
+            if (this->use_movbe) {
+                this->asmb.movbe_mem_reg32(rtmp, 0, rval);
                 break;
             }
             this->asmb.mov_reg_reg32(rtag, rval);
@@ -2062,6 +2072,7 @@ private:
     const AbiDesc&        abi;
     const int32_t         pad;
     const uint32_t        pool;
+    const bool            use_movbe;
     CodeMem               code;
 
     /** The shared stubs, emitted once by init and never reclaimed. Blocks

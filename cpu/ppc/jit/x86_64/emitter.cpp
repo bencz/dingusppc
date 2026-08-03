@@ -230,6 +230,22 @@ void X64Emitter::mov_mem_reg32(X64Gpr base, int32_t disp, X64Gpr src) {
     this->modrm_mem(uint8_t(src), uint8_t(base), disp);
 }
 
+void X64Emitter::movbe_reg_mem32(X64Gpr dst, X64Gpr base, int32_t disp) {
+    this->rex(false, uint8_t(dst), uint8_t(base));
+    this->emit8(0x0F);
+    this->emit8(0x38);
+    this->emit8(0xF0);
+    this->modrm_mem(uint8_t(dst), uint8_t(base), disp);
+}
+
+void X64Emitter::movbe_mem_reg32(X64Gpr base, int32_t disp, X64Gpr src) {
+    this->rex(false, uint8_t(src), uint8_t(base));
+    this->emit8(0x0F);
+    this->emit8(0x38);
+    this->emit8(0xF1);
+    this->modrm_mem(uint8_t(src), uint8_t(base), disp);
+}
+
 void X64Emitter::lea_reg_mem(X64Gpr dst, X64Gpr base, int32_t disp) {
     this->rex(false, uint8_t(dst), uint8_t(base));
     this->emit8(0x8D);

@@ -36,6 +36,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "../ppcemu.h"
 #include "../ppcjit.h"
 #include "../ppcmmu.h"
+#if defined(DPPC_JIT_X86_64)
+#include "../jit/x86_64/emitter.h"
+#endif
 #include "devices/common/mmiodevice.h"
 #include "devices/memctrl/mpc106.h"
 
@@ -55,6 +58,28 @@ static void jit_check(bool passed, const char* what) {
         jit_failed++;
     }
 }
+
+#if defined(DPPC_JIT_X86_64)
+/** The load and store forms differ by one opcode byte and share the same REX
+    and ModRM fields. Exercise extended registers and a disp8 so every part of
+    the encoding is visible rather than relying only on the current CPU to
+    accept it. */
+static void test_movbe_encoding() {
+    dppc_jit::X64Emitter emitter;
+    emitter.movbe_reg_mem32(dppc_jit::R9, dppc_jit::R10, 0x7F);
+    emitter.movbe_mem_reg32(dppc_jit::R10, -4, dppc_jit::R9);
+
+    constexpr uint8_t expected[] = {
+        0x45, 0x0F, 0x38, 0xF0, 0x4A, 0x7F,
+        0x45, 0x0F, 0x38, 0xF1, 0x4A, 0xFC,
+    };
+    bool same = emitter.size() == sizeof(expected);
+    for (size_t i = 0; same && i < sizeof(expected); i++) {
+        same = emitter.bytes()[i] == expected[i];
+    }
+    jit_check(same, "MOVBE load and store have the exact x64 encoding");
+}
+#endif
 
 /** A device access is part of the guest instruction stream, so it must see
     every instruction retired before it even when the block executor normally
@@ -2385,6 +2410,10 @@ int test_jit() {
     }
 
     ppc_cpu_init(host_bridge, PPC_VER::MPC750, false, 16705000);
+
+#if defined(DPPC_JIT_X86_64)
+    test_movbe_encoding();
+#endif
 
     // MSR[DR] is clear coming out of reset, so effective addresses are physical
     load_test_code();
