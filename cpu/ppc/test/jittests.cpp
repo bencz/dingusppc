@@ -620,6 +620,41 @@ static void test_constant_fold_ir() {
     jit_check(!has_runtime_alu, "the folded construction has no run-time ALU operation");
 }
 
+/** Native memory helpers never rejoin their block, so the successful inline
+    path may keep unrelated guest values cached. This sequence reads r3 on
+    both sides of a load and a store; one LoadGPR is enough for all four uses. */
+static void test_memory_gpr_cache_ir() {
+    constexpr uint32_t words[] = {
+        0x80830000, // lwz  r4, 0(r3)
+        0x38A30004, // addi r5, r3, 4
+        0x90830008, // stw  r4, 8(r3)
+        0x38C3000C, // addi r6, r3, 12
+        0x00000000, // illegal: ends the block before it
+    };
+    alignas(4) uint8_t code[sizeof(words)];
+    for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+        code[i * 4 + 0] = uint8_t(words[i] >> 24);
+        code[i * 4 + 1] = uint8_t(words[i] >> 16);
+        code[i * 4 + 2] = uint8_t(words[i] >> 8);
+        code[i * 4 + 3] = uint8_t(words[i]);
+    }
+
+    dppc_jit::IRBlock ir;
+    const bool translated = dppc_jit::translate_block(0x1000, 0x1000, code, 0, ir);
+    jit_check(translated, "the memory cache sequence translated to IR");
+
+    unsigned r3_loads = 0;
+    bool has_load = false;
+    bool has_store = false;
+    for (const dppc_jit::IRInsn& in : ir.insns) {
+        r3_loads += in.opcode == dppc_jit::IROpcode::LoadGPR && in.reg == 3;
+        has_load |= in.opcode == dppc_jit::IROpcode::Load;
+        has_store |= in.opcode == dppc_jit::IROpcode::Store;
+    }
+    jit_check(has_load && has_store && r3_loads == 1,
+              "load and store fast paths preserve the cached base GPR");
+}
+
 /*  D form loads, including the ones that force the slow path: unaligned
     accesses, a negative displacement and the update forms, whose rA may only
     be written after the access succeeds.
@@ -2447,6 +2482,7 @@ int test_jit() {
     test_native_matches_threaded(interp);
     test_interpreter_heat_gate();
     test_constant_fold_ir();
+    test_memory_gpr_cache_ir();
     test_alu_subset();
     test_load_subset();
     test_store_subset();

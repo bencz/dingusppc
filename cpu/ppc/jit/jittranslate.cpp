@@ -426,7 +426,10 @@ public:
         return this->out.append(in);
     }
 
-    /** A helper can change any register, so nothing cached survives it */
+    /** A generic helper can change any register, so nothing cached survives
+        it. Memory operations use their own narrower rule below: their native
+        slow path leaves the block, while the threaded helper changes only
+        the destination and update registers described by the instruction. */
     void invalidate() {
         for (int i = 0; i < 32; i++) {
             this->cache[i] = IR_NO_VALUE;
@@ -447,11 +450,15 @@ public:
         in.ureg         = uint8_t(update_reg);
         IRValue v = this->out.append(in);
 
-        // the slow path is a call, so nothing cached may outlive it. Keeping
-        // the read cache across a load would need the live values spilled
-        // around that call, and a load is common enough that the simple rule
-        // wins: reads after a load come from memory again
-        this->invalidate();
+        // Only the inline fast path reaches later native instructions. The
+        // helper path leaves through dispatch, so it may clobber volatile
+        // host registers without invalidating values used by the continuation.
+        // The threaded backend does continue, but the whole helper has exactly
+        // the guest instruction's GPR effects: rd is replaced by store_gpr at
+        // the call site and an update form leaves rA equal to this address.
+        if (update_reg != IR_NO_UPDATE) {
+            this->cache[update_reg] = ea;
+        }
         return v;
     }
 
@@ -483,7 +490,13 @@ public:
         in.helper       = helper;
         in.ureg         = uint8_t(update_reg);
         this->out.append(in);
-        this->invalidate(); // the slow path is a call, same as for a load
+
+        // A store changes no GPR except rA in an update form. As with load,
+        // its native helper path dispatches instead of rejoining the cached
+        // continuation, and the threaded helper has this exact writeback.
+        if (update_reg != IR_NO_UPDATE) {
+            this->cache[update_reg] = ea;
+        }
     }
 
     /** imm is the target when absolute, otherwise the displacement from the
