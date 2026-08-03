@@ -2208,6 +2208,8 @@ static void test_native_chaining() {
     const uint32_t until_result = run_chain_code(true);
     jit_check(until_result == CHAIN_ITERATIONS,
               "the same loop remains correct under ppc_exec_until");
+    jit_check(g_icycles == CHAIN_ITERATIONS * 2,
+              "same-page chaining retires each guest instruction exactly once");
     jit_check(ppc_jit_bound_chains() == 0,
               "an until run unbound every previously chained entry");
 
@@ -2261,6 +2263,8 @@ static void test_native_chaining() {
     const uint32_t va_until_result = run_va_chain_code(true);
     jit_check(va_until_result == CHAIN_ITERATIONS * 2,
               "the cross-page loop remains correct under ppc_exec_until");
+    jit_check(g_icycles == CHAIN_ITERATIONS * 4,
+              "virtual chaining retires each guest instruction exactly once");
     jit_check(ppc_jit_bound_chains() == 0,
               "the virtual until run retained no direct bindings");
 
@@ -2286,6 +2290,8 @@ static void test_native_chaining() {
     const uint32_t alt_until_result = run_alt_chain_code(true);
     jit_check(alt_until_result == (CHAIN_ITERATIONS / 2) * 11,
               "two observed virtual ways alternate without changing targets");
+    jit_check(g_icycles == CHAIN_ITERATIONS * 7,
+              "alternating virtual ways do not leak a retired count");
     jit_check(ppc_jit_bound_chains() == 0,
               "two observed virtual ways still count as unbound");
 

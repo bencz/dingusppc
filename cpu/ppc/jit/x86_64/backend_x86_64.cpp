@@ -144,6 +144,11 @@ constexpr X64Gpr REG_CALLOP  = R14;
 constexpr X64Gpr REG_RETIRED = R15;
 constexpr X64Gpr REG_SCRATCH = R11;
 
+/** REG_RETIRED is zero at every generated block entry. The trampoline and
+    dispatch stub establish the invariant; a block only writes a nonzero value
+    on a terminal path straight to dispatch, so chained exits may preserve it
+    instead of zeroing an already-zero callee-saved register. */
+
 /** The timing globals are reached as displacements from &ppc_state rather
     than each through an immediate of its own, which would be ten bytes and a
     scratch register apiece on a path taken before every helper call.
@@ -547,7 +552,6 @@ private:
         this->asmb.jcc(X64Cond::NotEqual, to_dispatch);
 
         this->asmb.lea_reg_mem(REG_ENTRYPC, REG_ENTRYPC, next_off);
-        this->asmb.xor_reg_reg32(REG_RETIRED, REG_RETIRED);
         this->asmb.jmp_mem_abs(&slot->code);
 
         // a due timer goes the long way round; the count is zero because the
@@ -616,7 +620,6 @@ private:
         this->asmb.mov_reg64_mem_abs(RAX, &slot->gen0);
         this->asmb.cmp_reg64_mem(RAX, REG_TIME, this->gen_disp);
         this->asmb.jcc(X64Cond::NotEqual, probe0);
-        this->asmb.xor_reg_reg32(REG_RETIRED, REG_RETIRED);
         this->asmb.jmp_mem_abs(&slot->code0);
 
         this->asmb.bind(try_way1);
@@ -625,7 +628,6 @@ private:
         this->asmb.mov_reg64_mem_abs(RAX, &slot->gen1);
         this->asmb.cmp_reg64_mem(RAX, REG_TIME, this->gen_disp);
         this->asmb.jcc(X64Cond::NotEqual, probe1);
-        this->asmb.xor_reg_reg32(REG_RETIRED, REG_RETIRED);
         this->asmb.jmp_mem_abs(&slot->code1);
 
         this->asmb.bind(to_dispatch);
@@ -676,7 +678,6 @@ private:
 
         this->asmb.mov_reg64_mem(RAX, REG_TIME, this->gen_disp);
         this->asmb.mov_mem64_abs_reg(gen, RAX);
-        this->asmb.xor_reg_reg32(REG_RETIRED, REG_RETIRED);
         this->asmb.jmp_mem_abs(code);
     }
 
