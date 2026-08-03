@@ -40,12 +40,17 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     generated code at all.
 
     Set DPPC_JIT=1 to measure the emitter, DPPC_JIT=threaded for the portable
-    backend, and leave it unset for the interpreter.
+    backend, and leave it unset for the interpreter. DPPC_BENCH_SAMPLES and
+    DPPC_BENCH_ITERATIONS override their defaults (30 and 200000) for quicker
+    diagnostic sweeps.
  */
 
 #include <chrono>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <vector>
 
 #include "cpu/ppc/ppcemu.h"
@@ -74,8 +79,28 @@ enum class RunMode {
     translator's own ceiling, and the ones between show the shape */
 const uint32_t lengths[] = {2, 4, 8, 16, 33, 64};
 
-constexpr uint32_t samples    = 30;
-constexpr uint64_t iterations = 200000;
+uint32_t samples    = 30;
+uint32_t iterations = 200000;
+
+bool read_env_uint32(const char* name, uint32_t& value) {
+    const char* text = std::getenv(name);
+    if (!text || !*text) {
+        return true;
+    }
+
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(text, &end, 10);
+    if (errno || *end || parsed == 0 ||
+        parsed > std::numeric_limits<uint32_t>::max()) {
+        LOG_F(ERROR, "%s must be an integer from 1 through %u", name,
+              std::numeric_limits<uint32_t>::max());
+        return false;
+    }
+
+    value = uint32_t(parsed);
+    return true;
+}
 
 /** addi r3, r3, 1 */
 constexpr uint32_t ADDI_R3 = 0x38630001;
@@ -140,6 +165,12 @@ int main(int argc, char** argv) {
     loguru::g_preamble_thread = false;
     loguru::g_stderr_verbosity = 0;
     loguru::init(argc, argv);
+
+    if (!read_env_uint32("DPPC_BENCH_SAMPLES", samples) ||
+        !read_env_uint32("DPPC_BENCH_ITERATIONS", iterations)) {
+        return -1;
+    }
+    printf("samples=%u iterations=%u\n", samples, iterations);
 
     MPC106* grackle = new MPC106;
     if (!grackle->add_ram_region(0, 0x10000)) {

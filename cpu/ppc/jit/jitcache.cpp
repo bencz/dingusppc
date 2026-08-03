@@ -38,16 +38,21 @@ std::unordered_map<uint64_t, JitBlock*> blocks;
     bucket is most of it. This turns the common case into an index, two loads
     and two compares.
 
-    It caches, it does not own. The map stays the authority, so a miss here
-    costs one extra lookup and never a wrong answer. Keyed by physical address
-    like the map, which is what keeps it free of the invalidation hazards a
-    virtual key would bring: a virtual address can start meaning different
-    memory without any block being dropped */
-typedef struct QuickEntry {
-    uint32_t  phys_addr;
-    uint32_t  mode;
-    JitBlock* blk;
-} QuickEntry;
+    It caches, it does not own. The map stays the authority. A matching entry
+    with a null block is a cached map miss, which keeps every cold interpreter
+    entry from repeating the same hash lookup. PPC_JIT_MODE_MASK makes all
+    ones an impossible mode, so it marks a slot whose key is not valid.
+
+    Keyed by physical address like the map, which is what keeps it free of the
+    invalidation hazards a virtual key would bring: a virtual address can
+    start meaning different memory without any block being dropped */
+constexpr uint32_t QUICK_INVALID_MODE = ~uint32_t(0);
+
+struct QuickEntry {
+    uint32_t  phys_addr = 0;
+    uint32_t  mode      = QUICK_INVALID_MODE;
+    JitBlock* blk       = nullptr;
+};
 
 constexpr size_t QUICK_BITS = 13;
 constexpr size_t QUICK_SIZE = size_t(1) << QUICK_BITS;
@@ -65,7 +70,8 @@ inline size_t quick_index(uint32_t phys_addr) {
 
 void quick_clear() {
     for (size_t i = 0; i < QUICK_SIZE; i++) {
-        quick[i].blk = nullptr;
+        quick[i].mode = QUICK_INVALID_MODE;
+        quick[i].blk  = nullptr;
     }
 }
 
@@ -73,12 +79,15 @@ void quick_clear() {
 
 JitBlock* cache_lookup(uint32_t phys_addr, uint32_t mode) {
     QuickEntry& q = quick[quick_index(phys_addr)];
-    if (q.blk && q.phys_addr == phys_addr && q.mode == mode) [[likely]] {
+    if (q.phys_addr == phys_addr && q.mode == mode) [[likely]] {
         return q.blk;
     }
 
     auto it = blocks.find(block_key(phys_addr, mode));
     if (it == blocks.end()) {
+        q.phys_addr = phys_addr;
+        q.mode      = mode;
+        q.blk       = nullptr;
         return nullptr;
     }
 
@@ -112,6 +121,8 @@ void cache_forget(JitBlock* blk) {
     // walking all 8192 entries
     QuickEntry& q = quick[quick_index(blk->phys_addr)];
     if (q.blk == blk) {
+        // The authoritative entry was just erased, so this key is now a
+        // known miss. A later translation overwrites it in cache_insert.
         q.blk = nullptr;
     }
 }

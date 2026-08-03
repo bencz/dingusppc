@@ -363,9 +363,17 @@ void flush_everything() {
     an interpreted instruction really runs. Resolver and dispatch probes do
     not count, otherwise one cold entry can be charged several times.
 
+    When interp_code is supplied, it receives the translated host instruction
+    pointer. The outer loop reuses it if this lookup leaves the instruction to
+    the interpreter, avoiding a second translation of the same address.
+
     Can unwind out of mmu_translate_imem on an instruction fetch fault, which
     is fine: no generated frame is on the stack at this point */
-JitBlock* find_or_translate(uint32_t virt_addr, bool allow_flush, bool count_heat) {
+JitBlock* find_or_translate(uint32_t virt_addr, bool allow_flush, bool count_heat,
+                            const uint8_t** interp_code = nullptr) {
+    if (interp_code) {
+        *interp_code = nullptr;
+    }
 #if SUPPORTS_PPC_LITTLE_ENDIAN_MODE
     if (ppc_state.is_LE) [[unlikely]] {
         // little endian munges addresses, so walking a host pointer forward
@@ -379,6 +387,9 @@ JitBlock* find_or_translate(uint32_t virt_addr, bool allow_flush, bool count_hea
 
     uint32_t phys_addr = 0;
     const uint8_t* code = mmu_translate_imem(virt_addr, &phys_addr);
+    if (interp_code) {
+        *interp_code = code;
+    }
 
     if (JitBlock* blk = cache_lookup(phys_addr, mode)) {
         return blk;
@@ -524,9 +535,13 @@ bool goal_splits_block(const JitBlock* blk, uint32_t entry_pc) {
 }
 
 /** One instruction on the interpreter, for whatever no backend took.
+    pc_real is normally the translation already obtained by find_or_translate;
+    little-endian mode reaches here without one and translates on demand.
     Leaves the PC and exec_flags exactly as a block would */
-void interpret_one() {
-    uint8_t* pc_real = mmu_translate_imem(ppc_state.pc);
+void interpret_one(const uint8_t* pc_real) {
+    if (!pc_real) {
+        pc_real = mmu_translate_imem(ppc_state.pc);
+    }
     uint32_t opcode  = ppc_read_instruction(pc_real);
 
     ppc_main_opcode(ppc_opcode_grabber, opcode);
@@ -877,7 +892,9 @@ void ppc_jit_exec_inner(JitExecType type, uint32_t goal_addr) {
         dppc_jit::drain_pending_free();
 
         const uint32_t entry_pc = ppc_state.pc;
-        dppc_jit::JitBlock* blk = dppc_jit::find_or_translate(entry_pc, true, true);
+        const uint8_t* interp_code = nullptr;
+        dppc_jit::JitBlock* blk =
+            dppc_jit::find_or_translate(entry_pc, true, true, &interp_code);
 
         dppc_jit::trace_block(blk);
 
@@ -891,7 +908,7 @@ void ppc_jit_exec_inner(JitExecType type, uint32_t goal_addr) {
             // something here has to be dealt with
             blk->entry(blk);
         } else {
-            dppc_jit::interpret_one();
+            dppc_jit::interpret_one(interp_code);
         }
 
         if (exec_flags) {
