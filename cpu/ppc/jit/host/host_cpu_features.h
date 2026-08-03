@@ -1,0 +1,36 @@
+/*
+DingusPPC - The Experimental PowerPC Macintosh emulator
+Copyright (C) 2018-26 The DingusPPC Development Team
+          (See CREDITS.MD for more details)
+
+(You may also contact divingkxt or powermax2286 on Discord)
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*/
+
+/** @file Host processor capabilities used by native JIT backends. */
+
+#pragma once
+
+namespace dppc_jit {
+
+/** Capabilities are discovered once on first use. Architecture backends use
+    this data without knowing which compiler or operating system supplied it. */
+struct HostCpuFeatures {
+    bool x86_movbe = false;
+};
+
+const HostCpuFeatures& host_cpu_features();
+
+} // namespace dppc_jit
