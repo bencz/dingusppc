@@ -91,6 +91,7 @@ struct ChainRef {
     JitBlock*   target;   // block the slot jumps into, nullptr while unbound
     ChainRef*   prev;     // neighbours on the target's incoming list
     ChainRef*   next;
+    ChainRef*   owner_next; // next slot entry owned by the same source block
 };
 
 /** Runs one interpreter helper on behalf of generated code.

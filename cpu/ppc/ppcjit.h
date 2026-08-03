@@ -117,6 +117,10 @@ unsigned ppc_jit_num_blocks();
 unsigned ppc_jit_native_compiles();
 unsigned ppc_jit_threaded_compiles();
 
+/** Number of chain slots currently bound to live blocks. The registry already
+    maintains this value, so exposing it to tests adds no execution cost. */
+uint64_t ppc_jit_bound_chains();
+
 /** Name of the backend in use, or nullptr while the JIT is off */
 const char* ppc_jit_backend_name();
 

@@ -194,6 +194,19 @@ void unbind_chains_to(JitBlock* blk) {
     unlink_chained_block(blk);
 }
 
+/** Detaches every binding owned by a block that is about to die. Incoming
+    tracking alone is not enough: a live target may otherwise retain a
+    ChainRef stored in the dead block's slot area, and a later invalidation
+    would write through that dangling entry. */
+void unbind_chains_from(JitBlock* blk) {
+    for (ChainRef* ref = blk->chain_out; ref; ref = ref->owner_next) {
+        if (ref->target) {
+            unlink_chain_ref(ref);
+        }
+    }
+    blk->chain_out = nullptr;
+}
+
 void unbind_all_chains() {
     for (JitBlock* blk = chained_head; blk;) {
         JitBlock* next_blk = blk->chained_next;
@@ -234,6 +247,7 @@ void on_block_released(CodeBlockHandle handle) {
         ppc_code_cache_remove(blk->second_phys, handle);
     }
     unbind_chains_to(blk);
+    unbind_chains_from(blk);
     cache_forget(blk);
     pending_free.push_back(blk);
 }
@@ -815,6 +829,10 @@ unsigned ppc_jit_native_compiles() {
 
 unsigned ppc_jit_threaded_compiles() {
     return dppc_jit::threaded_compiles;
+}
+
+uint64_t ppc_jit_bound_chains() {
+    return uint64_t(dppc_jit::chain_refs);
 }
 
 const char* ppc_jit_backend_name() {

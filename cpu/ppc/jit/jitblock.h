@@ -104,6 +104,10 @@ struct JitBlock {
         of their list */
     ChainRef*   chain_in;
 
+    /** Chain entries stored in this block's own slot area. They must detach
+        from their live targets before the slot memory is released or reused. */
+    ChainRef*   chain_out;
+
     /** Neighbours in the list of blocks whose chain_in is nonempty, which is
         what unbinding everything walks instead of every block there is */
     JitBlock*   chained_prev;

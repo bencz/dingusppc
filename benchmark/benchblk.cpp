@@ -30,9 +30,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     This runs the same loop at several block lengths and divides by the
     instructions retired, which separates the two costs. The body is one
     addi repeated, so what changes between lengths is only how often the
-    boundary is crossed. The gap between the shortest and the longest run is
-    the per block cost, and driving it down is the whole point of the shared
-    frame and of chaining blocks together.
+    boundary is crossed. Each length is measured twice: ppc_exec_until keeps
+    bindings disabled so it exposes the resolver/dispatcher cost, while
+    ppc_exec lets the backward edge bind and stay inside generated code.
 
     The loop closes with bdnz, which is a taken backward branch to the top of
     the same block. That is deliberate: it is both the commonest shape in a
@@ -65,6 +65,11 @@ namespace {
 
 constexpr uint32_t CODE_BASE = 0x1000;
 
+enum class RunMode {
+    unchained,
+    chained,
+};
+
 /** Block lengths to sweep. 4 is what a real workload averages, 64 is the
     translator's own ceiling, and the ones between show the shape */
 const uint32_t lengths[] = {2, 4, 8, 16, 33, 64};
@@ -82,17 +87,19 @@ uint32_t bdnz(int32_t disp) {
 
 /** Writes a loop of `len` guest instructions, all but the last an addi and
     the last a bdnz back to the top. One block per iteration, because a
-    branch is what ends a block */
+    branch is what ends a block. The illegal word just beyond it stops a
+    ppc_exec run through the benchmark's exception handler. */
 void write_loop(uint32_t len) {
     for (uint32_t i = 0; i + 1 < len; i++) {
         mmu_write_vmem<uint32_t>(0, CODE_BASE + i * 4, ADDI_R3);
     }
     const int32_t back = -int32_t((len - 1) * 4);
     mmu_write_vmem<uint32_t>(0, CODE_BASE + (len - 1) * 4, bdnz(back));
+    mmu_write_vmem<uint32_t>(0, CODE_BASE + len * 4, 0);
 }
 
 /** Best of `samples` runs, in nanoseconds, with the timing overhead removed */
-uint64_t time_loop(uint32_t len, uint64_t overhead) {
+uint64_t time_loop(uint32_t len, uint64_t overhead, RunMode mode) {
     const uint32_t goal = CODE_BASE + len * 4;
 
     uint64_t best = uint64_t(-1);
@@ -103,7 +110,11 @@ uint64_t time_loop(uint32_t len, uint64_t overhead) {
         power_on              = true;
 
         auto start = std::chrono::steady_clock::now();
-        ppc_exec_until(goal);
+        if (mode == RunMode::chained) {
+            ppc_exec();
+        } else {
+            ppc_exec_until(goal);
+        }
         auto end   = std::chrono::steady_clock::now();
 
         const uint64_t ns = uint64_t(
@@ -150,22 +161,32 @@ int main(int argc, char** argv) {
         }
     }
 
-    printf("%6s %14s %14s %14s\n", "insns", "total ns", "ns/insn", "ns/block");
-    for (uint32_t len : lengths) {
-        write_loop(len);
+    for (RunMode mode : {RunMode::unchained, RunMode::chained}) {
+        printf("\n%s (%s)\n",
+               mode == RunMode::chained ? "chained" : "unchained",
+               mode == RunMode::chained ? "ppc_exec" : "ppc_exec_until");
+        printf("%6s %14s %14s %14s %12s\n",
+               "insns", "total ns", "ns/insn", "ns/block", "MIPS");
 
-        // the guest code just changed underneath any translation of it
-        ppc_jit_flush();
+        for (uint32_t len : lengths) {
+            write_loop(len);
 
-        const uint64_t ns = time_loop(len, overhead);
-        if (!ns) {
-            continue;
+            // The guest code just changed underneath any translation of it.
+            // Flushing per mode also keeps one measurement from donating a
+            // warm binding to the other.
+            ppc_jit_flush();
+
+            const uint64_t ns = time_loop(len, overhead, mode);
+            if (!ns) {
+                continue;
+            }
+            const double per_insn  = double(ns) / double(iterations * len);
+            const double per_block = double(ns) / double(iterations);
+            const double mips      = 1000.0 / per_insn;
+            printf("%6u %14llu %14.4f %14.4f %12.1f\n", len,
+                   (unsigned long long)ns, per_insn, per_block, mips);
+            fflush(stdout);
         }
-        const double per_insn  = double(ns) / double(iterations * len);
-        const double per_block = double(ns) / double(iterations);
-        printf("%6u %14llu %14.4f %14.4f\n", len,
-               (unsigned long long)ns, per_insn, per_block);
-        fflush(stdout);
     }
 
     delete grackle;

@@ -1917,6 +1917,108 @@ static void test_mmio_cycle_visibility(MPC106* host_bridge) {
     }
 }
 
+/* A one-block counted loop. Its taken bdnz targets the block itself, which is
+   the smallest shape that can prove the resolver bound a same-page chain. */
+static const uint32_t chain_code[] = {
+    0x38630001, // addi r3, r3, 1
+    0x4200FFFC, // bdnz -4
+    0x00000000, // test-only stop helper installed at this decode slot
+};
+
+constexpr uint32_t CHAIN_BASE       = 0xB000;
+constexpr uint32_t CHAIN_END        = CHAIN_BASE + 8;
+constexpr uint32_t CHAIN_ITERATIONS = 64;
+
+static void stop_chain_run(uint32_t) {
+    power_on = false;
+}
+
+static void load_chain_code() {
+    for (size_t i = 0; i < sizeof(chain_code) / sizeof(chain_code[0]); i++) {
+        mmu_write_vmem<uint32_t>(NO_OPCODE, CHAIN_BASE + uint32_t(i) * 4, chain_code[i]);
+    }
+}
+
+static uint32_t run_chain_code(bool until) {
+    ppc_state.pc            = CHAIN_BASE;
+    ppc_state.gpr[3]        = 0;
+    ppc_state.spr[SPR::CTR] = CHAIN_ITERATIONS;
+    g_icycles               = 0;
+    g_icycles_max           = UINT64_MAX;
+    exec_timer              = false;
+    exec_flags              = 0;
+    power_on                = true;
+
+    if (until) {
+        ppc_exec_until(CHAIN_END);
+    } else {
+        ppc_exec();
+    }
+    return ppc_state.gpr[3];
+}
+
+static void test_native_chaining() {
+    ppc_jit_disable();
+    if (!ppc_jit_enable(JitBackend::automatic)) {
+        jit_check(false, "the JIT came up for the chaining test");
+        return;
+    }
+    ppc_jit_flush();
+
+    // Opcode zero is normally illegal. Making just this table entry a
+    // controlled stop lets ppc_exec exercise real chaining without entering
+    // an exception vector that the test's small RAM image does not map.
+    PPCOpcode saved_zero = ppc_opcode_grabber[0];
+    ppc_opcode_grabber[0] = stop_chain_run;
+    load_chain_code();
+
+    const uint32_t first_result = run_chain_code(false);
+    jit_check(first_result == CHAIN_ITERATIONS,
+              "a ppc_exec run completed the chained counted loop");
+
+    if (ppc_jit_native_compiles() == 0) {
+        cout << "  (no emitter on this host, skipping native chaining)" << endl;
+        ppc_opcode_grabber[0] = saved_zero;
+        ppc_jit_flush();
+        return;
+    }
+
+    jit_check(ppc_jit_bound_chains() > 0,
+              "the loop left live same-page chain bindings");
+
+    const uint32_t until_result = run_chain_code(true);
+    jit_check(until_result == CHAIN_ITERATIONS,
+              "the same loop remains correct under ppc_exec_until");
+    jit_check(ppc_jit_bound_chains() == 0,
+              "an until run unbound every previously chained entry");
+
+    const uint32_t rebound_result = run_chain_code(false);
+    jit_check(rebound_result == CHAIN_ITERATIONS,
+              "the loop remains correct after returning to ppc_exec");
+    jit_check(ppc_jit_bound_chains() > 0,
+              "an ordinary run rebound the chain lazily");
+
+    // A write into the loop invalidates its block. This exercises both sides
+    // of the registry: the self-chain is incoming to that block, while its
+    // fall-through chain is an outgoing entry aimed at the stop block.
+    const unsigned blocks_before_invalidation = ppc_jit_num_blocks();
+    mmu_write_vmem<uint32_t>(NO_OPCODE, CHAIN_BASE, 0x60000000);
+    jit_check(ppc_jit_bound_chains() == 0,
+              "invalidating a chain source detached incoming and outgoing slots");
+    jit_check(ppc_jit_num_blocks() + 1 == blocks_before_invalidation,
+              "invalidating the loop removed exactly its translated block");
+
+    load_chain_code();
+    const uint32_t restored_result = run_chain_code(false);
+    jit_check(restored_result == CHAIN_ITERATIONS,
+              "the restored loop still computes the expected result");
+    jit_check(ppc_jit_bound_chains() > 0,
+              "the restored block acquired a fresh chain binding");
+
+    ppc_opcode_grabber[0] = saved_zero;
+    ppc_jit_flush();
+}
+
 int test_jit() {
     jit_tested = 0;
     jit_failed = 0;
@@ -1975,6 +2077,7 @@ int test_jit() {
     test_ov_subset();
     test_xform_subset();
     test_mmio_cycle_visibility(host_bridge);
+    test_native_chaining();
 
     ppc_jit_disable();
     jit_check(!ppc_jit_is_enabled(), "the JIT reports itself disabled again");

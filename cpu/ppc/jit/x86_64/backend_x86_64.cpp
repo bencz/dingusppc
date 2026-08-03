@@ -292,8 +292,23 @@ public:
         blk->code_bytes = uint32_t(this->asmb.size());
         blk->owner      = nullptr; // the facade fills this in
         blk->chain_in     = nullptr;
+        blk->chain_out    = nullptr;
         blk->chained_prev = nullptr;
         blk->chained_next = nullptr;
+
+        // The entries live in this block's slot area but sit on their
+        // targets' incoming lists while bound. Keep an ownership list so
+        // invalidating the source can detach them before that memory dies.
+        for (const ChainExit& ce : this->chain_exits) {
+            ce.slot->ref.owner_next = blk->chain_out;
+            blk->chain_out          = &ce.slot->ref;
+        }
+        for (const VaChainExit& ce : this->va_chain_exits) {
+            ce.slot->ref0.owner_next = blk->chain_out;
+            blk->chain_out           = &ce.slot->ref0;
+            ce.slot->ref1.owner_next = blk->chain_out;
+            blk->chain_out           = &ce.slot->ref1;
+        }
 
         if (FILE* f = map_log()) [[unlikely]] {
             fprintf(f, "%llx %zx %u %u %08x %08x %x\n",
