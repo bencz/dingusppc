@@ -21,8 +21,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 /** @file What a code generator has to provide.
 
-    One implementation per host architecture, plus the threaded one, which is
-    portable and is what a WebAssembly build runs.
+    One implementation per host architecture, plus a portable threaded
+    executor retained for explicit differential tests.
  */
 
 #ifndef PPC_JIT_BACKEND_H
@@ -67,13 +67,13 @@ public:
         Nothing reclaims a single block's code: handing the bytes back one at
         a time would fragment the pool for no gain, and translations are cheap
         to redo. So the pool only ever comes back whole, and this is how the
-        backend asks for that to happen. Without it a long run degrades to the
-        threaded backend the moment the pool fills and never recovers */
+        backend asks for that to happen. Without it a long run would stay on
+        the interpreter once the pool filled and never recover */
     virtual bool wants_flush() const { return false; }
 };
 
 /** Portable, executes a block by calling the interpreter helpers in order.
-    Always available */
+    Selected explicitly for tests; never the automatic fallback */
 std::unique_ptr<Backend> make_threaded_backend();
 
 #if defined(DPPC_JIT_X86_64)

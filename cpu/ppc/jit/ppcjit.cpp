@@ -61,8 +61,7 @@ namespace {
 std::unique_ptr<Backend> native_backend;
 std::unique_ptr<Backend> threaded_backend;
 
-/** Both names, because both are in play: an emitter that declines a block
-    does not send it to the interpreter, it sends it to the threaded backend */
+/** The selected executor and its fallback policy, for diagnostics */
 std::string backend_label;
 
 /** Blocks the code cache dropped but nobody has freed yet.
@@ -80,19 +79,80 @@ IRBlock scratch_ir;
 unsigned native_compiles   = 0;
 unsigned threaded_compiles = 0;
 
-/** Entries a block collects as a threaded one before the emitter is asked.
+/** Interpreted entries a block collects before the emitter is asked.
 
     A booting system runs megabytes of code exactly once: loaders, linkers,
     initialisation that never comes back. Emitting all of it cost more than
     running it, and the churn was worse than the cost: every block thrown
     away by an invalidation had bought chain bindings, registry entries and
-    code pool bytes with it. Below the threshold a block runs as IR, which
-    is roughly interpreter speed; crossing it buys emission once.
+    code pool bytes with it. Below the threshold the ordinary interpreter
+    runs the instructions; crossing it buys emission once.
 
     Zero turns the gate off and every block compiles native on first entry,
     which is what the tests use to hold the emitter to full coverage.
     DPPC_JIT_HEAT overrides it for bisection either way */
-uint32_t promote_threshold = 8;
+uint32_t heat_threshold = 8;
+
+/** A bounded hotness map, deliberately separate from the code cache.
+
+    Cold code must not need a JitBlock allocation just to remember that it
+    ran once. A direct-mapped table keeps that state to a fixed amount of BSS
+    and makes eviction harmless: a collision can delay compilation, never
+    change guest behaviour. Count zero marks an empty/cooling entry, so key
+    zero needs no special case. */
+struct HeatEntry {
+    uint64_t key;
+    uint32_t count;
+    uint32_t epoch;
+};
+
+constexpr size_t HEAT_TABLE_SIZE = 1u << 16;
+constexpr size_t HEAT_TABLE_MASK = HEAT_TABLE_SIZE - 1;
+HeatEntry heat_table[HEAT_TABLE_SIZE] = {};
+uint32_t heat_epoch = 1;
+
+inline size_t heat_index(uint64_t key) {
+    uint32_t mixed = uint32_t(key) ^ uint32_t(key >> 32);
+    mixed ^= mixed >> 16;
+    mixed *= 0x7FEB352Du;
+    mixed ^= mixed >> 15;
+    return size_t(mixed) & HEAT_TABLE_MASK;
+}
+
+bool heat_ready(uint64_t key) {
+    if (!heat_threshold) {
+        return true;
+    }
+
+    HeatEntry& entry = heat_table[heat_index(key)];
+    if (entry.epoch != heat_epoch || !entry.count || entry.key != key) {
+        entry.key   = key;
+        entry.count = 1;
+        entry.epoch = heat_epoch;
+    } else if (entry.count < heat_threshold) {
+        entry.count++;
+    }
+
+    if (entry.count < heat_threshold) {
+        return false;
+    }
+
+    // Space retries out too: an untranslatable or emitter-declined block
+    // gets another attempt only after a fresh interval of interpreted runs.
+    entry.count = 0;
+    return true;
+}
+
+void heat_clear() {
+    // Epoch invalidation makes the common flush O(1). Only the impossible in
+    // practice 32-bit wrap has to touch the table before epoch one is reused.
+    if (++heat_epoch == 0) {
+        for (HeatEntry& entry : heat_table) {
+            entry.epoch = 0;
+        }
+        heat_epoch = 1;
+    }
+}
 
 /** What the outer loop is doing, so rt_dispatch can apply the same stopping
     rule from inside generated code. Set once per ppc_jit_exec_inner and read
@@ -271,6 +331,7 @@ void flush_everything() {
     ppc_code_cache_invalidate_all(); // sends every block through on_block_released
     drain_pending_free();
     cache_clear();
+    heat_clear();
 
     // every release above already unbound its chains and emptied the chained
     // list; the entries themselves live in the slot area the backends are
@@ -287,8 +348,8 @@ void flush_everything() {
 }
 
 /** Finds the block covering virt_addr under the current mode, translating it
-    if this is the first time. Returns nullptr when the instruction there has
-    to go back to the interpreter.
+    once its interpreter entry count is hot enough. Returns nullptr when the
+    instruction there has to go back to the interpreter.
 
     allow_flush says the caller sits below the code memory floor, which the
     dispatch stub does and a resolver thunk does not: a thunk lives in the
@@ -298,60 +359,13 @@ void flush_everything() {
     untranslated rather than flushing; its exit falls back to the stub, and
     the stub's own lookup does the flushing on safe ground.
 
+    count_heat is true only at the outer execution loop, immediately before
+    an interpreted instruction really runs. Resolver and dispatch probes do
+    not count, otherwise one cold entry can be charged several times.
+
     Can unwind out of mmu_translate_imem on an instruction fetch fault, which
     is fine: no generated frame is on the stack at this point */
-/** Retranslates a heated threaded block and swaps a native one into its
-    place: same cache key, same invalidation registration, new executor.
-    Returns nullptr when the emitter declines or the pool is full in a
-    context that may not flush, and the threaded block stays as it was */
-JitBlock* promote_block(JitBlock* blk, uint32_t virt_addr, uint32_t phys_addr,
-                        const uint8_t* code, uint32_t mode, bool allow_flush) {
-    if (!translate_block(virt_addr, phys_addr, code, mode, scratch_ir)) {
-        return nullptr;
-    }
-
-    JitBlock* nblk = native_backend->compile(scratch_ir);
-
-    if (!nblk && native_backend->wants_flush()) {
-        if (!allow_flush) {
-            return nullptr; // a resolver is on the stack, see find_or_translate
-        }
-        LOG_F(INFO, "JIT: code memory exhausted, flushing %zu blocks", cache_size());
-        flush_everything(); // takes the threaded original with it
-        nblk = native_backend->compile(scratch_ir);
-        if (!nblk) {
-            return nullptr;
-        }
-        native_compiles++;
-        nblk->owner = native_backend.get();
-        cache_insert(nblk);
-        register_ranges(nblk);
-        return nblk;
-    }
-    if (!nblk) {
-        return nullptr; // declined for real; the block keeps running as IR
-    }
-
-    native_compiles++;
-    nblk->owner = native_backend.get();
-
-    cache_forget(blk);
-    cache_insert(nblk);
-    // not a swap in place: the retranslation may cover different ground
-    // than the threaded original did, a cross page walk through forming
-    // once the target's translation warmed up being the usual way, so the
-    // old ranges go and the new ones are registered from scratch
-    ppc_code_cache_remove(blk->phys_addr, static_cast<CodeBlockHandle>(blk));
-    if (blk->second_size) {
-        ppc_code_cache_remove(blk->second_phys, static_cast<CodeBlockHandle>(blk));
-    }
-    register_ranges(nblk);
-    blk->owner->release(blk); // a threaded payload is plain heap, and the
-                              // block is not executing at any promotion site
-    return nblk;
-}
-
-JitBlock* find_or_translate(uint32_t virt_addr, bool allow_flush) {
+JitBlock* find_or_translate(uint32_t virt_addr, bool allow_flush, bool count_heat) {
 #if SUPPORTS_PPC_LITTLE_ENDIAN_MODE
     if (ppc_state.is_LE) [[unlikely]] {
         // little endian munges addresses, so walking a host pointer forward
@@ -367,60 +381,47 @@ JitBlock* find_or_translate(uint32_t virt_addr, bool allow_flush) {
     const uint8_t* code = mmu_translate_imem(virt_addr, &phys_addr);
 
     if (JitBlock* blk = cache_lookup(phys_addr, mode)) {
-        // a threaded block heats up with every entry; the one that crosses
-        // the threshold comes back native, and the caller jumps straight
-        // into it. A failed promotion leaves the threaded block in place,
-        // and resetting the heat spaces out the retries
-        if (blk->owner == threaded_backend.get() && native_backend &&
-            promote_threshold && ++blk->heat >= promote_threshold) {
-            blk->heat = 0;
-            if (JitBlock* promoted =
-                    promote_block(blk, virt_addr, phys_addr, code, mode, allow_flush)) {
-                return promoted;
-            }
-        }
         return blk;
+    }
+
+    // Automatic mode has a native backend and leaves cold instructions to
+    // the interpreter. Explicit threaded mode has no native backend and is
+    // compiled immediately, because its purpose is differential testing.
+    if (native_backend && heat_threshold &&
+        (!count_heat || !heat_ready(block_key(phys_addr, mode)))) {
+        return nullptr;
     }
 
     if (!translate_block(virt_addr, phys_addr, code, mode, scratch_ir)) {
         return nullptr;
     }
 
-    // with a native backend present a block is born threaded and earns its
-    // emission through the heat gate above; without one, threaded is all
-    // there is. The gate off means native on first entry
-    Backend* owner = native_backend.get();
-    JitBlock* blk  = nullptr;
+    Backend* owner = native_backend ? native_backend.get() : threaded_backend.get();
+    JitBlock* blk  = owner->compile(scratch_ir);
 
-    if (owner && !promote_threshold) {
-        blk = owner->compile(scratch_ir);
-
-        if (!blk && owner->wants_flush()) {
-            if (!allow_flush) {
-                // a resolver is on the stack with its return address inside
-                // the memory a flush reclaims. No block, no threaded
-                // fallback, no cache entry: the retry from the dispatch
-                // stub redoes all of it
-                return nullptr;
-            }
-            // the pool filled up. Everything translated so far goes, and
-            // this block gets one more try on the empty pool. Nothing is
-            // executing here, so the code the flush reclaims cannot be
-            // under anyone's feet
-            LOG_F(INFO, "JIT: code memory exhausted, flushing %zu blocks", cache_size());
-            flush_everything();
-            blk = owner->compile(scratch_ir);
-        }
-    }
-
-    if (blk) {
-        native_compiles++;
-    } else {
-        owner = threaded_backend.get();
-        blk   = owner->compile(scratch_ir);
-        if (!blk) {
+    if (!blk && native_backend && owner->wants_flush()) {
+        if (!allow_flush) {
+            // A resolver is on the stack with its return address inside the
+            // memory a flush reclaims. The dispatch stub retries from safe
+            // ground; with a heat gate, the outer loop does so after it has
+            // counted the actual interpreted entry.
             return nullptr;
         }
+        // The pool filled up. Everything translated so far goes, and this
+        // block gets one more try on the empty pool. Nothing is executing
+        // here, so reclaimed code cannot be under anyone's feet.
+        LOG_F(INFO, "JIT: code memory exhausted, flushing %zu blocks", cache_size());
+        flush_everything();
+        blk = owner->compile(scratch_ir);
+    }
+
+    if (!blk) {
+        return nullptr; // the ordinary interpreter is the automatic fallback
+    }
+
+    if (native_backend) {
+        native_compiles++;
+    } else {
         threaded_compiles++;
     }
     blk->owner = owner;
@@ -569,7 +570,7 @@ const void* dispatch_body(uint32_t retired) {
     }
 
     const uint32_t entry_pc = ppc_state.pc;
-    JitBlock* blk = find_or_translate(entry_pc, true);
+    JitBlock* blk = find_or_translate(entry_pc, true, false);
     trace_block(blk);
 
     if (!blk || !blk->code || goal_splits_block(blk, entry_pc)) [[unlikely]] {
@@ -611,7 +612,7 @@ const void* rt_chain_resolve(ChainSlot* slot) noexcept {
         }
 
         const uint32_t entry_pc = ppc_state.pc;
-        JitBlock* blk = find_or_translate(entry_pc, false);
+        JitBlock* blk = find_or_translate(entry_pc, false, false);
         trace_block(blk);
 
         if (!blk || !blk->code || goal_splits_block(blk, entry_pc)) [[unlikely]] {
@@ -646,7 +647,7 @@ const void* rt_chain_resolve_va(ChainVaSlot* slot) noexcept {
         }
 
         const uint32_t entry_pc = ppc_state.pc;
-        JitBlock* blk = find_or_translate(entry_pc, false);
+        JitBlock* blk = find_or_translate(entry_pc, false, false);
         trace_block(blk);
 
         if (!blk || !blk->code || goal_splits_block(blk, entry_pc)) [[unlikely]] {
@@ -708,12 +709,16 @@ bool ppc_jit_enable(JitBackend choice) {
 
     if (choice == JitBackend::automatic) {
         dppc_jit::native_backend = dppc_jit::make_native_backend();
-    }
-
-    // present either way: it is what takes the blocks the emitter declines
-    dppc_jit::threaded_backend = dppc_jit::make_threaded_backend();
-    if (!dppc_jit::threaded_backend) {
-        return false;
+        if (!dppc_jit::native_backend) {
+            return false;
+        }
+    } else {
+        // Retained as an explicit differential-test backend. It is never the
+        // implicit destination of a native emitter decline.
+        dppc_jit::threaded_backend = dppc_jit::make_threaded_backend();
+        if (!dppc_jit::threaded_backend) {
+            return false;
+        }
     }
 
     if (getenv("DPPC_JIT_TRACE")) {
@@ -778,21 +783,22 @@ bool ppc_jit_enable(JitBackend choice) {
         }
     }
 
-    if (const char* heat = getenv("DPPC_JIT_HEAT")) {
-        const long n = strtol(heat, nullptr, 0);
-        if (n >= 0 && n <= 1000000) {
-            dppc_jit::promote_threshold = uint32_t(n);
-            if (n) {
-                LOG_F(INFO, "JIT: blocks go native after %ld entries", n);
-            } else {
-                LOG_F(INFO, "JIT: heat gate off, every block goes native at once");
+    if (dppc_jit::native_backend) {
+        if (const char* heat = getenv("DPPC_JIT_HEAT")) {
+            const long n = strtol(heat, nullptr, 0);
+            if (n >= 0 && n <= 1000000) {
+                dppc_jit::heat_threshold = uint32_t(n);
+                if (n) {
+                    LOG_F(INFO, "JIT: blocks go native after %ld entries", n);
+                } else {
+                    LOG_F(INFO, "JIT: heat gate off, every block goes native at once");
+                }
             }
         }
     }
 
     dppc_jit::backend_label = dppc_jit::native_backend
-        ? std::string(dppc_jit::native_backend->name()) + " over " +
-          dppc_jit::threaded_backend->name()
+        ? std::string(dppc_jit::native_backend->name()) + " over interpreter"
         : dppc_jit::threaded_backend->name();
 
     ppc_code_cache_set_release_cb(dppc_jit::on_block_released);
@@ -842,6 +848,12 @@ const char* ppc_jit_backend_name() {
     return dppc_jit::backend_label.c_str();
 }
 
+/** Clang's function-type sanitizer expects compiler metadata before every
+    indirect-call target. The sole indirect call below enters generated code,
+    which cannot carry that metadata. Other ASan/UBSan checks stay enabled. */
+#if defined(__clang__)
+__attribute__((no_sanitize("function")))
+#endif
 void ppc_jit_exec_inner(JitExecType type, uint32_t goal_addr) {
     exec_flags = 0;
 
@@ -865,7 +877,7 @@ void ppc_jit_exec_inner(JitExecType type, uint32_t goal_addr) {
         dppc_jit::drain_pending_free();
 
         const uint32_t entry_pc = ppc_state.pc;
-        dppc_jit::JitBlock* blk = dppc_jit::find_or_translate(entry_pc, true);
+        dppc_jit::JitBlock* blk = dppc_jit::find_or_translate(entry_pc, true, true);
 
         dppc_jit::trace_block(blk);
 

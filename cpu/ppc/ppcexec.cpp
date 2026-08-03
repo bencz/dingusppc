@@ -726,8 +726,8 @@ do { \
 
 void initialize_ppc_opcode_table() {
     auto opcodeGrabberSize = sizeof(OpcodeGrabber) / sizeof(OpcodeGrabber[0]);
-    std::fill_n(OpcodeGrabber, opcodeGrabberSize, ppc_illegalop);
-    std::fill_n(OpcodeGrabberNoFPU, opcodeGrabberSize, ppc_illegalop);
+    std::fill_n(OpcodeGrabber, opcodeGrabberSize, &ppc_illegalop);
+    std::fill_n(OpcodeGrabberNoFPU, opcodeGrabberSize, &ppc_illegalop);
 
     OP(3,  ppc_twi);
     //OP(4,  ppc_opcode4); - Altivec instructions not emulated yet. Uncomment once they're implemented.

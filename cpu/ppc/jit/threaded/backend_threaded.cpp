@@ -411,7 +411,6 @@ public:
         blk->end_reason = uint8_t(ir.end_reason);
         blk->entry      = threaded_entry;
         blk->payload    = payload;
-        blk->heat       = 0;
         blk->code       = nullptr; // ordinary C++, there is no frame to share
         blk->owner      = nullptr; // the facade fills this in
         blk->chain_in     = nullptr;

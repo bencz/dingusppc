@@ -91,7 +91,7 @@ public:
     }
 
     JitBlock* compile(const IRBlock&) override {
-        return nullptr; // no emitter yet, declined blocks land on the threaded backend
+        return nullptr; // minimal bring-up: the interpreter remains the fallback
     }
 
     void release(JitBlock*) override {}

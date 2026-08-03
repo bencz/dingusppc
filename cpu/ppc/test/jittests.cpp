@@ -41,6 +41,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include <cstdlib>
 #include <iostream>
+#include <string>
 
 using namespace std;
 
@@ -142,6 +143,14 @@ static RunResult run_test_code(uint32_t goal = CODE_END) {
 
 static bool same_run(const RunResult& a, const RunResult& b) {
     return a.r3 == b.r3 && a.ctr == b.ctr && a.pc == b.pc && a.retired == b.retired;
+}
+
+static void set_test_heat(bool gated) {
+#if defined(_WIN32)
+    _putenv(gated ? "DPPC_JIT_HEAT=3" : "DPPC_JIT_HEAT=0");
+#else
+    setenv("DPPC_JIT_HEAT", gated ? "3" : "0", 1);
+#endif
 }
 
 /** Interpreter and JIT have to agree on everything observable */
@@ -266,7 +275,9 @@ static void test_native_matches_threaded(const RunResult& interp) {
     ppc_jit_disable();
 
     if (!ppc_jit_enable(JitBackend::automatic)) {
-        jit_check(false, "the automatic backend came up");
+        RunResult automatic = run_test_code();
+        jit_check(!ppc_jit_is_enabled() && same_run(interp, automatic),
+                  "a host without an emitter stays on the interpreter");
         return;
     }
     RunResult automatic = run_test_code();
@@ -288,6 +299,72 @@ static void test_native_matches_threaded(const RunResult& interp) {
     RunResult again = run_test_code();
     jit_check(same_run(threaded, again), "and still matches on a cached second run");
     jit_check(ppc_jit_native_compiles() == 2, "the second run recompiled nothing");
+}
+
+/** Automatic mode leaves cold code on the ordinary interpreter. The heat
+    counter must represent real entries, survive without a placeholder block,
+    and start over when the translation cache is flushed. */
+static void test_interpreter_heat_gate() {
+    ppc_jit_disable();
+
+    // One interpreted instruction per run gives the threshold an exact,
+    // observable unit. The reference is collected while the JIT is off.
+    constexpr uint32_t ONE_INSN_GOAL = CODE_BASE + 4;
+    const RunResult interp_one = run_test_code(ONE_INSN_GOAL);
+
+    set_test_heat(true);
+    if (!ppc_jit_enable(JitBackend::automatic)) {
+        const RunResult fallback = run_test_code(ONE_INSN_GOAL);
+        jit_check(!ppc_jit_is_enabled() && same_run(interp_one, fallback),
+                  "automatic mode without an emitter stays on the interpreter");
+        set_test_heat(false);
+        return;
+    }
+
+    const string backend = ppc_jit_backend_name() ? ppc_jit_backend_name() : "";
+    jit_check(backend.find("interpreter") != string::npos,
+              "automatic mode identifies the interpreter fallback");
+    jit_check(backend.find("threaded") == string::npos,
+              "automatic mode does not select the threaded backend");
+
+    RunResult first  = run_test_code(ONE_INSN_GOAL);
+    RunResult second = run_test_code(ONE_INSN_GOAL);
+    jit_check(same_run(interp_one, first) && same_run(interp_one, second),
+              "cold entries execute exactly like the interpreter");
+    jit_check(ppc_jit_num_blocks() == 0 && ppc_jit_native_compiles() == 0,
+              "two entries stay below a heat threshold of three");
+    jit_check(ppc_jit_threaded_compiles() == 0,
+              "cold automatic entries create no threaded blocks");
+
+    ppc_jit_flush();
+    RunResult after_flush = run_test_code(ONE_INSN_GOAL);
+    RunResult second_after_flush = run_test_code(ONE_INSN_GOAL);
+    jit_check(same_run(interp_one, after_flush) &&
+                  same_run(interp_one, second_after_flush),
+              "flushed hotness still falls back correctly");
+    jit_check(ppc_jit_num_blocks() == 0 && ppc_jit_native_compiles() == 0,
+              "a cache flush resets the heat interval");
+
+    RunResult threshold = run_test_code(ONE_INSN_GOAL);
+    jit_check(same_run(interp_one, threshold),
+              "the threshold entry remains architecturally identical");
+    jit_check(ppc_jit_threaded_compiles() == 0,
+              "crossing the automatic heat threshold never uses threaded");
+
+    if (ppc_jit_native_compiles()) {
+        jit_check(ppc_jit_native_compiles() == 1 && ppc_jit_num_blocks() == 1,
+                  "the third real entry emits exactly one native block");
+    } else {
+        // The deliberately minimal AArch64 bring-up currently declines every
+        // block. Its important contract here is still interpreter fallback.
+        jit_check(ppc_jit_num_blocks() == 0,
+                  "a host emitter decline leaves no placeholder block");
+    }
+
+    ppc_jit_disable();
+    set_test_heat(false);
+    jit_check(ppc_jit_enable(JitBackend::automatic),
+              "the automatic backend returned with the heat gate disabled");
 }
 
 /*  One per opcode of the emitted subset, plus forms that exercise register
@@ -1960,7 +2037,7 @@ static uint32_t run_chain_code(bool until) {
 static void test_native_chaining() {
     ppc_jit_disable();
     if (!ppc_jit_enable(JitBackend::automatic)) {
-        jit_check(false, "the JIT came up for the chaining test");
+        cout << "  (no emitter on this host, skipping native chaining)" << endl;
         return;
     }
     ppc_jit_flush();
@@ -2023,13 +2100,9 @@ int test_jit() {
     jit_tested = 0;
     jit_failed = 0;
 
-    // the heat gate would keep every block threaded through these short
-    // programs and quietly skip the native comparisons, which are the point
-#if defined(_WIN32)
-    _putenv("DPPC_JIT_HEAT=0");
-#else
-    setenv("DPPC_JIT_HEAT", "0", 1);
-#endif
+    // These short programs are emitter coverage tests, so compile on their
+    // first entry except in the dedicated heat-gate test below.
+    set_test_heat(false);
 
     MPC106* host_bridge = new MPC106;
 
@@ -2048,8 +2121,18 @@ int test_jit() {
     RunResult interp     = run_test_code();
     RunResult interp_mid = run_test_code(MID_BLOCK);
 
-    if (!ppc_jit_enable()) {
-        cout << "  Failed: the JIT refused to come up" << endl;
+    // Cache and invalidation tests need real blocks. Probe automatic mode
+    // first; the minimal AArch64 bring-up and hosts without an emitter use
+    // explicit threaded blocks for those machinery tests, while automatic
+    // interpreter fallback is verified separately below.
+    bool have_emitter = false;
+    if (ppc_jit_enable(JitBackend::automatic)) {
+        run_test_code();
+        have_emitter = ppc_jit_native_compiles() != 0;
+        ppc_jit_disable();
+    }
+    if (!ppc_jit_enable(have_emitter ? JitBackend::automatic : JitBackend::threaded)) {
+        cout << "  Failed: no JIT test backend came up" << endl;
         return 1;
     }
     jit_check(ppc_jit_is_enabled(), "the JIT reports itself enabled");
@@ -2061,6 +2144,7 @@ int test_jit() {
     test_mode_is_part_of_the_key(interp);
     test_mid_block_goal(interp_mid);
     test_native_matches_threaded(interp);
+    test_interpreter_heat_gate();
     test_alu_subset();
     test_load_subset();
     test_store_subset();

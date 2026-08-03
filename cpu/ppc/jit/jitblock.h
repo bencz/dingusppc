@@ -87,16 +87,9 @@ struct JitBlock {
         the next compile of this size. Zero when nothing was emitted */
     uint32_t    code_bytes = 0;
 
-    /** Who produced it. A native backend declining a block sends it to the
-        threaded one, so within a single run blocks can come from either and
-        each has to go home to be released */
+    /** Who produced it, so invalidation can return it to the selected
+        backend. Automatic and explicit-threaded modes never mix owners. */
     Backend*    owner;
-
-    /** Entries seen while the block is still threaded. A block is only
-        emitted once this crosses the promotion threshold, which is what
-        keeps code that runs once, of which a booting system has megabytes,
-        from ever paying for the emitter */
-    uint32_t    heat;
 
     /** Chain slots elsewhere that jump straight into this block, so they can
         all go back to resolving the moment it dies. The entries live in the

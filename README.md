@@ -66,8 +66,8 @@ It is off by default. To turn it on, pass the flag:
 ```
 
 The `DPPC_JIT` environment variable does the same and overrides the flag: `1` enables, `0` disables, and
-`threaded` selects a portable fallback backend that exists for testing. The debugger always runs on the
-interpreter.
+`threaded` explicitly selects a portable differential-test backend. In normal JIT mode, cold instructions
+and blocks declined by the native emitter run on the interpreter. The debugger always uses the interpreter.
 
 ## How to Compile
 

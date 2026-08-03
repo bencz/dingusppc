@@ -76,8 +76,8 @@ inline bool ppc_jit_is_enabled() {
 }
 
 enum class JitBackend {
-    /** Emitter for this host if there is one, threaded for whatever it
-        declines. What a normal run wants */
+    /** Emitter for this host, with the ordinary interpreter handling cold
+        or declined instructions. What a normal run wants */
     automatic,
 
     /** Threaded only, ignoring any emitter. The tests use it to run the same
@@ -90,9 +90,8 @@ enum class JitBackend {
     running on the interpreter.
 
     The threaded backend executes a block by calling the interpreter helpers
-    in sequence. It is not faster than the interpreter, it exists so the rest
-    of the machinery has something to run in a WebAssembly build, and so an
-    emitter always has somewhere to send the blocks it declines */
+    in sequence. It is not the automatic fallback and is not expected to be
+    faster; it remains available explicitly for differential tests */
 bool ppc_jit_enable(JitBackend choice = JitBackend::automatic);
 
 /** Drops every block and goes back to the interpreter */

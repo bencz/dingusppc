@@ -58,7 +58,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     Call. A Call is always preceded by the writeback of every cached guest
     register, which consumes the values, and followed by dropping the cache,
     so nothing defined before it can be read after. If the pool ever runs dry
-    the block is declined and the threaded backend takes it, which is the same
+    the block is declined and the interpreter takes it, which is the same
     escape hatch used for opcodes outside the emitted subset.
  */
 
@@ -241,9 +241,8 @@ public:
 
         uint8_t* dst = this->code.alloc_writable(this->asmb.size());
         if (!dst) {
-            // the region is full. Declining sends this block to the threaded
-            // backend; the flag asks the caller for a flush so the next one
-            // does not have to go the same way
+            // The region is full. The flag asks the facade for a whole-pool
+            // flush before it gives this block back to the interpreter.
             this->full = true;
             LOG_F(INFO, "JIT: code memory full after %zu bytes", this->code.used());
             return nullptr;
@@ -287,7 +286,6 @@ public:
         blk->end_reason = uint8_t(ir.end_reason);
         blk->entry      = this->trampoline;
         blk->payload    = nullptr; // the code is the payload, and it is pooled
-        blk->heat       = 0;
         blk->code       = dst;
         blk->code_bytes = uint32_t(this->asmb.size());
         blk->owner      = nullptr; // the facade fills this in
@@ -850,7 +848,7 @@ private:
             dst = rb;
         } else {
             if (!free_mask) {
-                LOG_F(INFO, "JIT: out of host registers, block goes to the threaded backend");
+                LOG_F(INFO, "JIT: out of host registers, block goes to the interpreter");
                 return false;
             }
             dst = X64Gpr(lowest_bit(free_mask));
@@ -953,7 +951,7 @@ private:
         The scratch register carries the carry in and out, since nothing else
         may touch the flags between the operation and the setcc. One more
         register is needed for the XER merge; a block too pressured to have
-        one goes to the threaded backend like any other allocation failure */
+        one goes to the interpreter like any other allocation failure */
     bool emit_carry(const IRInsn& in, size_t idx, uint32_t& free_mask) {
         const X64Gpr ra = X64Gpr(this->reg_of[in.a]);
         const X64Gpr rb = X64Gpr(this->reg_of[in.b]);
@@ -1962,7 +1960,7 @@ const AbiDesc& abi_for_host() {
 std::unique_ptr<Backend> make_x86_64_backend() {
     X86_64Backend* backend = new X86_64Backend(abi_for_host());
     if (!backend->init()) {
-        LOG_F(WARNING, "JIT: no code memory, falling back to the threaded backend");
+        LOG_F(WARNING, "JIT: no code memory, leaving execution on the interpreter");
         delete backend;
         return nullptr;
     }
