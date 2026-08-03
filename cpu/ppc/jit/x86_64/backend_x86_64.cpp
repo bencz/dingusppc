@@ -149,11 +149,12 @@ constexpr X64Gpr REG_SCRATCH = R11;
     on a terminal path straight to dispatch, so chained exits may preserve it
     instead of zeroing an already-zero callee-saved register. */
 
-/** The timing globals are reached as displacements from &ppc_state rather
+/** Hot runtime globals are reached as displacements from &ppc_state rather
     than each through an immediate of its own, which would be ten bytes and a
-    scratch register apiece on a path taken before every helper call.
+    scratch register apiece. This covers timing state and the current TLB
+    pointers, both read on generated hot paths.
 
-    They are ordinary statics in the same image, so the distance is kilobytes
+    They are ordinary globals in the same image, so the distance is kilobytes
     and a displacement covers it with room to spare. init measures rather than
     assumes, and declines the backend if it ever turns out otherwise */
 constexpr X64Gpr REG_TIME = REG_STATE;
@@ -198,6 +199,11 @@ constexpr int32_t TLB_PHYS_OFFSET  = int32_t(offsetof(TLBEntry, phys_tag));
     needs updating. Both are work the emitted path does not do */
 constexpr uint32_t TLB_STORE_READY = TLBFlags::PAGE_WRITABLE | TLBFlags::PTE_SET_C;
 constexpr uint8_t TLB_ENTRY_SHIFT = 5; // sizeof(TLBEntry) == 32
+constexpr uint8_t TLB_INDEX_SHIFT = PPC_PAGE_SIZE_BITS - TLB_ENTRY_SHIFT;
+constexpr uint32_t TLB_INDEX_MASK = (TLB_SIZE - 1) << TLB_ENTRY_SHIFT;
+static_assert(sizeof(TLBEntry) == (size_t(1) << TLB_ENTRY_SHIFT));
+static_assert((TLB_SIZE & (TLB_SIZE - 1)) == 0);
+static_assert(PPC_PAGE_SIZE_BITS > TLB_ENTRY_SHIFT);
 
 constexpr size_t MAX_BLOCK_BYTES = 64 * 1024;
 constexpr uint8_t NO_REG = 0xFF;
@@ -209,8 +215,8 @@ public:
           pool(abi_usable_gprs(abi) & abi.volatile_gprs & ~bit(REG_SCRATCH)) {}
 
     bool init() {
-        if (!this->measure_time_globals()) {
-            LOG_F(WARNING, "JIT: timing globals too far from the register file");
+        if (!this->measure_runtime_globals()) {
+            LOG_F(WARNING, "JIT: runtime globals too far from the register file");
             return false;
         }
         // the tail holds the chain slots, a few dozen bytes per block worst
@@ -669,6 +675,22 @@ private:
         return true;
     }
 
+    /** Forms the byte address of a primary TLB entry.
+
+        ((va >> page_shift) & (entries - 1)) << entry_shift
+        is exactly
+        (va >> (page_shift - entry_shift)) & ((entries - 1) << entry_shift).
+
+        Folding the final scale into the shift removes one ALU instruction.
+        Loading the current table pointer relative to pinned ppc_state removes
+        the movabs that used to materialise the address of the pointer first. */
+    void emit_tlb1_entry(X64Gpr dst, X64Gpr va, int32_t table_disp) {
+        this->asmb.mov_reg_reg32(dst, va);
+        this->asmb.shr_reg_imm8(dst, TLB_INDEX_SHIFT);
+        this->asmb.and_reg_imm32(dst, TLB_INDEX_MASK);
+        this->asmb.add_reg64_mem(dst, REG_STATE, table_disp);
+    }
+
     /** The inline revalidation emit_va_chained_exit describes. RDX holds the
         target address and stays untouched for the thunk's sake; RAX and the
         scratch register are free here, nothing being live at an exit */
@@ -676,13 +698,7 @@ private:
                        uint32_t* phys, uint64_t* gen, void** code) {
         this->asmb.bind(probe);
 
-        // entry = pCurITLB1 + ((va >> 12) & tlb_size_mask) * sizeof(TLBEntry)
-        this->asmb.mov_reg_reg32(RAX, RDX);
-        this->asmb.shr_reg_imm8(RAX, PPC_PAGE_SIZE_BITS);
-        this->asmb.and_reg_imm32(RAX, TLB_SIZE - 1);
-        this->asmb.shl_reg_imm8(RAX, TLB_ENTRY_SHIFT);
-        this->asmb.mov_reg_imm64(REG_SCRATCH, uint64_t(uintptr_t(&pCurITLB1)));
-        this->asmb.add_reg64_mem(RAX, REG_SCRATCH, 0);
+        this->emit_tlb1_entry(RAX, RDX, this->itlb1_disp);
 
         // fresh under the current epoch?
         this->asmb.mov_reg_reg32(REG_SCRATCH, RDX);
@@ -728,13 +744,7 @@ private:
 
         this->asmb.lea_reg_mem(RDX, REG_ENTRYPC, in.offset);
 
-        // entry = pCurITLB1 + ((va >> 12) & tlb_size_mask) * sizeof(TLBEntry)
-        this->asmb.mov_reg_reg32(RAX, RDX);
-        this->asmb.shr_reg_imm8(RAX, PPC_PAGE_SIZE_BITS);
-        this->asmb.and_reg_imm32(RAX, TLB_SIZE - 1);
-        this->asmb.shl_reg_imm8(RAX, TLB_ENTRY_SHIFT);
-        this->asmb.mov_reg_imm64(REG_SCRATCH, uint64_t(uintptr_t(&pCurITLB1)));
-        this->asmb.add_reg64_mem(RAX, REG_SCRATCH, 0);
+        this->emit_tlb1_entry(RAX, RDX, this->itlb1_disp);
 
         // fresh under the current epoch, and still the physical page the
         // walk through was translated against?
@@ -1562,13 +1572,7 @@ private:
         X64Emitter::Label slow = this->asmb.new_label();
         X64Emitter::Label done = this->asmb.new_label();
 
-        // entry = pCurDTLB1 + ((ea >> 12) & tlb_size_mask) * sizeof(TLBEntry)
-        this->asmb.mov_reg_reg32(rtmp, rea);
-        this->asmb.shr_reg_imm8(rtmp, PPC_PAGE_SIZE_BITS);
-        this->asmb.and_reg_imm32(rtmp, TLB_SIZE - 1);
-        this->asmb.shl_reg_imm8(rtmp, TLB_ENTRY_SHIFT);
-        this->asmb.mov_reg_imm64(REG_SCRATCH, uint64_t(uintptr_t(&pCurDTLB1)));
-        this->asmb.add_reg64_mem(rtmp, REG_SCRATCH, 0);
+        this->emit_tlb1_entry(rtmp, rea, this->dtlb1_disp);
 
         // entry->tag == (ea & ~0xFFF) | dtlb_epoch ? An entry filled under an
         // older epoch mismatches by construction, which is the whole flush
@@ -1758,12 +1762,7 @@ private:
         X64Emitter::Label slow = this->asmb.new_label();
         X64Emitter::Label done = this->asmb.new_label();
 
-        this->asmb.mov_reg_reg32(rtmp, rea);
-        this->asmb.shr_reg_imm8(rtmp, PPC_PAGE_SIZE_BITS);
-        this->asmb.and_reg_imm32(rtmp, TLB_SIZE - 1);
-        this->asmb.shl_reg_imm8(rtmp, TLB_ENTRY_SHIFT);
-        this->asmb.mov_reg_imm64(REG_SCRATCH, uint64_t(uintptr_t(&pCurDTLB1)));
-        this->asmb.add_reg64_mem(rtmp, REG_SCRATCH, 0);
+        this->emit_tlb1_entry(rtmp, rea, this->dtlb1_disp);
 
         this->asmb.mov_reg_reg32(rtag, rea);
         this->asmb.and_reg_imm32(rtag, PPC_PAGE_MASK);
@@ -1978,20 +1977,24 @@ private:
         }
     }
 
-    bool measure_time_globals() {
+    bool measure_runtime_globals() {
         const int64_t icyc  = disp_from_state(&g_icycles);
         const int64_t dline = disp_from_state(&g_icycles_max);
         const int64_t timer = disp_from_state(const_cast<const bool*>(&exec_timer));
         const int64_t gen   = disp_from_state(&mmu_itrans_generation);
         const int64_t depo  = disp_from_state(&g_dtlb_epoch);
         const int64_t iepo  = disp_from_state(&g_itlb_epoch);
+        const int64_t dtlb1 = disp_from_state(&pCurDTLB1);
+        const int64_t itlb1 = disp_from_state(&pCurITLB1);
 
         if (icyc  < INT32_MIN || icyc  > INT32_MAX ||
             dline < INT32_MIN || dline > INT32_MAX ||
             timer < INT32_MIN || timer > INT32_MAX ||
             gen   < INT32_MIN || gen   > INT32_MAX ||
             depo  < INT32_MIN || depo  > INT32_MAX ||
-            iepo  < INT32_MIN || iepo  > INT32_MAX) {
+            iepo  < INT32_MIN || iepo  > INT32_MAX ||
+            dtlb1 < INT32_MIN || dtlb1 > INT32_MAX ||
+            itlb1 < INT32_MIN || itlb1 > INT32_MAX) {
             return false;
         }
 
@@ -2001,6 +2004,8 @@ private:
         this->gen_disp      = int32_t(gen);
         this->depoch_disp   = int32_t(depo);
         this->iepoch_disp   = int32_t(iepo);
+        this->dtlb1_disp    = int32_t(dtlb1);
+        this->itlb1_disp    = int32_t(itlb1);
         return true;
     }
 
@@ -2051,6 +2056,8 @@ private:
     int32_t               gen_disp      = 0;
     int32_t               depoch_disp   = 0;
     int32_t               iepoch_disp   = 0;
+    int32_t               dtlb1_disp    = 0;
+    int32_t               itlb1_disp    = 0;
 
     /** Guest instructions of the block already handed to the retired counter
         by a settling point, so every exit knows what is still owed */
