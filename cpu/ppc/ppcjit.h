@@ -103,8 +103,9 @@ void ppc_jit_flush();
 /** Block executing counterpart of ppc_exec_inner. Runs until power goes off,
     or until the PC reaches goal_addr when type is `until`.
 
-    Untranslatable instructions and modes fall back to the interpreter one
-    instruction at a time, so this always makes progress */
+    Cold code runs in bounded interpreter spans between control-flow
+    boundaries. Untranslatable instructions and modes fall back one at a
+    time, so this always makes progress */
 void ppc_jit_exec_inner(JitExecType type, uint32_t goal_addr);
 
 /** How many blocks the backend is currently holding. For the tests */

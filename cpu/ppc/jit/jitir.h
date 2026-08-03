@@ -403,6 +403,35 @@ extern bool jit_pool_recycle;
     translation observed too rarely */
 extern bool jit_sync_every_call;
 
+/** The uncommon primary-31 half of jit_fallback_ends_span. Kept out of line
+    so the per-instruction common path below stays small. */
+bool jit_fallback_group31_ends_span(uint32_t opcode);
+
+/** True when the interpreter just crossed a boundary at which a cold span
+    must return control to the JIT. This is deliberately conservative beside
+    the superblock translator: every guest branch ends a cold span, including
+    a conditional branch that fell through, while context-changing operations
+    stop before the next instruction fetch can observe a new mapping. */
+inline bool jit_fallback_ends_span(uint32_t opcode) {
+    switch (opcode >> 26) {
+    case 16: // bc and friends
+    case 18: // b and friends
+    case 17: // sc
+        return true;
+    case 19: {
+        const uint32_t ext = (opcode >> 1) & 0x3FF;
+        return ext == 16 ||    // bclr
+               ext == 528 ||   // bcctr
+               ext == 50 ||    // rfi
+               ext == 150;     // isync
+    }
+    case 31:
+        return jit_fallback_group31_ends_span(opcode);
+    default:
+        return false;
+    }
+}
+
 /** Decodes guest code into `out`.
 
     `code` points at the first instruction in host memory and `phys_addr` is

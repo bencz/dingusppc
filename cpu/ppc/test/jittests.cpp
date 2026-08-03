@@ -145,12 +145,41 @@ static bool same_run(const RunResult& a, const RunResult& b) {
     return a.r3 == b.r3 && a.ctr == b.ctr && a.pc == b.pc && a.retired == b.retired;
 }
 
-static void set_test_heat(bool gated) {
+constexpr uint32_t COLD_PAGE_BASE = 0x1FF8;
+constexpr uint32_t COLD_PAGE_END  = 0x2004;
+
+/** Three addi instructions with the page seam between the second and third.
+    A cold span may carry its host pointer to 0x1FFC, but must return for an
+    honest fetch before executing 0x2000. */
+static RunResult run_cold_page_code() {
+    constexpr uint32_t ADDI_R3 = 0x38630001;
+    for (uint32_t addr = COLD_PAGE_BASE; addr < COLD_PAGE_END; addr += 4) {
+        mmu_write_vmem<uint32_t>(NO_OPCODE, addr, ADDI_R3);
+    }
+    mmu_write_vmem<uint32_t>(NO_OPCODE, COLD_PAGE_END, 0);
+
+    ppc_state.pc            = COLD_PAGE_BASE;
+    ppc_state.gpr[3]        = 0;
+    ppc_state.spr[SPR::CTR] = 0;
+    g_icycles               = 0;
+    g_icycles_max           = 0;
+    exec_flags              = 0;
+    power_on                = true;
+
+    ppc_exec_until(COLD_PAGE_END);
+    return {ppc_state.gpr[3], ppc_state.spr[SPR::CTR], ppc_state.pc, g_icycles};
+}
+
+static void set_test_heat_value(const char* value) {
 #if defined(_WIN32)
-    _putenv(gated ? "DPPC_JIT_HEAT=3" : "DPPC_JIT_HEAT=0");
+    _putenv_s("DPPC_JIT_HEAT", value);
 #else
-    setenv("DPPC_JIT_HEAT", gated ? "3" : "0", 1);
+    setenv("DPPC_JIT_HEAT", value, 1);
 #endif
+}
+
+static void set_test_heat(bool gated) {
+    set_test_heat_value(gated ? "3" : "0");
 }
 
 /** Interpreter and JIT have to agree on everything observable */
@@ -311,8 +340,19 @@ static void test_interpreter_heat_gate() {
     // observable unit. The reference is collected while the JIT is off.
     constexpr uint32_t ONE_INSN_GOAL = CODE_BASE + 4;
     const RunResult interp_one = run_test_code(ONE_INSN_GOAL);
+    const RunResult interp_full = run_test_code();
+    const RunResult interp_page = run_cold_page_code();
 
-    set_test_heat(true);
+    jit_check(!dppc_jit::jit_fallback_ends_span(0x38630001) &&
+                  dppc_jit::jit_fallback_ends_span(0x42000000) &&
+                  dppc_jit::jit_fallback_ends_span(0x7C000124),
+              "cold spans classify arithmetic, branch and context boundaries");
+
+    // Keep the complete setup-and-loop program below its threshold. Besides
+    // parity, its final bdnz is a conditional branch that falls through: the
+    // cold span must still return at that boundary so ppc_exec_until observes
+    // CODE_END before the illegal word there executes.
+    set_test_heat_value("100");
     if (!ppc_jit_enable(JitBackend::automatic)) {
         const RunResult fallback = run_test_code(ONE_INSN_GOAL);
         jit_check(!ppc_jit_is_enabled() && same_run(interp_one, fallback),
@@ -320,6 +360,30 @@ static void test_interpreter_heat_gate() {
         set_test_heat(false);
         return;
     }
+
+    const RunResult cold_span = run_test_code();
+    jit_check(same_run(interp_full, cold_span),
+              "a bounded cold interpreter span matches the interpreter");
+    const RunResult cold_page = run_cold_page_code();
+    jit_check(same_run(interp_page, cold_page) && cold_page.r3 == 3 &&
+                  cold_page.retired == 3,
+              "a cold interpreter span stops safely at a page boundary");
+
+    const uint32_t saved_block_limit = dppc_jit::jit_max_block_insns;
+    dppc_jit::jit_max_block_insns = 1;
+    const RunResult single_step_span = run_test_code();
+    dppc_jit::jit_max_block_insns = saved_block_limit;
+    jit_check(same_run(interp_full, single_step_span),
+              "a one-instruction cold span preserves exact fallback behaviour");
+
+    jit_check(ppc_jit_num_blocks() == 0 && ppc_jit_native_compiles() == 0 &&
+                  ppc_jit_threaded_compiles() == 0,
+              "a below-threshold span creates no backend blocks");
+
+    ppc_jit_disable();
+    set_test_heat(true);
+    jit_check(ppc_jit_enable(JitBackend::automatic),
+              "the automatic backend returned for the exact heat test");
 
     const string backend = ppc_jit_backend_name() ? ppc_jit_backend_name() : "";
     jit_check(backend.find("interpreter") != string::npos,

@@ -79,7 +79,7 @@ IRBlock scratch_ir;
 unsigned native_compiles   = 0;
 unsigned threaded_compiles = 0;
 
-/** Interpreted entries a block collects before the emitter is asked.
+/** Interpreted block entries a candidate collects before the emitter is asked.
 
     A booting system runs megabytes of code exactly once: loaders, linkers,
     initialisation that never comes back. Emitting all of it cost more than
@@ -360,8 +360,10 @@ void flush_everything() {
     the stub's own lookup does the flushing on safe ground.
 
     count_heat is true only at the outer execution loop, immediately before
-    an interpreted instruction really runs. Resolver and dispatch probes do
-    not count, otherwise one cold entry can be charged several times.
+    an interpreted candidate block really runs. Resolver and dispatch probes
+    do not count, otherwise one cold entry can be charged several times. A
+    bounded cold span returns here at every guest control-flow boundary, so a
+    tight loop still contributes exactly one entry per iteration.
 
     When interp_code is supplied, it receives the translated host instruction
     pointer. The outer loop reuses it if this lookup leaves the instruction to
@@ -370,9 +372,13 @@ void flush_everything() {
     Can unwind out of mmu_translate_imem on an instruction fetch fault, which
     is fine: no generated frame is on the stack at this point */
 JitBlock* find_or_translate(uint32_t virt_addr, bool allow_flush, bool count_heat,
-                            const uint8_t** interp_code = nullptr) {
+                            const uint8_t** interp_code = nullptr,
+                            bool* cold_fallback = nullptr) {
     if (interp_code) {
         *interp_code = nullptr;
+    }
+    if (cold_fallback) {
+        *cold_fallback = false;
     }
 #if SUPPORTS_PPC_LITTLE_ENDIAN_MODE
     if (ppc_state.is_LE) [[unlikely]] {
@@ -400,6 +406,9 @@ JitBlock* find_or_translate(uint32_t virt_addr, bool allow_flush, bool count_hea
     // compiled immediately, because its purpose is differential testing.
     if (native_backend && heat_threshold &&
         (!count_heat || !heat_ready(block_key(phys_addr, mode)))) {
+        if (cold_fallback && count_heat) {
+            *cold_fallback = true;
+        }
         return nullptr;
     }
 
@@ -538,17 +547,43 @@ bool goal_splits_block(const JitBlock* blk, uint32_t entry_pc) {
     pc_real is normally the translation already obtained by find_or_translate;
     little-endian mode reaches here without one and translates on demand.
     Leaves the PC and exec_flags exactly as a block would */
-void interpret_one(const uint8_t* pc_real) {
+uint32_t interpret_one(const uint8_t* pc_real,
+                       uint64_t& deadline = g_icycles_max) {
     if (!pc_real) {
         pc_real = mmu_translate_imem(ppc_state.pc);
     }
     uint32_t opcode  = ppc_read_instruction(pc_real);
 
     ppc_main_opcode(ppc_opcode_grabber, opcode);
-    ppc_account_cycles(1);
+    ppc_account_cycles(1, deadline);
 
     if (!exec_flags) {
         ppc_state.pc += 4;
+    }
+    return opcode;
+}
+
+/** Runs one cold candidate block through the ordinary instruction helpers.
+
+    Returning to find_or_translate after every instruction made cache lookup,
+    hotness accounting and dispatch cost several times more than executing the
+    instruction. The translator has not inspected cold code yet, so this uses
+    conservative boundaries and the same hard instruction budget. It only
+    serves the below-threshold path: an actual translator or emitter decline
+    still executes exactly one instruction before the next lookup. */
+void interpret_cold_span(const uint8_t* pc_real) {
+    uint64_t deadline = g_icycles_max;
+    for (uint32_t i = 0; i < jit_max_block_insns; i++) {
+        const uint32_t opcode = interpret_one(pc_real, deadline);
+
+        if (!power_on || exec_flags || jit_fallback_ends_span(opcode) ||
+            (run_type == JitExecType::until && ppc_state.pc == run_goal) ||
+            i + 1 == jit_max_block_insns ||
+            (ppc_state.pc & ~PPC_PAGE_MASK) == 0) {
+            return;
+        }
+
+        pc_real += 4;
     }
 }
 
@@ -893,8 +928,10 @@ void ppc_jit_exec_inner(JitExecType type, uint32_t goal_addr) {
 
         const uint32_t entry_pc = ppc_state.pc;
         const uint8_t* interp_code = nullptr;
+        bool cold_fallback = false;
         dppc_jit::JitBlock* blk =
-            dppc_jit::find_or_translate(entry_pc, true, true, &interp_code);
+            dppc_jit::find_or_translate(
+                entry_pc, true, true, &interp_code, &cold_fallback);
 
         dppc_jit::trace_block(blk);
 
@@ -908,7 +945,11 @@ void ppc_jit_exec_inner(JitExecType type, uint32_t goal_addr) {
             // something here has to be dealt with
             blk->entry(blk);
         } else {
-            dppc_jit::interpret_one(interp_code);
+            if (cold_fallback && !dppc_jit::trace_enabled) {
+                dppc_jit::interpret_cold_span(interp_code);
+            } else {
+                dppc_jit::interpret_one(interp_code);
+            }
         }
 
         if (exec_flags) {

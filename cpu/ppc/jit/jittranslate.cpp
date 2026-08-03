@@ -958,6 +958,10 @@ bool decode_alu(Builder& b, uint32_t op) {
 
 } // namespace
 
+bool jit_fallback_group31_ends_span(uint32_t opcode) {
+    return ends_context(opcode);
+}
+
 bool translate_block(uint32_t virt_addr, uint32_t phys_addr, const uint8_t* code,
                      uint32_t mode, IRBlock& out)
 {
