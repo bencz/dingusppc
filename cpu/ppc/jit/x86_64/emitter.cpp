@@ -246,13 +246,20 @@ void X64Emitter::lea_reg_reg32(X64Gpr dst, X64Gpr base, X64Gpr index) {
     }
 }
 
-/** ALU forms with a 32 bit immediate share opcode 0x81 and differ only in the
-    ModRM extension: /0 add, /1 or, /4 and, /6 xor, /7 cmp */
+/** ALU forms with an immediate share their ModRM extension: /0 add, /1 or,
+    /4 and, /6 xor, /7 cmp. 0x83 sign extends its byte, so it is both shorter
+    and exactly equivalent whenever the 32-bit immediate is a signed byte. */
 void X64Emitter::alu_reg_imm32(uint8_t ext, X64Gpr dst, uint32_t imm) {
     this->rex(false, 0, uint8_t(dst));
-    this->emit8(0x81);
-    this->modrm_reg(ext, uint8_t(dst));
-    this->emit32(imm);
+    if (fits_int8(int32_t(imm))) {
+        this->emit8(0x83);
+        this->modrm_reg(ext, uint8_t(dst));
+        this->emit8(uint8_t(int8_t(imm)));
+    } else {
+        this->emit8(0x81);
+        this->modrm_reg(ext, uint8_t(dst));
+        this->emit32(imm);
+    }
 }
 
 void X64Emitter::add_reg_reg32(X64Gpr dst, X64Gpr src) {
@@ -508,10 +515,7 @@ void X64Emitter::add_reg_imm32(X64Gpr dst, uint32_t imm) {
     if (imm == 0) {
         return;
     }
-    this->rex(false, 0, uint8_t(dst));
-    this->emit8(0x81);
-    this->modrm_reg(0, uint8_t(dst)); // /0 is add
-    this->emit32(imm);
+    this->alu_reg_imm32(0, dst, imm);
 }
 
 void X64Emitter::inc_reg32(X64Gpr dst) {

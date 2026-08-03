@@ -787,11 +787,49 @@ private:
     void plan_lifetimes(const IRBlock& ir) {
         this->last_use.assign(ir.insns.size(), 0);
         this->reg_of.assign(ir.insns.size(), NO_REG);
+        this->immediate_const.assign(ir.insns.size(), 0);
+        this->immediate_value.assign(ir.insns.size(), 0);
+
+        std::vector<uint16_t> use_count(ir.insns.size(), 0);
 
         for (size_t i = 0; i < ir.insns.size(); i++) {
             const IRInsn& in = ir.insns[i];
-            if (in.a != IR_NO_VALUE) this->last_use[in.a] = uint32_t(i);
-            if (in.b != IR_NO_VALUE) this->last_use[in.b] = uint32_t(i);
+            if (in.a != IR_NO_VALUE) {
+                this->last_use[in.a] = uint32_t(i);
+                use_count[in.a]++;
+            }
+            if (in.b != IR_NO_VALUE) {
+                this->last_use[in.b] = uint32_t(i);
+                use_count[in.b]++;
+            }
+        }
+
+        // x86 can consume one constant operand without first materialising
+        // it in a host register. Restrict this to a single-use value and one
+        // operand per instruction: every skipped ConstI32 then has exactly
+        // one immediate consumer, while all other backends keep seeing the
+        // ordinary, backend-neutral IR.
+        for (size_t i = 0; i < ir.insns.size(); i++) {
+            const IRInsn& in = ir.insns[i];
+            const bool immediate_alu = !in.oe &&
+                (in.opcode == IROpcode::Add || in.opcode == IROpcode::And ||
+                 in.opcode == IROpcode::Or  || in.opcode == IROpcode::Xor);
+            if (!immediate_alu) {
+                continue;
+            }
+
+            IRValue selected = IR_NO_VALUE;
+            if (in.b != IR_NO_VALUE && use_count[in.b] == 1 &&
+                ir.insns[in.b].opcode == IROpcode::ConstI32) {
+                selected = in.b;
+            } else if (in.a != IR_NO_VALUE && use_count[in.a] == 1 &&
+                       ir.insns[in.a].opcode == IROpcode::ConstI32) {
+                selected = in.a;
+            }
+            if (selected != IR_NO_VALUE) {
+                this->immediate_const[selected] = 1;
+                this->immediate_value[selected] = ir.insns[selected].imm;
+            }
         }
     }
 
@@ -821,6 +859,13 @@ private:
         const bool a_dies = in.a != IR_NO_VALUE && this->last_use[in.a] == idx;
         const bool b_dies = in.b != IR_NO_VALUE && this->last_use[in.b] == idx;
 
+        // A selected single-use constant is emitted by its consumer below.
+        // Giving it no register removes both the mov-immediate and its
+        // register pressure from the generated block.
+        if (in.opcode == IROpcode::ConstI32 && this->immediate_const[idx]) {
+            return true;
+        }
+
         X64Gpr ra = in.a != IR_NO_VALUE ? X64Gpr(this->reg_of[in.a]) : RAX;
         X64Gpr rb = in.b != IR_NO_VALUE ? X64Gpr(this->reg_of[in.b]) : RAX;
 
@@ -838,6 +883,40 @@ private:
 
         if (!this->takes_register(in.opcode)) {
             return false; // Phi and anything else added later
+        }
+
+        const IRValue imm_value =
+            in.a != IR_NO_VALUE && this->immediate_const[in.a] ? in.a :
+            in.b != IR_NO_VALUE && this->immediate_const[in.b] ? in.b : IR_NO_VALUE;
+        if (imm_value != IR_NO_VALUE) {
+            const IRValue src_value = in.a == imm_value ? in.b : in.a;
+            const X64Gpr src = X64Gpr(this->reg_of[src_value]);
+            const bool src_dies = this->last_use[src_value] == idx;
+
+            X64Gpr dst;
+            if (src_dies) {
+                dst = src;
+            } else {
+                if (!free_mask) {
+                    LOG_F(INFO, "JIT: out of host registers, block goes to the interpreter");
+                    return false;
+                }
+                dst = X64Gpr(lowest_bit(free_mask));
+                free_mask &= ~bit(uint8_t(dst));
+                this->asmb.mov_reg_reg32(dst, src);
+            }
+
+            const uint32_t imm = this->immediate_value[imm_value];
+            switch (in.opcode) {
+            case IROpcode::Add: this->asmb.add_reg_imm32(dst, imm); break;
+            case IROpcode::And: this->asmb.and_reg_imm32(dst, imm); break;
+            case IROpcode::Or:  this->asmb.or_reg_imm32(dst, imm);  break;
+            case IROpcode::Xor: this->asmb.xor_reg_imm32(dst, imm); break;
+            default: return false;
+            }
+
+            this->reg_of[idx] = uint8_t(dst);
+            return true;
         }
 
         // reusing a dying operand's register saves the move that would
@@ -1923,6 +2002,8 @@ private:
     X64Emitter            asmb;
     std::vector<uint32_t> last_use;
     std::vector<uint8_t>  reg_of;
+    std::vector<uint8_t>  immediate_const;
+    std::vector<uint32_t> immediate_value;
 
     typedef struct ColdExit { X64Emitter::Label label; uint32_t guest_idx; } ColdExit;
     std::vector<ColdExit> cold_exits;

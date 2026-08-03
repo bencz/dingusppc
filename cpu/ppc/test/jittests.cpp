@@ -455,6 +455,10 @@ static const uint32_t alu_code[] = {
     0x7CB02B78, // mr     r16, r5
     0x7E232050, // subf   r17, r3, r4
     0x50B2400E, // rlwimi r18, r5, 8, 0, 7
+    0x3A63007F, // addi   r19, r3, 127   signed imm8 upper edge
+    0x3A830080, // addi   r20, r3, 128   needs the full immediate
+    0x3AA3FF80, // addi   r21, r3, -128  signed imm8 lower edge
+    0x3AC3FF7F, // addi   r22, r3, -129  needs the full immediate
     0x00000000, // illegal on purpose, the block stops short of it
 };
 
