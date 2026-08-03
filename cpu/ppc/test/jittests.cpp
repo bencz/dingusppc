@@ -2133,6 +2133,18 @@ static void test_native_chaining() {
     jit_check(ppc_jit_bound_chains() == 0,
               "an until run unbound every previously chained entry");
 
+    // The until resolver remembers its observation without turning it into a
+    // direct jump. That weak cache lives on the same incoming registry list,
+    // so killing the target must clear it without underflowing the bound count
+    // or leaving a dangling JitBlock pointer in the source slot.
+    const unsigned cached_blocks = ppc_jit_num_blocks();
+    mmu_write_vmem<uint32_t>(NO_OPCODE, CHAIN_BASE, 0x60000000);
+    jit_check(ppc_jit_bound_chains() == 0,
+              "invalidating an observed target keeps the bound count at zero");
+    jit_check(ppc_jit_num_blocks() + 1 == cached_blocks,
+              "invalidating an observed target removed exactly its block");
+    load_chain_code();
+
     const uint32_t rebound_result = run_chain_code(false);
     jit_check(rebound_result == CHAIN_ITERATIONS,
               "the loop remains correct after returning to ppc_exec");

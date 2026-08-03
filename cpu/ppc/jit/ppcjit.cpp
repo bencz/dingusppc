@@ -190,8 +190,13 @@ void unlink_chained_block(JitBlock* blk) {
 
 /** Detaches a ref from its target's incoming list without touching the slot,
     for a way that is about to be rewritten with a fresh binding anyway */
+inline bool chain_ref_jumps_direct(const ChainRef* ref) {
+    return *ref->code != ref->resolver;
+}
+
 void unlink_chain_ref(ChainRef* ref) {
     JitBlock* blk = ref->target;
+    const bool direct = chain_ref_jumps_direct(ref);
     if (ref->prev) {
         ref->prev->next = ref->next;
     } else {
@@ -204,14 +209,16 @@ void unlink_chain_ref(ChainRef* ref) {
         ref->next->prev = ref->prev;
     }
     ref->target = nullptr;
-    chain_refs--;
+    if (direct) {
+        chain_refs--;
+    }
 }
 
-/** Points a slot's registry entry at a new target. A rebinding entry moves
-    off the old target's list first, so nothing is allocated and nothing is
-    left behind, however hard a site churns */
-void bind_chain(JitBlock* blk, ChainRef* ref, void** code, const void* resolver,
-                uint64_t* pred) {
+/** Tracks a slot's target on its incoming list. A direct entry becomes a real
+    bound jump immediately after this returns; an observed entry deliberately
+    leaves its code cell on the resolver and only caches target identity. */
+void track_chain(JitBlock* blk, ChainRef* ref, void** code, const void* resolver,
+                 uint64_t* pred, bool direct) {
     if (ref->target) {
         unlink_chain_ref(ref);
     }
@@ -232,7 +239,24 @@ void bind_chain(JitBlock* blk, ChainRef* ref, void** code, const void* resolver,
         chained_head = blk;
     }
     blk->chain_in = ref;
-    chain_refs++;
+    if (direct) {
+        chain_refs++;
+    }
+}
+
+/** Points a slot's registry entry at a new target. A rebinding entry moves
+    off the old target's list first, so nothing is allocated and nothing is
+    left behind, however hard a site churns */
+void bind_chain(JitBlock* blk, ChainRef* ref, void** code, const void* resolver,
+                uint64_t* pred) {
+    track_chain(blk, ref, code, resolver, pred, true);
+}
+
+/** Remembers a resolver observation without allowing generated code to skip
+    the resolver on its next entry. */
+void cache_chain_target(JitBlock* blk, ChainRef* ref, void** code,
+                        const void* resolver) {
+    track_chain(blk, ref, code, resolver, nullptr, false);
 }
 
 /** Sends every slot aimed at the block back to resolving */
@@ -242,12 +266,14 @@ void unbind_chains_to(JitBlock* blk) {
         return;
     }
     do {
+        if (chain_ref_jumps_direct(ref)) {
+            chain_refs--;
+        }
         *ref->code = const_cast<void*>(ref->resolver);
         if (ref->pred) {
             *ref->pred = 1;
         }
         ref->target = nullptr;
-        chain_refs--;
         ref = ref->next;
     } while (ref);
     blk->chain_in = nullptr;
@@ -662,7 +688,12 @@ const void* rt_chain_resolve(ChainSlot* slot) noexcept {
         }
 
         const uint32_t entry_pc = ppc_state.pc;
-        JitBlock* blk = find_or_translate(entry_pc, false, false);
+        const void* resolver =
+            slot->ref.target ? slot->ref.resolver : slot->code;
+        JitBlock* blk = slot->ref.target;
+        if (!blk) {
+            blk = find_or_translate(entry_pc, false, false);
+        }
         trace_block(blk);
 
         if (!blk || !blk->code || goal_splits_block(blk, entry_pc)) [[unlikely]] {
@@ -674,8 +705,12 @@ const void* rt_chain_resolve(ChainSlot* slot) noexcept {
         if (chain_allowed) {
             // the cell still points at the resolver thunk, or this call
             // would not be happening
-            bind_chain(blk, &slot->ref, &slot->code, slot->code, nullptr);
+            bind_chain(blk, &slot->ref, &slot->code, resolver, nullptr);
             slot->code = blk->code;
+        } else if (!slot->ref.target) {
+            // Keep observing every entry, but do not repeat a full physical
+            // lookup until invalidation clears this tracked weak reference.
+            cache_chain_target(blk, &slot->ref, &slot->code, resolver);
         }
         return blk->code;
     } catch (PPCExcUnwind&) {

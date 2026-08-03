@@ -82,13 +82,16 @@ inline bool itlb1_peek(uint32_t va, uint32_t* phys_page, const uint8_t** host) {
     fields the resolver just wrote. The pooled predecessor was measured at
     8% of the Cheetah boot storm, almost all of it one cold load per bind
 
-    target is null while the slot is unbound, and only ppcjit.cpp touches
-    any of this */
+    target is null when the slot knows nothing about its destination. During
+    an `until` run it may also point at a tracked observation cache while the
+    code cell still points at the resolver. That is not a bound jump, but
+    keeping it on the incoming list lets invalidation clear it safely.
+    Only ppcjit.cpp touches any of this */
 struct ChainRef {
     void**      code;     // where the target pointer lives
     const void* resolver; // what goes back there on unbind
     uint64_t*   pred;     // pred to poison on unbind, nullptr for same page
-    JitBlock*   target;   // block the slot jumps into, nullptr while unbound
+    JitBlock*   target;   // bound or observed block, nullptr when unknown
     ChainRef*   prev;     // neighbours on the target's incoming list
     ChainRef*   next;
     ChainRef*   owner_next; // next slot entry owned by the same source block
@@ -159,7 +162,10 @@ void rt_block_end(uint32_t entry_pc, uint32_t byte_size, uint32_t retired) noexc
 
 /** Resolves one chain slot: finds or translates the block at ppc_state.pc,
     and when chaining is allowed binds the slot to it, so the next pass jumps
-    straight through without coming here.
+    straight through without coming here. When direct chaining is forbidden,
+    the resolver retains the observed target instead: every entry still calls
+    here for `until` and tracing semantics, but repeated entries avoid another
+    MMU and block-cache lookup.
 
     Called from the resolver thunk a chained exit starts out pointing at. On
     entry the exit already advanced the entry PC register, wrote ppc_state.pc
