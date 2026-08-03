@@ -255,8 +255,8 @@ void bind_chain(JitBlock* blk, ChainRef* ref, void** code, const void* resolver,
 /** Remembers a resolver observation without allowing generated code to skip
     the resolver on its next entry. */
 void cache_chain_target(JitBlock* blk, ChainRef* ref, void** code,
-                        const void* resolver) {
-    track_chain(blk, ref, code, resolver, nullptr, false);
+                        const void* resolver, uint64_t* pred = nullptr) {
+    track_chain(blk, ref, code, resolver, pred, false);
 }
 
 /** Sends every slot aimed at the block back to resolving */
@@ -732,7 +732,24 @@ const void* rt_chain_resolve_va(ChainVaSlot* slot) noexcept {
         }
 
         const uint32_t entry_pc = ppc_state.pc;
-        JitBlock* blk = find_or_translate(entry_pc, false, false);
+
+        // An observed way always keeps code on the resolver, so getting here
+        // is expected. Its address and translation generation have already
+        // passed the emitted guards. A stale generation reaches the thunk
+        // only when its inline ITLB revalidation failed, and must therefore
+        // take the honest translation path below instead of trusting the old
+        // physical target.
+        JitBlock* blk = nullptr;
+        if (slot->pred0 == entry_pc &&
+            slot->gen0 == mmu_itrans_generation) {
+            blk = slot->ref0.target;
+        } else if (slot->pred1 == entry_pc &&
+                   slot->gen1 == mmu_itrans_generation) {
+            blk = slot->ref1.target;
+        }
+        if (!blk) {
+            blk = find_or_translate(entry_pc, false, false);
+        }
         trace_block(blk);
 
         if (!blk || !blk->code || goal_splits_block(blk, entry_pc)) [[unlikely]] {
@@ -746,22 +763,23 @@ const void* rt_chain_resolve_va(ChainVaSlot* slot) noexcept {
         // nothing stale remains anywhere. Rebinding at all matters as much
         // as the ways do: a policy that only bound virgin slots left every
         // site dead after the first tlbie
-        if (chain_allowed) {
-            int way;
-            if (slot->pred0 == entry_pc)      way = 0;
-            else if (slot->pred1 == entry_pc) way = 1;
-            else if (slot->pred0 == 1)        way = 0;
-            else if (slot->pred1 == 1)        way = 1;
-            else {
-                way = int(slot->flip & 1);
-                slot->flip ^= 1;
-            }
+        int way;
+        if (slot->pred0 == entry_pc)      way = 0;
+        else if (slot->pred1 == entry_pc) way = 1;
+        else if (slot->pred0 == 1)        way = 0;
+        else if (slot->pred1 == 1)        way = 1;
+        else {
+            way = int(slot->flip & 1);
+            slot->flip ^= 1;
+        }
 
-            uint64_t* pred = way ? &slot->pred1 : &slot->pred0;
-            uint64_t* gen  = way ? &slot->gen1  : &slot->gen0;
-            void**    code = way ? &slot->code1 : &slot->code0;
-            uint32_t* phys = way ? &slot->phys1 : &slot->phys0;
-            ChainRef* ref  = way ? &slot->ref1  : &slot->ref0;
+        uint64_t* pred = way ? &slot->pred1 : &slot->pred0;
+        uint64_t* gen  = way ? &slot->gen1  : &slot->gen0;
+        void**    code = way ? &slot->code1 : &slot->code0;
+        uint32_t* phys = way ? &slot->phys1 : &slot->phys0;
+        ChainRef* ref  = way ? &slot->ref1  : &slot->ref0;
+
+        if (chain_allowed) {
 
             // the storm case: the way already holds this very binding and
             // only the generation went stale. The translation was just
@@ -780,6 +798,15 @@ const void* rt_chain_resolve_va(ChainVaSlot* slot) noexcept {
             *gen  = mmu_itrans_generation;
             *phys = blk->phys_addr & PPC_PAGE_MASK;
             *code = blk->code;
+        } else if (ref->target != blk || *pred != entry_pc ||
+                   *gen != mmu_itrans_generation) {
+            // Populate the ordinary address and generation guards, but keep
+            // code pointing at the resolver. The next matching pass still
+            // gets observed while avoiding MMU and block-cache lookup.
+            cache_chain_target(blk, ref, code, slot->resolver, pred);
+            *pred = entry_pc;
+            *gen  = mmu_itrans_generation;
+            *phys = blk->phys_addr & PPC_PAGE_MASK;
         }
         return blk->code;
     } catch (PPCExcUnwind&) {

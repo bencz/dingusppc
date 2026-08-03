@@ -218,8 +218,11 @@ const void* rt_chain_resolve(ChainSlot* slot) noexcept;
 
     A prediction starts (and is unbound to) 1, an address no instruction can
     have. A binding lives and dies in the way it was installed in and is
-    never copied across. resolver remembers the thunk so any unbind knows
-    what to put back */
+    never copied across. When binding is forbidden, the same guarded way may
+    retain an observed target while code stays on resolver; invalidation
+    poisons its prediction and clears the tracked target exactly as it does a
+    direct binding. resolver remembers the thunk so any unbind knows what to
+    put back */
 typedef struct ChainVaSlot {
     uint64_t    pred0;
     uint64_t    gen0;
@@ -238,9 +241,11 @@ typedef struct ChainVaSlot {
 /** rt_chain_resolve for a ChainVaSlot. Installs the target into the way
     already predicting this address if there is one, a virgin way otherwise,
     and the flip way as a last resort, so a site alternating between two
-    targets settles with both bound. A megamorphic site just keeps rotating
-    its two ways; each rotation moves the way's registry entry, so churn
-    costs nothing to anyone else */
+    targets settles with both bound. While binding is disabled the way remains
+    pointed at this resolver, but its guarded observation avoids translating
+    the same target again. A megamorphic site just keeps rotating its two ways;
+    each rotation moves the way's registry entry, so churn costs nothing to
+    anyone else */
 const void* rt_chain_resolve_va(ChainVaSlot* slot) noexcept;
 
 /** Hands control back to the emulator between two blocks and says where to

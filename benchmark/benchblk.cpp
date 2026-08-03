@@ -30,14 +30,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     This runs the same loop at several block lengths and divides by the
     instructions retired, which separates the two costs. The body is one
     addi repeated, so what changes between lengths is only how often the
-    boundary is crossed. Each length is measured twice: ppc_exec_until keeps
-    bindings disabled so it exposes the resolver/dispatcher cost, while
-    ppc_exec lets the backward edge bind and stay inside generated code.
+    boundary is crossed. Each length is measured with ppc_exec_until, which
+    keeps bindings disabled and exposes resolver cost, and with ppc_exec,
+    which lets the backward edge bind and stay inside generated code.
 
-    The loop closes with bdnz, which is a taken backward branch to the top of
-    the same block. That is deliberate: it is both the commonest shape in a
-    real workload and the one a chained block can serve without leaving
-    generated code at all.
+    The first suite closes with bdnz to the top of the same page. The second
+    splits each turn across two pages, so its backward edge exercises the
+    guarded virtual-address resolver used by returns, bcctr and cross-page
+    branches. Together they keep same-page and mapping-sensitive chaining
+    visible as separate numbers.
 
     Set DPPC_JIT=1 to measure the emitter, DPPC_JIT=threaded for the portable
     backend, and leave it unset for the interpreter. DPPC_BENCH_SAMPLES and
@@ -68,16 +69,23 @@ void ppc_exception_handler(Except_Type exception_type, uint32_t srr1_bits) {
 
 namespace {
 
-constexpr uint32_t CODE_BASE = 0x1000;
+constexpr uint32_t CODE_BASE  = 0x1000;
+constexpr uint32_t CROSS_BASE = 0x2000;
 
 enum class RunMode {
     unchained,
     chained,
 };
 
+enum class LoopShape {
+    same_page,
+    cross_page,
+};
+
 /** Block lengths to sweep. 4 is what a real workload averages, 64 is the
     translator's own ceiling, and the ones between show the shape */
 const uint32_t lengths[] = {2, 4, 8, 16, 33, 64};
+const uint32_t cross_lengths[] = {2, 4, 8, 16, 32};
 
 uint32_t samples    = 30;
 uint32_t iterations = 200000;
@@ -110,6 +118,11 @@ uint32_t bdnz(int32_t disp) {
     return 0x42000000UL | (uint32_t(disp) & 0xFFFCUL);
 }
 
+/** b disp: an unconditional relative branch. */
+uint32_t branch(int32_t disp) {
+    return 0x48000000UL | (uint32_t(disp) & 0x03FFFFFCUL);
+}
+
 /** Writes a loop of `len` guest instructions, all but the last an addi and
     the last a bdnz back to the top. One block per iteration, because a
     branch is what ends a block. The illegal word just beyond it stops a
@@ -123,9 +136,34 @@ void write_loop(uint32_t len) {
     mmu_write_vmem<uint32_t>(0, CODE_BASE + len * 4, 0);
 }
 
+/** Writes one logical loop split across two pages.
+
+    The first half ends in a forward direct branch. The translator can follow
+    that into the second page behind its instruction-translation guard, so the
+    backward bdnz is a virtual-address exit back into the first page. Even if
+    the block-size limit keeps a long pair separate, both page crossings still
+    exercise ChainVaSlot rather than the same-page ChainSlot measured above. */
+void write_cross_loop(uint32_t len) {
+    for (uint32_t i = 0; i + 1 < len; i++) {
+        mmu_write_vmem<uint32_t>(0, CODE_BASE + i * 4, ADDI_R3);
+        mmu_write_vmem<uint32_t>(0, CROSS_BASE + i * 4, ADDI_R3);
+    }
+    mmu_write_vmem<uint32_t>(
+        0, CODE_BASE + (len - 1) * 4,
+        branch(int32_t(CROSS_BASE) - int32_t(CODE_BASE + (len - 1) * 4)));
+    mmu_write_vmem<uint32_t>(
+        0, CROSS_BASE + (len - 1) * 4,
+        bdnz(int32_t(CODE_BASE) - int32_t(CROSS_BASE + (len - 1) * 4)));
+    mmu_write_vmem<uint32_t>(0, CROSS_BASE + len * 4, 0);
+}
+
 /** Best of `samples` runs, in nanoseconds, with the timing overhead removed */
-uint64_t time_loop(uint32_t len, uint64_t overhead, RunMode mode) {
-    const uint32_t goal = CODE_BASE + len * 4;
+uint64_t time_loop(uint32_t len, uint64_t overhead, RunMode mode,
+                   LoopShape shape) {
+    const uint32_t goal = shape == LoopShape::same_page
+        ? CODE_BASE + len * 4
+        : CROSS_BASE + len * 4;
+    const uint32_t halves = shape == LoopShape::same_page ? 1 : 2;
 
     uint64_t best = uint64_t(-1);
     for (uint32_t s = 0; s < samples; s++) {
@@ -148,9 +186,10 @@ uint64_t time_loop(uint32_t len, uint64_t overhead, RunMode mode) {
             best = ns;
         }
 
-        if (ppc_state.gpr[3] != uint32_t(iterations * (len - 1))) {
+        const uint32_t expected = uint32_t(iterations * (len - 1) * halves);
+        if (ppc_state.gpr[3] != expected) {
             LOG_F(ERROR, "block length %u: r3 is 0x%08X, expected 0x%08X",
-                  len, ppc_state.gpr[3], uint32_t(iterations * (len - 1)));
+                  len, ppc_state.gpr[3], expected);
             return 0;
         }
     }
@@ -192,31 +231,49 @@ int main(int argc, char** argv) {
         }
     }
 
-    for (RunMode mode : {RunMode::unchained, RunMode::chained}) {
-        printf("\n%s (%s)\n",
-               mode == RunMode::chained ? "chained" : "unchained",
-               mode == RunMode::chained ? "ppc_exec" : "ppc_exec_until");
-        printf("%6s %14s %14s %14s %12s\n",
-               "insns", "total ns", "ns/insn", "ns/block", "MIPS");
+    for (LoopShape shape : {LoopShape::same_page, LoopShape::cross_page}) {
+        const uint32_t* shape_lengths = shape == LoopShape::same_page
+            ? lengths : cross_lengths;
+        const size_t shape_count = shape == LoopShape::same_page
+            ? sizeof(lengths) / sizeof(lengths[0])
+            : sizeof(cross_lengths) / sizeof(cross_lengths[0]);
 
-        for (uint32_t len : lengths) {
-            write_loop(len);
+        for (RunMode mode : {RunMode::unchained, RunMode::chained}) {
+            printf("\n%s %s (%s)\n",
+                   shape == LoopShape::same_page ? "same-page" : "cross-page VA",
+                   mode == RunMode::chained ? "chained" : "unchained",
+                   mode == RunMode::chained ? "ppc_exec" : "ppc_exec_until");
+            printf("%6s %14s %14s %14s %12s\n",
+                   "insns", "total ns", "ns/insn", "ns/turn", "MIPS");
 
-            // The guest code just changed underneath any translation of it.
-            // Flushing per mode also keeps one measurement from donating a
-            // warm binding to the other.
-            ppc_jit_flush();
+            for (size_t index = 0; index < shape_count; index++) {
+                const uint32_t len = shape_lengths[index];
+                const uint32_t halves = shape == LoopShape::same_page ? 1 : 2;
+                if (shape == LoopShape::same_page) {
+                    write_loop(len);
+                } else {
+                    write_cross_loop(len);
+                }
 
-            const uint64_t ns = time_loop(len, overhead, mode);
-            if (!ns) {
-                continue;
+                // The guest code just changed underneath any translation of it.
+                // Flushing per mode also keeps one measurement from donating a
+                // warm binding to the other.
+                ppc_jit_flush();
+
+                const uint64_t ns = time_loop(len, overhead, mode, shape);
+                if (!ns) {
+                    continue;
+                }
+                const uint32_t insns_per_turn = len * halves;
+                const double per_insn =
+                    double(ns) / double(iterations * insns_per_turn);
+                const double per_turn = double(ns) / double(iterations);
+                const double mips     = 1000.0 / per_insn;
+                printf("%6u %14llu %14.4f %14.4f %12.1f\n",
+                       insns_per_turn, (unsigned long long)ns,
+                       per_insn, per_turn, mips);
+                fflush(stdout);
             }
-            const double per_insn  = double(ns) / double(iterations * len);
-            const double per_block = double(ns) / double(iterations);
-            const double mips      = 1000.0 / per_insn;
-            printf("%6u %14llu %14.4f %14.4f %12.1f\n", len,
-                   (unsigned long long)ns, per_insn, per_block, mips);
-            fflush(stdout);
         }
     }
 

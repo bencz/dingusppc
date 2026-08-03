@@ -2098,6 +2098,84 @@ static uint32_t run_chain_code(bool until) {
     return ppc_state.gpr[3];
 }
 
+/* The same counted-loop shape split across two pages. The forward b can be
+   followed into the second page, while the backward bdnz has to use the
+   guarded virtual-address chain slot to return to the first one. */
+constexpr uint32_t VA_CHAIN_A   = 0xC000;
+constexpr uint32_t VA_CHAIN_B   = 0xD000;
+constexpr uint32_t VA_CHAIN_END = VA_CHAIN_B + 8;
+
+static void load_va_chain_code() {
+    mmu_write_vmem<uint32_t>(NO_OPCODE, VA_CHAIN_A,     0x38630001); // addi r3,r3,1
+    mmu_write_vmem<uint32_t>(NO_OPCODE, VA_CHAIN_A + 4, 0x48000FFC); // b VA_CHAIN_B
+    mmu_write_vmem<uint32_t>(NO_OPCODE, VA_CHAIN_B,     0x38630001); // addi r3,r3,1
+    mmu_write_vmem<uint32_t>(NO_OPCODE, VA_CHAIN_B + 4, 0x4200EFFC); // bdnz VA_CHAIN_A
+    mmu_write_vmem<uint32_t>(NO_OPCODE, VA_CHAIN_END,   0x00000000);
+}
+
+static uint32_t run_va_chain_code(bool until) {
+    ppc_state.pc              = VA_CHAIN_A;
+    ppc_state.gpr[3]          = 0;
+    ppc_state.spr[SPR::CTR]   = CHAIN_ITERATIONS;
+    g_icycles                 = 0;
+    g_icycles_max             = UINT64_MAX;
+    exec_timer                = false;
+    exec_flags                = 0;
+    power_on                  = true;
+
+    if (until) {
+        ppc_exec_until(VA_CHAIN_END);
+    } else {
+        ppc_exec();
+    }
+    return ppc_state.gpr[3];
+}
+
+/* One bclr site alternating between two target pages. This is the workload
+   the two ChainVaSlot ways exist for: neither prediction should evict the
+   other after the first pair of visits. */
+constexpr uint32_t ALT_CHAIN_A        = 0x8000;
+constexpr uint32_t ALT_CHAIN_B        = 0x9000;
+constexpr uint32_t ALT_CHAIN_DISPATCH = 0xE000;
+constexpr uint32_t ALT_CHAIN_END      = ALT_CHAIN_A + 8;
+
+static void load_alt_chain_code() {
+    // r4 toggles 0/1, which selects 0x8000/0x9000 without a control-flow
+    // split before the one bclr whose two ways are under test.
+    mmu_write_vmem<uint32_t>(NO_OPCODE, ALT_CHAIN_DISPATCH,      0x68840001); // xori r4,r4,1
+    mmu_write_vmem<uint32_t>(NO_OPCODE, ALT_CHAIN_DISPATCH + 4,  0x1CA41000); // mulli r5,r4,0x1000
+    mmu_write_vmem<uint32_t>(NO_OPCODE, ALT_CHAIN_DISPATCH + 8,  0x60A58000); // ori r5,r5,0x8000
+    mmu_write_vmem<uint32_t>(NO_OPCODE, ALT_CHAIN_DISPATCH + 12, 0x7CA803A6); // mtlr r5
+    mmu_write_vmem<uint32_t>(NO_OPCODE, ALT_CHAIN_DISPATCH + 16, 0x4E800020); // blr
+
+    mmu_write_vmem<uint32_t>(NO_OPCODE, ALT_CHAIN_A,     0x38630001); // addi r3,r3,1
+    mmu_write_vmem<uint32_t>(NO_OPCODE, ALT_CHAIN_A + 4, 0x42005FFC); // bdnz dispatch
+    mmu_write_vmem<uint32_t>(NO_OPCODE, ALT_CHAIN_A + 8, 0x00000000);
+    mmu_write_vmem<uint32_t>(NO_OPCODE, ALT_CHAIN_B,     0x3863000A); // addi r3,r3,10
+    mmu_write_vmem<uint32_t>(NO_OPCODE, ALT_CHAIN_B + 4, 0x42004FFC); // bdnz dispatch
+    mmu_write_vmem<uint32_t>(NO_OPCODE, ALT_CHAIN_B + 8, 0x00000000);
+}
+
+static uint32_t run_alt_chain_code(bool until) {
+    ppc_state.pc              = ALT_CHAIN_DISPATCH;
+    ppc_state.gpr[3]          = 0;
+    ppc_state.gpr[4]          = 0;
+    ppc_state.spr[SPR::CTR]   = CHAIN_ITERATIONS;
+    ppc_state.spr[SPR::LR]    = 0;
+    g_icycles                 = 0;
+    g_icycles_max             = UINT64_MAX;
+    exec_timer                = false;
+    exec_flags                = 0;
+    power_on                  = true;
+
+    if (until) {
+        ppc_exec_until(ALT_CHAIN_END);
+    } else {
+        ppc_exec();
+    }
+    return ppc_state.gpr[3];
+}
+
 static void test_native_chaining() {
     ppc_jit_disable();
     if (!ppc_jit_enable(JitBackend::automatic)) {
@@ -2167,6 +2245,66 @@ static void test_native_chaining() {
               "the restored loop still computes the expected result");
     jit_check(ppc_jit_bound_chains() > 0,
               "the restored block acquired a fresh chain binding");
+
+    // Repeat the lifecycle through ChainVaSlot. Its two guarded ways keep
+    // observed targets as well as direct bindings, so an until loop can avoid
+    // translating the same cross-page destination on every turn without
+    // ever skipping the goal observation.
+    ppc_jit_flush();
+    load_va_chain_code();
+    const uint32_t va_result = run_va_chain_code(false);
+    jit_check(va_result == CHAIN_ITERATIONS * 2,
+              "a cross-page ppc_exec loop completed through a virtual chain");
+    jit_check(ppc_jit_bound_chains() > 0,
+              "the cross-page loop left a guarded virtual chain binding");
+
+    const uint32_t va_until_result = run_va_chain_code(true);
+    jit_check(va_until_result == CHAIN_ITERATIONS * 2,
+              "the cross-page loop remains correct under ppc_exec_until");
+    jit_check(ppc_jit_bound_chains() == 0,
+              "the virtual until run retained no direct bindings");
+
+    const unsigned va_cached_blocks = ppc_jit_num_blocks();
+    mmu_write_vmem<uint32_t>(NO_OPCODE, VA_CHAIN_A, 0x60000000);
+    jit_check(ppc_jit_bound_chains() == 0,
+              "invalidating an observed virtual target keeps the count at zero");
+    jit_check(ppc_jit_num_blocks() + 1 == va_cached_blocks,
+              "invalidating an observed virtual target removed exactly its block");
+
+    load_va_chain_code();
+    const uint32_t va_cached_result = run_va_chain_code(true);
+    jit_check(va_cached_result == CHAIN_ITERATIONS * 2,
+              "a restored virtual chain repopulated its observation cache");
+    const uint32_t va_rebound_result = run_va_chain_code(false);
+    jit_check(va_rebound_result == CHAIN_ITERATIONS * 2,
+              "a virtual observation promoted without changing guest results");
+    jit_check(ppc_jit_bound_chains() > 0,
+              "an ordinary run promoted the virtual observation to a binding");
+
+    ppc_jit_flush();
+    load_alt_chain_code();
+    const uint32_t alt_until_result = run_alt_chain_code(true);
+    jit_check(alt_until_result == (CHAIN_ITERATIONS / 2) * 11,
+              "two observed virtual ways alternate without changing targets");
+    jit_check(ppc_jit_bound_chains() == 0,
+              "two observed virtual ways still count as unbound");
+
+    const unsigned alt_cached_blocks = ppc_jit_num_blocks();
+    mmu_write_vmem<uint32_t>(NO_OPCODE, ALT_CHAIN_A, 0x60000000);
+    jit_check(ppc_jit_bound_chains() == 0,
+              "invalidating one observed way leaves no phantom binding");
+    jit_check(ppc_jit_num_blocks() + 1 == alt_cached_blocks,
+              "invalidating one observed way removes only its target block");
+
+    load_alt_chain_code();
+    const uint32_t alt_restored_result = run_alt_chain_code(true);
+    jit_check(alt_restored_result == (CHAIN_ITERATIONS / 2) * 11,
+              "the alternating observation cache repopulates after invalidation");
+    const uint32_t alt_bound_result = run_alt_chain_code(false);
+    jit_check(alt_bound_result == (CHAIN_ITERATIONS / 2) * 11,
+              "both observed ways promote without changing alternation");
+    jit_check(ppc_jit_bound_chains() > 0,
+              "the alternating site promoted its virtual ways to bindings");
 
     ppc_opcode_grabber[0] = saved_zero;
     ppc_jit_flush();
