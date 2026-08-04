@@ -395,7 +395,11 @@ uint64_t ppc_process_events()
 {
     ppc_report_speed();
 
+    // Clear first so a device thread that queues an invalidation during or
+    // after the drain leaves the flag set for the next event check. Clearing
+    // it afterwards would lose that wakeup and could run a stale JIT block.
     exec_timer = false;
+    ppc_code_cache_drain_dma_invalidations();
     uint64_t slice_ns = TimerManager::get_instance()->process_timers();
     if (slice_ns == 0) {
         // execute 25.000 cycles

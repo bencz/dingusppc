@@ -31,6 +31,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "devices/memctrl/mpc106.h"
 
 #include <iostream>
+#include <thread>
 #include <vector>
 
 using namespace std;
@@ -92,6 +93,60 @@ static void test_release_callback() {
     cc_check(released.size() == 2, "the callback fires on a full flush too");
 
     ppc_code_cache_set_release_cb(nullptr);
+}
+
+/** A walked-through JIT block has one handle registered for each of its two
+    physical regions. Releasing either region removes both registrations from
+    inside the callback. The invalidation walk must not count its own entry a
+    second time after that callback. */
+static void test_shared_handle_callback() {
+    CodeBlockHandle shared = reinterpret_cast<CodeBlockHandle>(uintptr_t(14));
+    unsigned released = 0;
+
+    ppc_code_cache_set_release_cb([&](CodeBlockHandle handle) {
+        cc_check(handle == shared, "the shared block callback receives its handle");
+        released++;
+        ppc_code_cache_remove(0x7000, handle);
+        ppc_code_cache_remove(0x8000, handle);
+    });
+
+    ppc_code_cache_add(0x7000, PPC_ICACHE_LINE_SIZE, shared);
+    ppc_code_cache_add(0x8000, PPC_ICACHE_LINE_SIZE, shared);
+    cc_check(ppc_code_cache_num_blocks() == 2,
+             "a two-region block has two invalidation registrations");
+
+    cc_check(ppc_code_cache_invalidate(0x7000, PPC_ICACHE_LINE_SIZE) == 1,
+             "invalidating either region releases the shared block once");
+    cc_check(released == 1, "the two-region block callback ran once");
+    cc_check(ppc_code_cache_is_empty(),
+             "removing both regions leaves the registration count at zero");
+
+    ppc_code_cache_set_release_cb(nullptr);
+}
+
+/** Device callbacks such as Cubeb's output callback do not own the JIT. A
+    DMA mapping from one of those threads must wake the CPU but leave block
+    and chain teardown to the CPU thread. */
+static void test_dma_invalidation_handoff() {
+    ppc_code_cache_add(0x9000, PPC_ICACHE_LINE_SIZE, (CodeBlockHandle)15);
+    exec_timer = false;
+
+    std::thread device_thread([] {
+        ppc_code_cache_invalidate_dma(0x9000, PPC_ICACHE_LINE_SIZE);
+    });
+    device_thread.join();
+
+    cc_check(ppc_code_cache_num_blocks() == 1,
+             "a device thread queues invalidation without touching the registry");
+    cc_check(exec_timer, "a queued DMA invalidation wakes the CPU event loop");
+    cc_check(ppc_code_cache_drain_dma_invalidations() == 1,
+             "the CPU thread drains the queued invalidation");
+    cc_check(ppc_code_cache_is_empty(), "the drained DMA invalidation drops its block");
+
+    ppc_code_cache_add(0xA000, PPC_ICACHE_LINE_SIZE, (CodeBlockHandle)16);
+    ppc_code_cache_invalidate_dma(0xA000, PPC_ICACHE_LINE_SIZE);
+    cc_check(ppc_code_cache_is_empty(),
+             "DMA invalidation on the CPU thread remains synchronous");
 }
 
 static void test_icbi() {
@@ -162,6 +217,16 @@ static void test_store_invalidation() {
 
     mmu_write_vmem<uint32_t>(NO_OPCODE, 0x3010, 0);
     cc_check(ppc_code_cache_is_empty(), "storing on the last code page empties the cache");
+
+    // Merely handing a device a read-only view of RAM (sound output, video)
+    // must not invalidate code. A writer still has to do so before bypassing
+    // the MMU with its bare host pointer.
+    ppc_code_cache_add(0x6000, PPC_ICACHE_LINE_SIZE, (CodeBlockHandle)17);
+    mmu_map_dma_mem(0x6000, PPC_ICACHE_LINE_SIZE, DmaAccess::Read);
+    cc_check(ppc_code_cache_num_blocks() == 1,
+             "a read-only DMA mapping leaves translated code intact");
+    mmu_map_dma_mem(0x6000, PPC_ICACHE_LINE_SIZE, DmaAccess::Write);
+    cc_check(ppc_code_cache_is_empty(), "a writable DMA mapping invalidates translated code");
 }
 
 int test_code_cache() {
@@ -170,6 +235,8 @@ int test_code_cache() {
 
     test_registry();
     test_release_callback();
+    test_shared_handle_callback();
+    test_dma_invalidation_handoff();
     test_icbi();
     test_store_invalidation();
 

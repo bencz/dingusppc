@@ -687,7 +687,7 @@ DmaPullResult AmicSndOutDma::pull_data(uint32_t req_len, uint32_t *avail_len,
 
     MapDmaResult res = mmu_map_dma_mem(
         (this->snd_buf_num ? this->out_buf1 : this->out_buf0) + this->cur_buf_pos,
-        len, false);
+        len, DmaAccess::Read);
     *p_data = res.host_va;
     this->cur_buf_pos += len;
     *avail_len = len;
@@ -723,7 +723,7 @@ DmaPushResult AmicFloppyDma::push_data(const char* src_ptr, int len)
 {
     len = std::min((int)this->byte_count, len);
 
-    MapDmaResult res = mmu_map_dma_mem(this->addr_ptr, len, false);
+    MapDmaResult res = mmu_map_dma_mem(this->addr_ptr, len, DmaAccess::Write);
     uint8_t *p_data = res.host_va;
     if (!res.is_writable) {
         ABORT_F("AMIC: attempting DMA write to read-only memory");
@@ -782,7 +782,7 @@ void AmicScsiDma::xfer_from_device() {
 
     uint32_t len = this->dev_obj->tell_xfer_size(this);
 
-    MapDmaResult res = mmu_map_dma_mem(this->addr_ptr, len, false);
+    MapDmaResult res = mmu_map_dma_mem(this->addr_ptr, len, DmaAccess::Write);
 
     int got_bytes = this->dev_obj->xfer_from(this, res.host_va, len);
     if (got_bytes > 0) {
@@ -798,7 +798,7 @@ void AmicScsiDma::xfer_to_device() {
 
     uint32_t len = this->dev_obj->tell_xfer_size(this);
 
-    MapDmaResult res = mmu_map_dma_mem(this->addr_ptr, len, false);
+    MapDmaResult res = mmu_map_dma_mem(this->addr_ptr, len, DmaAccess::Read);
 
     int got_bytes = this->dev_obj->xfer_to(this, res.host_va, len);
     if (got_bytes > 0) {

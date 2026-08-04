@@ -255,7 +255,8 @@ void PdmOnboardVideo::set_fb_base() {
     uint8_t  vmem_loc = (hmc_control >> HMC_VBASE_BIT) & 1;
     if (this->fb_loc != vmem_loc) {
         uint32_t fb_base_phys = vmem_loc ? 0 : 0x100000;
-        MapDmaResult res = mmu_map_dma_mem(fb_base_phys, PDM_FB_SIZE_MAX, false);
+        MapDmaResult res = mmu_map_dma_mem(
+            fb_base_phys, PDM_FB_SIZE_MAX, DmaAccess::Read);
         this->fb_ptr = res.host_va;
         this->fb_loc = vmem_loc;
     }

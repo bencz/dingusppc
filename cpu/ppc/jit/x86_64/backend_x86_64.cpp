@@ -544,10 +544,12 @@ private:
                                ir.end_reason == BlockEnd::SizeLimit ||
                                ir.end_reason == BlockEnd::PageEnd;
         bool tail_done = false;
-        if (ir.end_reason == BlockEnd::Branch || ir.end_reason == BlockEnd::SizeLimit) {
+        if (jit_chaining && jit_local_chaining &&
+            (ir.end_reason == BlockEnd::Branch ||
+             ir.end_reason == BlockEnd::SizeLimit)) {
             tail_done = this->emit_chained_exit(ir.end_off, tail_retired);
         }
-        if (!tail_done && mode_safe) {
+        if (jit_chaining && jit_va_chaining && !tail_done && mode_safe) {
             this->asmb.lea_reg_mem(RDX, REG_ENTRYPC, ir.end_off);
             tail_done = this->emit_va_chained_exit(tail_retired);
         }
@@ -690,7 +692,8 @@ private:
         this->asmb.jcc(X64Cond::NotEqual, try_way1);
         this->asmb.mov_reg64_mem_abs(RAX, &slot->gen0);
         this->asmb.cmp_reg64_mem(RAX, REG_TIME, this->gen_disp);
-        this->asmb.jcc(X64Cond::NotEqual, probe0);
+        this->asmb.jcc(X64Cond::NotEqual,
+                       jit_va_revalidate ? probe0 : thunk);
         this->asmb.jmp_mem_abs(&slot->code0);
 
         this->asmb.bind(try_way1);
@@ -698,7 +701,8 @@ private:
         this->asmb.jcc(X64Cond::NotEqual, thunk);
         this->asmb.mov_reg64_mem_abs(RAX, &slot->gen1);
         this->asmb.cmp_reg64_mem(RAX, REG_TIME, this->gen_disp);
-        this->asmb.jcc(X64Cond::NotEqual, probe1);
+        this->asmb.jcc(X64Cond::NotEqual,
+                       jit_va_revalidate ? probe1 : thunk);
         this->asmb.jmp_mem_abs(&slot->code1);
 
         this->asmb.bind(to_dispatch);
@@ -2352,7 +2356,8 @@ private:
             // address predicted chain catches the common case of a site that
             // keeps going back to the same place
             this->asmb.and_reg_imm32(RDX, ~3u);
-            if (!this->emit_va_chained_exit(insn_count)) {
+            if (!jit_chaining || !jit_va_chaining ||
+                !this->emit_va_chained_exit(insn_count)) {
                 this->asmb.mov_mem_reg32(REG_STATE, PC_OFFSET, RDX);
                 this->asmb.mov_reg_imm32(REG_RETIRED, insn_count);
                 this->asmb.jmp_abs(this->dispatch);
@@ -2361,7 +2366,8 @@ private:
             // an absolute target is a fixed virtual address, which is
             // exactly what the address predicted chain guards
             this->asmb.mov_reg_imm32(RDX, in.imm);
-            if (!this->emit_va_chained_exit(insn_count)) {
+            if (!jit_chaining || !jit_va_chaining ||
+                !this->emit_va_chained_exit(insn_count)) {
                 this->asmb.mov_mem_reg32(REG_STATE, PC_OFFSET, RDX);
                 this->asmb.mov_reg_imm32(REG_RETIRED, insn_count);
                 this->asmb.jmp_abs(this->dispatch);
@@ -2371,9 +2377,11 @@ private:
             // this the chain that pays: a tight loop becomes native end to
             // end. A target outside the page falls back to the guarded kind
             const int32_t next_off = guest_off + int32_t(in.imm);
-            if (!this->emit_chained_exit(next_off, insn_count)) {
+            if (!jit_chaining || !jit_local_chaining ||
+                !this->emit_chained_exit(next_off, insn_count)) {
                 this->asmb.lea_reg_mem(RDX, REG_ENTRYPC, next_off);
-                if (!this->emit_va_chained_exit(insn_count)) {
+                if (!jit_chaining || !jit_va_chaining ||
+                    !this->emit_va_chained_exit(insn_count)) {
                     this->emit_exit(next_off, insn_count);
                 }
             }

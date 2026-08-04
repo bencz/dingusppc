@@ -42,6 +42,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #ifndef PPC_CODE_CACHE_H
 #define PPC_CODE_CACHE_H
 
+#include <atomic>
 #include <cinttypes>
 #include <functional>
 
@@ -52,16 +53,16 @@ typedef void* CodeBlockHandle;
 constexpr uint32_t PPC_ICACHE_LINE_SIZE = 32;
 
 /** Number of registered blocks. Exposed so the empty check below can inline */
-extern unsigned ppc_code_cache_count;
+extern std::atomic<unsigned> ppc_code_cache_count;
 
 /** Hot paths test this before doing any work. It is always true in builds
     without a code generator, which keeps icbi as cheap as it was before */
 inline bool ppc_code_cache_is_empty() {
-    return ppc_code_cache_count == 0;
+    return ppc_code_cache_count.load(std::memory_order_relaxed) == 0;
 }
 
 inline unsigned ppc_code_cache_num_blocks() {
-    return ppc_code_cache_count;
+    return ppc_code_cache_count.load(std::memory_order_relaxed);
 }
 
 /** Drops every block and forgets the release callback */
@@ -104,6 +105,16 @@ void ppc_code_cache_remove(uint32_t phys_addr, CodeBlockHandle handle);
 
 /** Drops every block overlapping the range and returns how many went away */
 unsigned ppc_code_cache_invalidate(uint32_t phys_addr, uint32_t size);
+
+/** Invalidates a range mapped for DMA without letting a device thread mutate
+    the translated-code registry or JIT chain links. Calls made by the cache
+    owner (CPU) thread remain synchronous; calls from any other thread are
+    queued and ask the CPU loop to process events. */
+void ppc_code_cache_invalidate_dma(uint32_t phys_addr, uint32_t size);
+
+/** Applies DMA invalidations queued by device threads. Must run on the CPU
+    thread, before translated execution resumes. */
+unsigned ppc_code_cache_drain_dma_invalidations();
 
 unsigned ppc_code_cache_invalidate_all();
 

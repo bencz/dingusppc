@@ -23,14 +23,18 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include <loguru.hpp>
 #include "ppccodecache.h"
+#include "ppcemu.h"
 #include "ppcmmu.h"
 
+#include <algorithm>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
-unsigned ppc_code_cache_count = 0;
+std::atomic<unsigned> ppc_code_cache_count{0};
 
 namespace {
 
@@ -55,6 +59,19 @@ std::unordered_set<uint32_t> protected_pages;
 
 std::function<void(CodeBlockHandle)> release_cb;
 
+struct InvalidationRange {
+    uint32_t start;
+    uint32_t size;
+};
+
+/* Cubeb drives sound DBDMA from its callback thread. That thread may map and
+   update DBDMA descriptors while the CPU is compiling or following a direct
+   chain. It must never walk blocks_by_page or invoke the JIT release callback:
+   neither the registry nor the chain-link lists are concurrent containers. */
+std::thread::id                 code_cache_owner_thread;
+std::mutex                      dma_invalidations_mutex;
+std::vector<InvalidationRange>  dma_invalidations;
+
 /** Clamps to the end of the address space so a wrapping size cannot turn
     into an empty range */
 inline uint32_t range_last(uint32_t phys_addr, uint32_t size) {
@@ -62,10 +79,17 @@ inline uint32_t range_last(uint32_t phys_addr, uint32_t size) {
     return last > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : uint32_t(last);
 }
 
+void clear_dma_invalidations() {
+    std::lock_guard<std::mutex> lock(dma_invalidations_mutex);
+    dma_invalidations.clear();
+}
+
 } // namespace
 
 void ppc_code_cache_init() {
     ppc_code_cache_invalidate_all();
+    clear_dma_invalidations();
+    code_cache_owner_thread = std::this_thread::get_id();
 
     // the TLBs are being rebuilt around this call anyway, so nothing is
     // left protected that should not be
@@ -92,7 +116,7 @@ void ppc_code_cache_add(uint32_t phys_addr, uint32_t size, CodeBlockHandle handl
     }
 
     blocks_by_page[page].push_back({phys_addr, phys_addr + size, handle});
-    ppc_code_cache_count++;
+    ppc_code_cache_count.fetch_add(1, std::memory_order_relaxed);
 
     // stores have to be noticed from now on. Only the first block ever put on
     // the page pays for saying so, see protected_pages
@@ -116,7 +140,7 @@ void ppc_code_cache_remove(uint32_t phys_addr, CodeBlockHandle handle) {
     for (CodeBlock& blk : it->second) {
         if (blk.handle == handle) {
             blk.handle = nullptr;
-            ppc_code_cache_count--;
+            ppc_code_cache_count.fetch_sub(1, std::memory_order_relaxed);
             return;
         }
     }
@@ -154,10 +178,19 @@ unsigned ppc_code_cache_invalidate(uint32_t phys_addr, uint32_t size) {
                     page_blocks[i] = page_blocks.back();
                     page_blocks.pop_back();
                 } else if (blk.start <= last && blk.end > phys_addr) {
+                    // Retire this registration before notifying its owner.
+                    // A block spanning two translated regions uses the same
+                    // handle twice, and its callback tombstones both entries.
+                    // Leaving the current entry live until after the callback
+                    // made ppc_code_cache_remove decrement it here and then
+                    // made this walk decrement it a second time, wrapping the
+                    // unsigned global count and leaving the cache permanently
+                    // non-empty after a cross-region invalidation.
+                    const CodeBlockHandle handle = blk.handle;
+                    page_blocks[i].handle = nullptr;
+                    ppc_code_cache_count.fetch_sub(1, std::memory_order_relaxed);
                     if (release_cb) {
-                        // may tombstone other entries, this one included;
-                        // the removal below does not care either way
-                        release_cb(blk.handle);
+                        release_cb(handle);
                     }
                     page_blocks[i] = page_blocks.back();
                     page_blocks.pop_back();
@@ -175,12 +208,70 @@ unsigned ppc_code_cache_invalidate(uint32_t phys_addr, uint32_t size) {
         }
     }
 
-    ppc_code_cache_count -= dropped;
+    return dropped;
+}
+
+void ppc_code_cache_invalidate_dma(uint32_t phys_addr, uint32_t size) {
+    if (!size || ppc_code_cache_is_empty()) {
+        return;
+    }
+
+    if (std::this_thread::get_id() == code_cache_owner_thread) {
+        ppc_code_cache_invalidate(phys_addr, size);
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(dma_invalidations_mutex);
+
+        // DMA descriptors and buffers are normally consumed in order. Merge
+        // with the last range when possible to keep a busy device from
+        // growing the queue between two CPU event checks.
+        if (!dma_invalidations.empty()) {
+            InvalidationRange& prev = dma_invalidations.back();
+            const uint64_t address_space_end = uint64_t(UINT32_MAX) + 1;
+            const uint64_t prev_end = std::min(
+                uint64_t(prev.start) + prev.size, address_space_end);
+            const uint64_t new_end = std::min(
+                uint64_t(phys_addr) + size, address_space_end);
+            if (uint64_t(phys_addr) <= prev_end && uint64_t(prev.start) <= new_end) {
+                const uint64_t merged_start = std::min(prev.start, phys_addr);
+                const uint64_t merged_size  = std::max(prev_end, new_end) - merged_start;
+                if (merged_size <= UINT32_MAX) {
+                    prev.start = uint32_t(merged_start);
+                    prev.size  = uint32_t(merged_size);
+                } else {
+                    dma_invalidations.push_back({phys_addr, size});
+                }
+            } else {
+                dma_invalidations.push_back({phys_addr, size});
+            }
+        } else {
+            dma_invalidations.push_back({phys_addr, size});
+        }
+    }
+
+    // The generated-code exit checks this byte before following another
+    // chain, so the CPU reaches ppc_process_events and drains the queue.
+    exec_timer = true;
+}
+
+unsigned ppc_code_cache_drain_dma_invalidations() {
+    std::vector<InvalidationRange> pending;
+    {
+        std::lock_guard<std::mutex> lock(dma_invalidations_mutex);
+        pending.swap(dma_invalidations);
+    }
+
+    unsigned dropped = 0;
+    for (const InvalidationRange& range : pending) {
+        dropped += ppc_code_cache_invalidate(range.start, range.size);
+    }
     return dropped;
 }
 
 unsigned ppc_code_cache_invalidate_all() {
-    unsigned dropped = ppc_code_cache_count;
+    unsigned dropped = ppc_code_cache_count.load(std::memory_order_relaxed);
 
     if (release_cb) {
         for (auto& page : blocks_by_page) {
@@ -193,6 +284,6 @@ unsigned ppc_code_cache_invalidate_all() {
     }
 
     blocks_by_page.clear();
-    ppc_code_cache_count = 0;
+    ppc_code_cache_count.store(0, std::memory_order_relaxed);
     return dropped;
 }

@@ -779,7 +779,7 @@ const void* rt_chain_resolve_va(ChainVaSlot* slot) noexcept {
         uint32_t* phys = way ? &slot->phys1 : &slot->phys0;
         ChainRef* ref  = way ? &slot->ref1  : &slot->ref0;
 
-        if (chain_allowed) {
+        if (chain_allowed && jit_va_binding) {
 
             // the storm case: the way already holds this very binding and
             // only the generation went stale. The translation was just
@@ -885,6 +885,41 @@ bool ppc_jit_enable(JitBackend choice) {
         dppc_jit::jit_cr_fuse = strtol(cf, nullptr, 0) != 0;
         if (!dppc_jit::jit_cr_fuse) {
             LOG_F(INFO, "JIT: compare and branch fusion off");
+        }
+    }
+
+    if (const char* chain = getenv("DPPC_JIT_CHAIN")) {
+        dppc_jit::jit_chaining = strtol(chain, nullptr, 0) != 0;
+        if (!dppc_jit::jit_chaining) {
+            LOG_F(INFO, "JIT: direct block chaining off");
+        }
+    }
+
+    if (const char* local = getenv("DPPC_JIT_CHAIN_LOCAL")) {
+        dppc_jit::jit_local_chaining = strtol(local, nullptr, 0) != 0;
+        if (!dppc_jit::jit_local_chaining) {
+            LOG_F(INFO, "JIT: same-page block chaining off");
+        }
+    }
+
+    if (const char* va = getenv("DPPC_JIT_CHAIN_VA")) {
+        dppc_jit::jit_va_chaining = strtol(va, nullptr, 0) != 0;
+        if (!dppc_jit::jit_va_chaining) {
+            LOG_F(INFO, "JIT: virtual-address block chaining off");
+        }
+    }
+
+    if (const char* revalidate = getenv("DPPC_JIT_CHAIN_VA_REVALIDATE")) {
+        dppc_jit::jit_va_revalidate = strtol(revalidate, nullptr, 0) != 0;
+        if (!dppc_jit::jit_va_revalidate) {
+            LOG_F(INFO, "JIT: inline VA-chain ITLB revalidation off");
+        }
+    }
+
+    if (const char* bind = getenv("DPPC_JIT_CHAIN_VA_BIND")) {
+        dppc_jit::jit_va_binding = strtol(bind, nullptr, 0) != 0;
+        if (dppc_jit::jit_va_binding) {
+            LOG_F(WARNING, "JIT: experimental direct VA-chain binding enabled");
         }
     }
 

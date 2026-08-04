@@ -418,6 +418,31 @@ extern bool jit_blr_follow;
     DPPC_JIT_CRFUSE=0 makes every branch read the architected CR */
 extern bool jit_cr_fuse;
 
+/** Whether native block exits may bind directly to another generated block.
+    DPPC_JIT_CHAIN=0 keeps branch lowering enabled but routes every exit
+    through the dispatcher, separating branch semantics from resolver bugs. */
+extern bool jit_chaining;
+
+/** Finer chaining bisection knobs. The local kind targets a fixed offset in
+    the source block's own guest page; the VA kind guards a runtime virtual
+    address and instruction-translation generation. Both remain enabled by
+    default and DPPC_JIT_CHAIN is still their master switch. */
+extern bool jit_local_chaining;
+extern bool jit_va_chaining;
+
+/** Whether a stale VA-chain generation may be revalidated from the primary
+    ITLB in emitted code. DPPC_JIT_CHAIN_VA_REVALIDATE=0 sends generation
+    misses through the full resolver while retaining direct VA bindings. */
+extern bool jit_va_revalidate;
+
+/** Whether a resolved VA-chain way may replace its resolver pointer with the
+    target's native entry. Off by default: real Mac OS 9 workloads expose a
+    lifecycle/state invariant that the synthetic chaining tests do not yet
+    cover. The resolver path retains the two-way target cache and all native
+    execution; DPPC_JIT_CHAIN_VA_BIND=1 opts into the experimental direct
+    handoff for continued development. */
+extern bool jit_va_binding;
+
 /** Whether a dead block's emitted bytes go back to the pool for reuse.
     Off by default and DPPC_JIT_RECYCLE=1 opts in: measured on the Cheetah
     boot, reuse scatters hot code into cold holes and costs ~7% of the

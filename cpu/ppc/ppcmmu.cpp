@@ -380,7 +380,8 @@ static PATResult page_address_translation(uint32_t la, bool is_instr_fetch,
     };
 }
 
-MapDmaResult mmu_map_dma_mem(uint32_t addr, uint32_t size, bool allow_mmio, bool is_dbg) {
+MapDmaResult mmu_map_dma_mem(uint32_t addr, uint32_t size, DmaAccess access,
+                             bool allow_mmio, bool is_dbg) {
     MMIODevice      *devobj  = nullptr;
     uint8_t         *host_va = nullptr;
     uint32_t        dev_base = 0;
@@ -452,18 +453,12 @@ MapDmaResult mmu_map_dma_mem(uint32_t addr, uint32_t size, bool allow_mmio, bool
         host_va  = cur_dma_rgn->mem_ptr + (addr - cur_dma_rgn->start);
         is_writable = cur_dma_rgn->type & RT_RAM;
 
-        // A device is about to be handed a bare pointer into guest memory and
-        // will write through it without the MMU seeing anything, so this is
-        // the last chance to notice that translated code is about to be
-        // overwritten. That is not a corner case: loading a system off a disk
-        // is exactly a DMA engine writing code into RAM.
-        //
-        // Read transfers get invalidated too, since nothing here says which
-        // way the data will go. Redoing a translation costs far less than
-        // running a stale one, and the check below is free while nothing has
-        // been translated at all
-        if (is_writable && !is_dbg && !ppc_code_cache_is_empty()) {
-            ppc_code_cache_invalidate(addr, size);
+        // A DMA writer receives a bare pointer and bypasses the MMU store
+        // path, so invalidate translated code explicitly. Device callbacks
+        // may run outside the CPU thread; the code-cache entry point queues
+        // those requests instead of racing JIT lookup and chain publication.
+        if (is_writable && !is_dbg && access != DmaAccess::Read) {
+            ppc_code_cache_invalidate_dma(addr, size);
         }
     } else { // RT_MMIO
         devobj = cur_dma_rgn->devobj;

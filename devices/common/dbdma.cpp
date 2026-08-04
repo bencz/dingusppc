@@ -47,7 +47,8 @@ void DMAChannel::set_data_callbacks(DbdmaCallback in_cb, DbdmaCallback out_cb, D
 
 /* Load DMACmd from physical memory. */
 DMACmd* DMAChannel::fetch_cmd(uint32_t cmd_addr, DMACmd* p_cmd, bool *is_writable) {
-    MapDmaResult res = mmu_map_dma_mem(cmd_addr, 16, false);
+    // DBDMA reads the descriptor and later writes residual/status fields.
+    MapDmaResult res = mmu_map_dma_mem(cmd_addr, 16, DmaAccess::ReadWrite);
     if (is_writable) *is_writable = res.is_writable;
     DMACmd* cmd_host = (DMACmd*)res.host_va;
     p_cmd->req_count = READ_WORD_LE_A(&cmd_host->req_count);
@@ -90,7 +91,12 @@ void DMAChannel::interpret_cmd() {
             break;
         }
         if (cmd_struct.req_count) {
-            res = mmu_map_dma_mem(cmd_struct.address, cmd_struct.req_count, false);
+            const DmaAccess access =
+                (this->cur_cmd == DBDMA_Cmd::OUTPUT_MORE ||
+                 this->cur_cmd == DBDMA_Cmd::OUTPUT_LAST)
+                    ? DmaAccess::Read
+                    : DmaAccess::Write;
+            res = mmu_map_dma_mem(cmd_struct.address, cmd_struct.req_count, access);
             this->queue_data = res.host_va;
             this->res_count  = cmd_struct.req_count;
             this->queue_len  = cmd_struct.req_count; // don't set queue_len until all the other fields are set
@@ -231,7 +237,8 @@ void DMAChannel::xfer_quad(bool is_store) {
         addr &= ~(xfer_size - 1);
     }
 
-    res = mmu_map_dma_mem(addr, xfer_size, true);
+    res = mmu_map_dma_mem(addr, xfer_size,
+                          is_store ? DmaAccess::Write : DmaAccess::Read, true);
 
     // prepare data pointers and perform data transfer
     if (is_store) {

@@ -1138,6 +1138,235 @@ static void test_branch_subset() {
               "a second pass over the cached branch blocks agrees");
 }
 
+/** Exhaust the complete BO field over CR bits in every CR field and CTR
+    values whose low byte is zero as well as ordinary loop counts. The latter
+    is important for catching an accidentally byte-sized host comparison.
+
+    Taken and fall-through paths write different values, and LK is tested on
+    both, so one compact program observes the branch decision, CTR decrement,
+    LR update, PC and retired count together. Forward CR-only forms also take
+    the superblock side-exit path, while unconditional forms are walked
+    through by the translator. */
+struct BranchMatrixCase {
+    uint32_t opcode;
+    uint32_t ctr;
+    uint32_t cr;
+};
+
+struct BranchMatrixResult {
+    uint32_t r3;
+    uint32_t ctr;
+    uint32_t lr;
+    uint32_t cr;
+    uint32_t pc;
+    uint64_t retired;
+};
+
+constexpr uint32_t BRM_BASE = 0x8A00;
+constexpr uint32_t BRM_END  = BRM_BASE + 0x10;
+
+static BranchMatrixResult run_branch_matrix_case(const BranchMatrixCase& c) {
+    mmu_write_vmem<uint32_t>(NO_OPCODE, BRM_BASE, c.opcode);
+
+    ppc_state.gpr[3] = 0xDEADBEEF;
+    ppc_state.spr[SPR::CTR] = c.ctr;
+    ppc_state.spr[SPR::LR]  = 0x13579BDF;
+    ppc_state.cr = c.cr;
+    ppc_state.pc = BRM_BASE;
+    g_icycles = 0;
+    g_icycles_max = UINT64_MAX;
+    exec_flags = 0;
+    power_on = true;
+    ppc_exec_until(BRM_END);
+
+    return {ppc_state.gpr[3], ppc_state.spr[SPR::CTR],
+            ppc_state.spr[SPR::LR], ppc_state.cr, ppc_state.pc, g_icycles};
+}
+
+static bool same_branch_matrix(const BranchMatrixResult& a,
+                               const BranchMatrixResult& b) {
+    return a.r3 == b.r3 && a.ctr == b.ctr && a.lr == b.lr &&
+           a.cr == b.cr && a.pc == b.pc && a.retired == b.retired;
+}
+
+static void test_branch_matrix() {
+    // bc +12; fall-through writes one and skips the target, taken writes two.
+    constexpr uint32_t tail[] = {
+        0,          // replaced by each bc below
+        0x38600001, // li r3,1
+        0x48000008, // b BRM_END
+        0x38600002, // li r3,2
+        0,          // test-only illegal goal
+    };
+    for (size_t i = 1; i < sizeof(tail) / sizeof(tail[0]); i++) {
+        mmu_write_vmem<uint32_t>(NO_OPCODE, BRM_BASE + uint32_t(i) * 4, tail[i]);
+    }
+
+    constexpr uint8_t bis[] = {0, 1, 2, 3, 4, 7, 8, 15, 16, 23, 24, 31};
+    constexpr uint32_t ctrs[] = {0, 1, 2, 0x100, 0x101, 0xFFFFFFFFU};
+    constexpr uint32_t crs[] = {0, 0xFFFFFFFFU};
+
+    vector<BranchMatrixCase> cases;
+    for (unsigned lk = 0; lk < 2; lk++) {
+        for (unsigned bo = 0; bo < 32; bo++) {
+            for (uint8_t bi : bis) {
+                for (uint32_t ctr : ctrs) {
+                    for (uint32_t cr : crs) {
+                        cases.push_back({(16U << 26) | (bo << 21) |
+                                             (uint32_t(bi) << 16) | 12U | lk,
+                                         ctr, cr});
+                    }
+                }
+            }
+        }
+    }
+
+    ppc_jit_disable();
+    vector<BranchMatrixResult> reference;
+    reference.reserve(cases.size());
+    for (const BranchMatrixCase& c : cases) {
+        reference.push_back(run_branch_matrix_case(c));
+    }
+
+    ppc_jit_enable(JitBackend::threaded);
+    bool threaded_ok = true;
+    for (size_t i = 0; i < cases.size(); i++) {
+        threaded_ok &= same_branch_matrix(reference[i],
+                                          run_branch_matrix_case(cases[i]));
+    }
+    jit_check(threaded_ok,
+              "threaded bc agrees for every BO, CR field and CTR edge matrix");
+
+    ppc_jit_disable();
+    ppc_jit_enable(JitBackend::automatic);
+    bool native_ok = true;
+    for (size_t i = 0; i < cases.size(); i++) {
+        native_ok &= same_branch_matrix(reference[i],
+                                        run_branch_matrix_case(cases[i]));
+    }
+    if (ppc_jit_native_compiles()) {
+        jit_check(native_ok,
+                  "native bc agrees for every BO, CR field and CTR edge matrix");
+        jit_check(ppc_jit_threaded_compiles() == 0,
+                  "the native emitter accepted the complete bc matrix");
+    }
+    ppc_jit_disable();
+    load_test_code();
+}
+
+/** The direct-branch matrix above cannot exercise the address-predicted exit
+    used by bclr and bcctr. Cover their complete BO field separately,
+    including bclrl's read-old-LR-before-writing-LR rule and the MPC750 rule
+    that bcctr never decrements CTR. Low target bits are deliberately set in
+    half the cases so both backends also have to apply the architectural
+    four-byte alignment mask. */
+constexpr uint32_t BRC_BASE = 0x8B00;
+constexpr uint32_t BRC_END  = BRC_BASE + 0x10;
+
+static BranchMatrixResult run_computed_branch_case(uint32_t opcode,
+                                                    uint32_t ctr,
+                                                    uint32_t lr,
+                                                    uint32_t cr) {
+    mmu_write_vmem<uint32_t>(NO_OPCODE, BRC_BASE, opcode);
+
+    ppc_state.gpr[3] = 0xDEADBEEF;
+    ppc_state.spr[SPR::CTR] = ctr;
+    ppc_state.spr[SPR::LR]  = lr;
+    ppc_state.cr = cr;
+    ppc_state.pc = BRC_BASE;
+    g_icycles = 0;
+    g_icycles_max = UINT64_MAX;
+    exec_flags = 0;
+    power_on = true;
+    ppc_exec_until(BRC_END);
+
+    return {ppc_state.gpr[3], ppc_state.spr[SPR::CTR],
+            ppc_state.spr[SPR::LR], ppc_state.cr, ppc_state.pc, g_icycles};
+}
+
+struct ComputedBranchCase {
+    uint32_t opcode;
+    uint32_t ctr;
+    uint32_t lr;
+    uint32_t cr;
+};
+
+static void test_computed_branch_matrix() {
+    // bclr/bcctr; fall-through writes one, the indirect target writes two.
+    constexpr uint32_t tail[] = {
+        0,          // replaced by the computed branch below
+        0x38600001, // li r3,1
+        0x48000008, // b BRC_END
+        0x38600002, // li r3,2
+        0,          // test-only illegal goal
+    };
+    for (size_t i = 1; i < sizeof(tail) / sizeof(tail[0]); i++) {
+        mmu_write_vmem<uint32_t>(NO_OPCODE, BRC_BASE + uint32_t(i) * 4, tail[i]);
+    }
+
+    constexpr uint8_t bis[] = {0, 1, 2, 3, 4, 7, 8, 15, 16, 23, 24, 31};
+    constexpr uint32_t ctrs[] = {0, 1, 2, 0x100, 0x101, 0xFFFFFFFFU};
+    constexpr uint32_t crs[] = {0, 0xFFFFFFFFU};
+
+    vector<ComputedBranchCase> cases;
+    for (unsigned lk = 0; lk < 2; lk++) {
+        for (unsigned bo = 0; bo < 32; bo++) {
+            for (uint8_t bi : bis) {
+                for (uint32_t cr : crs) {
+                    for (uint32_t ctr : ctrs) {
+                        const uint32_t low = ctr & 1 ? 3U : 0U;
+                        cases.push_back({(19U << 26) | (bo << 21) |
+                                             (uint32_t(bi) << 16) | (16U << 1) | lk,
+                                         ctr, (BRC_BASE + 12) | low, cr});
+                    }
+
+                    // On the 750 CTR is simultaneously bcctr's target and
+                    // its condition input, and is never decremented.
+                    for (uint32_t low : {0U, 3U}) {
+                        cases.push_back({(19U << 26) | (bo << 21) |
+                                             (uint32_t(bi) << 16) | (528U << 1) | lk,
+                                         (BRC_BASE + 12) | low, 0x13579BDFU, cr});
+                    }
+                }
+            }
+        }
+    }
+
+    ppc_jit_disable();
+    vector<BranchMatrixResult> reference;
+    reference.reserve(cases.size());
+    for (const ComputedBranchCase& c : cases) {
+        reference.push_back(run_computed_branch_case(c.opcode, c.ctr, c.lr, c.cr));
+    }
+
+    ppc_jit_enable(JitBackend::threaded);
+    bool threaded_ok = true;
+    for (size_t i = 0; i < cases.size(); i++) {
+        const ComputedBranchCase& c = cases[i];
+        threaded_ok &= same_branch_matrix(
+            reference[i], run_computed_branch_case(c.opcode, c.ctr, c.lr, c.cr));
+    }
+    jit_check(threaded_ok,
+              "threaded bclr/bcctr agree for every BO, CR field and CTR edge matrix");
+
+    ppc_jit_disable();
+    ppc_jit_enable(JitBackend::automatic);
+    bool native_ok = true;
+    for (size_t i = 0; i < cases.size(); i++) {
+        const ComputedBranchCase& c = cases[i];
+        native_ok &= same_branch_matrix(
+            reference[i], run_computed_branch_case(c.opcode, c.ctr, c.lr, c.cr));
+    }
+    if (ppc_jit_native_compiles()) {
+        jit_check(native_ok,
+                  "native bclr/bcctr agree for every BO, CR field and CTR edge matrix");
+        jit_check(ppc_jit_threaded_compiles() == 0,
+                  "the native emitter accepted the complete bclr/bcctr matrix");
+    }
+    ppc_jit_disable();
+    load_test_code();
+}
+
 /*  Superblock formation: a taken forward beq leaving through a side exit, a
     not taken one falling through it, a bcl 20,31,$+4 dissolving into an LR
     store, and unconditional skips walked through with gaps behind them. The
@@ -2315,6 +2544,7 @@ static uint32_t run_alt_chain_code(bool until) {
 }
 
 static void test_native_chaining() {
+    const bool saved_va_binding = dppc_jit::jit_va_binding;
     ppc_jit_disable();
     if (!ppc_jit_enable(JitBackend::automatic)) {
         cout << "  (no emitter on this host, skipping native chaining)" << endl;
@@ -2336,6 +2566,7 @@ static void test_native_chaining() {
     if (ppc_jit_native_compiles() == 0) {
         cout << "  (no emitter on this host, skipping native chaining)" << endl;
         ppc_opcode_grabber[0] = saved_zero;
+        dppc_jit::jit_va_binding = saved_va_binding;
         ppc_jit_flush();
         return;
     }
@@ -2386,6 +2617,20 @@ static void test_native_chaining() {
     jit_check(ppc_jit_bound_chains() > 0,
               "the restored block acquired a fresh chain binding");
 
+    // The production default keeps each guarded VA way on its resolver. It
+    // still caches the native target and executes it; only the unsafe direct
+    // pointer promotion is omitted.
+    dppc_jit::jit_va_binding = false;
+    ppc_jit_flush();
+    load_va_chain_code();
+    const uint32_t va_safe_result = run_va_chain_code(false);
+    jit_check(va_safe_result == CHAIN_ITERATIONS * 2,
+              "the default resolver-backed VA chain completes natively");
+
+    // Keep exercising the opt-in direct implementation even though the real
+    // workload has shown that it is not ready to be the production default.
+    dppc_jit::jit_va_binding = true;
+
     // Repeat the lifecycle through ChainVaSlot. Its two guarded ways keep
     // observed targets as well as direct bindings, so an until loop can avoid
     // translating the same cross-page destination on every turn without
@@ -2397,6 +2642,22 @@ static void test_native_chaining() {
               "a cross-page ppc_exec loop completed through a virtual chain");
     jit_check(ppc_jit_bound_chains() > 0,
               "the cross-page loop left a guarded virtual chain binding");
+
+    // Kill a bound VA target and immediately enter through ppc_exec again.
+    // ppc_exec_until would call unbind_all_chains first and hide a stale
+    // direct pointer, so this has to precede every until run. Change the
+    // instruction as well as invalidating it: executing the old native entry
+    // then produces the old sum and makes the dangling binding observable.
+    mmu_write_vmem<uint32_t>(NO_OPCODE, VA_CHAIN_A, 0x38630002); // addi r3,r3,2
+    const uint32_t va_replaced_result = run_va_chain_code(false);
+    jit_check(va_replaced_result == CHAIN_ITERATIONS * 3,
+              "a virtual chain executes a replaced target without global unbind");
+
+    // Put the ordinary loop back for the observation-cache lifecycle below.
+    mmu_write_vmem<uint32_t>(NO_OPCODE, VA_CHAIN_A, 0x38630001);
+    const uint32_t va_restored_bound_result = run_va_chain_code(false);
+    jit_check(va_restored_bound_result == CHAIN_ITERATIONS * 2,
+              "a virtual chain rebinds a target replaced a second time");
 
     const uint32_t va_until_result = run_va_chain_code(true);
     jit_check(va_until_result == CHAIN_ITERATIONS * 2,
@@ -2451,6 +2712,7 @@ static void test_native_chaining() {
               "the alternating site promoted its virtual ways to bindings");
 
     ppc_opcode_grabber[0] = saved_zero;
+    dppc_jit::jit_va_binding = saved_va_binding;
     ppc_jit_flush();
 }
 
@@ -3015,6 +3277,8 @@ int test_jit() {
     test_store_subset();
     test_cr_subset();
     test_branch_subset();
+    test_branch_matrix();
+    test_computed_branch_matrix();
     test_superblock_subset();
     test_superblock_budget_edge();
     test_cross_page_call();
