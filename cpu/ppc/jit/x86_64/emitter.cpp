@@ -335,6 +335,22 @@ void X64Emitter::imul_reg_reg32(X64Gpr dst, X64Gpr src) {
     this->modrm_reg(uint8_t(dst), uint8_t(src));
 }
 
+void X64Emitter::imul_reg_reg_imm32(X64Gpr dst, X64Gpr src, uint32_t imm) {
+    // Three operands leave src untouched. 6B sign extends an imm8; 69 carries
+    // the full word. Both produce the same low 32 bits for signed and unsigned
+    // multiplication, which is exactly what MulLow represents.
+    this->rex(false, uint8_t(dst), uint8_t(src));
+    if (fits_int8(int32_t(imm))) {
+        this->emit8(0x6B);
+        this->modrm_reg(uint8_t(dst), uint8_t(src));
+        this->emit8(uint8_t(int8_t(imm)));
+    } else {
+        this->emit8(0x69);
+        this->modrm_reg(uint8_t(dst), uint8_t(src));
+        this->emit32(imm);
+    }
+}
+
 void X64Emitter::imul_reg64_reg64(X64Gpr dst, X64Gpr src) {
     this->rex(true, uint8_t(dst), uint8_t(src));
     this->emit8(0x0F);

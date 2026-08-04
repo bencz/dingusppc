@@ -392,6 +392,7 @@ public:
             case IROpcode::And: return this->constant(lhs.imm & rhs.imm);
             case IROpcode::Or:  return this->constant(lhs.imm | rhs.imm);
             case IROpcode::Xor: return this->constant(lhs.imm ^ rhs.imm);
+            case IROpcode::MulLow: return this->constant(lhs.imm * rhs.imm);
             default: break;
             }
         }

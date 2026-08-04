@@ -70,6 +70,8 @@ static void test_x64_encoding() {
     emitter.movbe_mem_reg16(dppc_jit::R10, -8, dppc_jit::R9);
     emitter.cmp_reg_imm32(dppc_jit::R9, 0);
     emitter.cmp_reg_imm32(dppc_jit::R10, 0x12345678);
+    emitter.imul_reg_reg_imm32(dppc_jit::R9, dppc_jit::R10, uint32_t(-2));
+    emitter.imul_reg_reg_imm32(dppc_jit::R10, dppc_jit::R9, 0x12345678);
 
     constexpr uint8_t expected[] = {
         0x45, 0x0F, 0x38, 0xF0, 0x4A, 0x7F,
@@ -77,12 +79,14 @@ static void test_x64_encoding() {
         0x66, 0x45, 0x0F, 0x38, 0xF1, 0x4A, 0xF8,
         0x45, 0x85, 0xC9,
         0x41, 0x81, 0xFA, 0x78, 0x56, 0x34, 0x12,
+        0x45, 0x6B, 0xCA, 0xFE,
+        0x45, 0x69, 0xD1, 0x78, 0x56, 0x34, 0x12,
     };
     bool same = emitter.size() == sizeof(expected);
     for (size_t i = 0; same && i < sizeof(expected); i++) {
         same = emitter.bytes()[i] == expected[i];
     }
-    jit_check(same, "MOVBE and immediate compares have the exact x64 encoding");
+    jit_check(same, "MOVBE, compares and IMUL have the exact x64 encoding");
 }
 #endif
 
@@ -486,6 +490,11 @@ static const uint32_t alu_code[] = {
     0x54B60FFE, // srwi   r22, r5, 31
     0x54B8003E, // rlwinm r24, r5, 0, 0, 31  identity
     0x54B93840, // rlwinm r25, r5, 7, 1, 0   wrapping full mask
+    0x1F7A0000, // mulli  r27, r26, 0
+    0x1F9A0001, // mulli  r28, r26, 1
+    0x1FBA0002, // mulli  r29, r26, 2
+    0x1FDAFFFE, // mulli  r30, r26, -2
+    0x1FFA7FFF, // mulli  r31, r26, 32767
     0x38A5FFFF, // addi   r5, r5, -1
     0x7CA52A14, // add    r5, r5, r5
     0x7CB02B78, // mr     r16, r5

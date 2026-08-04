@@ -900,7 +900,8 @@ private:
             const IRInsn& in = ir.insns[i];
             const bool immediate_alu = !in.oe &&
                 (in.opcode == IROpcode::Add || in.opcode == IROpcode::And ||
-                 in.opcode == IROpcode::Or  || in.opcode == IROpcode::Xor);
+                 in.opcode == IROpcode::Or  || in.opcode == IROpcode::Xor ||
+                 in.opcode == IROpcode::MulLow);
             const bool immediate_compare = in.opcode == IROpcode::SetCR;
             if (!immediate_alu && !immediate_compare) {
                 continue;
@@ -1003,7 +1004,12 @@ private:
                 }
                 dst = X64Gpr(lowest_bit(free_mask));
                 free_mask &= ~bit(uint8_t(dst));
-                this->asmb.mov_reg_reg32(dst, src);
+                // Three-operand IMUL reads src without destroying it. Its
+                // strength-reduced cases below make their own copy only when
+                // they actually need one.
+                if (in.opcode != IROpcode::MulLow) {
+                    this->asmb.mov_reg_reg32(dst, src);
+                }
             }
 
             const uint32_t imm = this->immediate_value[imm_value];
@@ -1012,6 +1018,18 @@ private:
             case IROpcode::And: this->asmb.and_reg_imm32(dst, imm); break;
             case IROpcode::Or:  this->asmb.or_reg_imm32(dst, imm);  break;
             case IROpcode::Xor: this->asmb.xor_reg_imm32(dst, imm); break;
+            case IROpcode::MulLow:
+                if (imm == 0) {
+                    this->asmb.xor_reg_reg32(dst, dst);
+                } else if (imm == 1) {
+                    if (dst != src) this->asmb.mov_reg_reg32(dst, src);
+                } else if ((imm & (imm - 1)) == 0) {
+                    if (dst != src) this->asmb.mov_reg_reg32(dst, src);
+                    this->asmb.shl_reg_imm8(dst, lowest_bit(imm));
+                } else {
+                    this->asmb.imul_reg_reg_imm32(dst, src, imm);
+                }
+                break;
             default: return false;
             }
 

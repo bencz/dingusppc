@@ -119,6 +119,7 @@ public:
     void sub_reg_reg32(X64Gpr dst, X64Gpr src);   // dst -= src
     void adc_reg_reg32(X64Gpr dst, X64Gpr src);   // dst += src + CF
     void imul_reg_reg32(X64Gpr dst, X64Gpr src);  // dst *= src, OF on overflow
+    void imul_reg_reg_imm32(X64Gpr dst, X64Gpr src, uint32_t imm);
     void not_reg32(X64Gpr dst);                   // leaves the flags alone
     void neg_reg32(X64Gpr dst);                   // dst = -dst
     void setcc_reg8(X64Cond cond, X64Gpr dst);    // low byte only
