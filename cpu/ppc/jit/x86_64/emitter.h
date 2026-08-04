@@ -133,6 +133,15 @@ public:
     void rol_reg16_imm8(X64Gpr dst, uint8_t sh);
     void shr_reg_imm8(X64Gpr dst, uint8_t sh);
     void shl_reg_imm8(X64Gpr dst, uint8_t sh);
+    void sar_reg_imm8(X64Gpr dst, uint8_t sh);
+    void rol_reg_cl32(X64Gpr dst);
+    void shl_reg_cl32(X64Gpr dst);
+    void shr_reg_cl32(X64Gpr dst);
+    void sar_reg_cl32(X64Gpr dst);
+    void bsr_reg_reg32(X64Gpr dst, X64Gpr src);
+    void cdq();
+    void div_reg32(X64Gpr divisor);
+    void idiv_reg32(X64Gpr divisor);
     void bswap_reg32(X64Gpr dst);
     void test_reg_imm32(X64Gpr dst, uint32_t imm);
     void cmp_mem_reg32(X64Gpr base, int32_t disp, X64Gpr src);
@@ -144,6 +153,10 @@ public:
     void imul_reg64_reg64(X64Gpr dst, X64Gpr src); // full 64 bit product
     void movsxd_reg64_reg32(X64Gpr dst, X64Gpr src); // sign extend low word
     void mov_reg64_mem(X64Gpr dst, X64Gpr base, int32_t disp);
+    void mov_mem_reg64(X64Gpr base, int32_t disp, X64Gpr src);
+    void btc_reg64_imm8(X64Gpr dst, uint8_t bit);
+    void btr_reg64_imm8(X64Gpr dst, uint8_t bit);
+    void bts_reg64_imm8(X64Gpr dst, uint8_t bit);
     void add_reg64_mem(X64Gpr dst, X64Gpr base, int32_t disp);
     void add_reg64_reg64(X64Gpr dst, X64Gpr src);
     void movzx_reg8(X64Gpr dst, X64Gpr src);      // zero extend low byte
@@ -165,6 +178,8 @@ public:
     void test_reg64_self(X64Gpr reg);   // all 64 bits, for a returned pointer
     void cmp_mem_imm8(X64Gpr base, int32_t disp, int8_t imm);
     void mov_mem_imm32(X64Gpr base, int32_t disp, uint32_t imm);
+    void and_mem_imm32(X64Gpr base, int32_t disp, uint32_t imm);
+    void or_mem_imm32(X64Gpr base, int32_t disp, uint32_t imm);
     void test_mem_imm32(X64Gpr base, int32_t disp, uint32_t imm);
     void dec_mem32(X64Gpr base, int32_t disp);
 

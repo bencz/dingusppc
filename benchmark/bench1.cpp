@@ -181,6 +181,7 @@ int main(int argc, char** argv) {
         LOG_F(INFO, "Doing %s", theproc ? "ppc_exec_until" : "ppc_exec");
         for (i = 0; i < test_iterations; i++) {
             uint64_t best_sample = -1;
+            uint64_t best_retired = 0;
             for (j = 0; j < test_samples; j++) {
                 ppc_state.pc = 0;
                 ppc_state.gpr[3] = 0x1000;    // buf
@@ -188,17 +189,22 @@ int main(int argc, char** argv) {
                 ppc_state.gpr[5] = 0;         // sum
                 power_on = true;
 
+                const uint64_t retired_before = g_icycles;
                 auto start_time   = std::chrono::steady_clock::now();
                     (theproc) ? ppc_exec_until(0xC4) : ppc_exec();
                 auto end_time     = std::chrono::steady_clock::now();
                 auto time_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time);
-                if (time_elapsed.count() < best_sample)
+                if (time_elapsed.count() < best_sample) {
                     best_sample = time_elapsed.count();
+                    best_retired = g_icycles - retired_before;
+                }
             }
             if (ppc_state.gpr[3] != checksum)
                 LOG_F(INFO, "Checksum: 0x%08X", ppc_state.gpr[3]);
             best_sample -= overhead;
-            LOG_F(INFO, "(%d) %lld ns, %.4lf MiB/s", i+1, best_sample, 1E9 * test_size / (best_sample * 1024 * 1024));
+            LOG_F(INFO, "(%d) %lld ns, %.4lf MiB/s, %.2lf MIPS", i+1,
+                  best_sample, 1E9 * test_size / (best_sample * 1024 * 1024),
+                  double(best_retired) * 1000.0 / double(best_sample));
         }
     }
 

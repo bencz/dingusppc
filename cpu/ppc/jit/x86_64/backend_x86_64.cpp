@@ -169,9 +169,14 @@ constexpr int32_t CR_OFFSET  = int32_t(offsetof(SetPRS, cr));
 constexpr int32_t CTR_OFFSET = int32_t(offsetof(SetPRS, spr) + SPR::CTR * sizeof(uint32_t));
 constexpr int32_t LR_OFFSET  = int32_t(offsetof(SetPRS, spr) + SPR::LR  * sizeof(uint32_t));
 constexpr int32_t XER_OFFSET = int32_t(offsetof(SetPRS, spr) + SPR::XER * sizeof(uint32_t));
+constexpr int32_t RESERVE_OFFSET = int32_t(offsetof(SetPRS, reserve));
 
 inline int32_t gpr_offset(unsigned reg) {
     return int32_t(offsetof(SetPRS, gpr) + reg * sizeof(uint32_t));
+}
+
+inline int32_t fpr_offset(unsigned reg) {
+    return int32_t(offsetof(SetPRS, fpr) + reg * sizeof(FPR_storage));
 }
 
 inline int32_t spr_offset(unsigned spr) {
@@ -368,12 +373,28 @@ private:
         this->live_cmp.valid = false;
         this->plan_lifetimes(ir);
 
+        // Legacy x86 variable shifts require CL and integer division requires
+        // EDX:EAX. Reserve those fixed registers only in blocks that need
+        // them; ordinary blocks retain the full volatile register pool.
+        this->active_pool = this->pool;
+        for (const IRInsn& in : ir.insns) {
+            if (in.opcode == IROpcode::ShiftLeft ||
+                in.opcode == IROpcode::ShiftRightU ||
+                in.opcode == IROpcode::Sraw ||
+                in.opcode == IROpcode::RotlMaskVar) {
+                this->active_pool &= ~bit(RCX);
+            }
+            if (in.opcode == IROpcode::DivS || in.opcode == IROpcode::DivU) {
+                this->active_pool &= ~(bit(RAX) | bit(RDX));
+            }
+        }
+
         const X64Gpr arg0 = X64Gpr(this->abi.int_arg_regs[0]);
         const X64Gpr arg1 = X64Gpr(this->abi.int_arg_regs[1]);
         const X64Gpr arg2 = X64Gpr(this->abi.int_arg_regs[2]);
         const X64Gpr ret  = X64Gpr(this->abi.int_ret_reg);
 
-        uint32_t free_mask = this->pool;
+        uint32_t free_mask = this->active_pool;
 
         size_t dead_store_count = 0;
         for (uint8_t dead : this->dead_gpr_store) {
@@ -435,7 +456,7 @@ private:
                     // block. The builder invalidated its cache, so nothing
                     // lives across this and the exit scratches freely
                     this->emit_branch(in, in.insn_idx + 1 - this->accounted);
-                    free_mask = this->pool;
+                    free_mask = this->active_pool;
                     continue;
                 }
                 this->emit_branch(in, ir.insn_count - this->accounted);
@@ -448,7 +469,7 @@ private:
                     return false;
                 }
                 // nothing is live here, so the pool comes back whole
-                free_mask = this->pool;
+                free_mask = this->active_pool;
                 continue;
             }
 
@@ -456,7 +477,7 @@ private:
                 this->emit_itrans_guard(in);
                 // the probe scratches RAX, RDX and the scratch register;
                 // the builder invalidated its cache to match
-                free_mask = this->pool;
+                free_mask = this->active_pool;
                 continue;
             }
 
@@ -472,6 +493,28 @@ private:
                 if (!this->emit_mtcrf(in, i, free_mask)) {
                     return false;
                 }
+                continue;
+            }
+
+            if (in.opcode == IROpcode::ShiftLeft ||
+                in.opcode == IROpcode::ShiftRightU ||
+                in.opcode == IROpcode::Sraw ||
+                in.opcode == IROpcode::RotlMaskVar) {
+                if (!this->emit_shift(in, i, free_mask)) {
+                    return false;
+                }
+                continue;
+            }
+
+            if (in.opcode == IROpcode::DivS || in.opcode == IROpcode::DivU) {
+                if (!this->emit_div(in, i, free_mask)) {
+                    return false;
+                }
+                continue;
+            }
+
+            if (in.opcode == IROpcode::FMove) {
+                this->emit_fmove(in);
                 continue;
             }
 
@@ -822,6 +865,7 @@ private:
         this->immediate_const.assign(ir.insns.size(), 0);
         this->immediate_value.assign(ir.insns.size(), 0);
         this->dead_gpr_store.assign(ir.insns.size(), 0);
+        this->dead_cr_store.assign(ir.insns.size(), 0);
 
         std::vector<uint16_t> use_count(ir.insns.size(), 0);
 
@@ -858,6 +902,38 @@ private:
                     this->dead_gpr_store[pending_store[in.reg]] = 1;
                 }
                 pending_store[in.reg] = IRValue(i);
+            }
+        }
+
+        // A CR field write can stay lazy until something observes CR. If the
+        // same field is replaced first, the earlier materialisation is dead.
+        // The last write is deliberately kept because every block exit must
+        // expose complete architectural state to the dispatcher.
+        IRValue pending_cr[8];
+        for (IRValue& pending : pending_cr) {
+            pending = IR_NO_VALUE;
+        }
+        for (size_t i = 0; i < ir.insns.size(); i++) {
+            const IRInsn& in = ir.insns[i];
+            const bool barrier = in.opcode == IROpcode::Call ||
+                                 in.opcode == IROpcode::Load ||
+                                 in.opcode == IROpcode::Store ||
+                                 in.opcode == IROpcode::Branch ||
+                                 in.opcode == IROpcode::ItransGuard ||
+                                 in.opcode == IROpcode::LoadCR ||
+                                 in.opcode == IROpcode::StoreCR ||
+                                 in.opcode == IROpcode::MtCrf;
+            if (barrier) {
+                for (IRValue& pending : pending_cr) {
+                    pending = IR_NO_VALUE;
+                }
+            }
+            if (in.opcode == IROpcode::SetCR) {
+                const unsigned field = in.crf >> 2;
+                if (pending_cr[field] != IR_NO_VALUE) {
+                    this->dead_cr_store[pending_cr[field]] = 1;
+                }
+                pending_cr[field] = IRValue(i);
             }
         }
 
@@ -930,6 +1006,7 @@ private:
         switch (op) {
         case IROpcode::LoadGPR:
         case IROpcode::LoadSPR:
+        case IROpcode::LoadCR:
         case IROpcode::ConstI32:
         case IROpcode::PcRel:
         case IROpcode::Add:
@@ -942,6 +1019,7 @@ private:
         case IROpcode::MulLow:
         case IROpcode::MulHighS:
         case IROpcode::MulHighU:
+        case IROpcode::CountLeadingZeros:
             return true;
         default:
             return false;
@@ -985,6 +1063,12 @@ private:
             return true;
         }
 
+        if (in.opcode == IROpcode::StoreCR) {
+            this->asmb.mov_mem_reg32(REG_STATE, CR_OFFSET, ra);
+            if (a_dies) free_mask |= bit(uint8_t(ra));
+            return true;
+        }
+
         if (!this->takes_register(in.opcode)) {
             return false; // Phi and anything else added later
         }
@@ -1009,15 +1093,23 @@ private:
                 free_mask &= ~bit(uint8_t(dst));
                 // Three-operand IMUL reads src without destroying it. Its
                 // strength-reduced cases below make their own copy only when
-                // they actually need one.
-                if (in.opcode != IROpcode::MulLow) {
+                // they actually need one. ADD uses LEA when src remains live,
+                // producing the copy and sum in one flag-preserving opcode.
+                if (in.opcode != IROpcode::MulLow &&
+                    in.opcode != IROpcode::Add) {
                     this->asmb.mov_reg_reg32(dst, src);
                 }
             }
 
             const uint32_t imm = this->immediate_value[imm_value];
             switch (in.opcode) {
-            case IROpcode::Add: this->asmb.add_reg_imm32(dst, imm); break;
+            case IROpcode::Add:
+                if (dst == src) {
+                    this->asmb.add_reg_imm32(dst, imm);
+                } else {
+                    this->asmb.lea_reg_mem(dst, src, int32_t(imm));
+                }
+                break;
             case IROpcode::And: this->asmb.and_reg_imm32(dst, imm); break;
             case IROpcode::Or:  this->asmb.or_reg_imm32(dst, imm);  break;
             case IROpcode::Xor: this->asmb.xor_reg_imm32(dst, imm); break;
@@ -1062,6 +1154,9 @@ private:
             break;
         case IROpcode::LoadSPR:
             this->asmb.mov_reg_mem32(dst, REG_STATE, spr_offset(in.reg));
+            break;
+        case IROpcode::LoadCR:
+            this->asmb.mov_reg_mem32(dst, REG_STATE, CR_OFFSET);
             break;
         case IROpcode::ConstI32:
             this->asmb.mov_reg_imm32(dst, in.imm);
@@ -1134,6 +1229,19 @@ private:
             if (in.width == 1) this->asmb.movsx_reg8(dst, ra);
             else               this->asmb.movsx_reg16(dst, ra);
             break;
+        case IROpcode::CountLeadingZeros: {
+            X64Emitter::Label zero = this->asmb.new_label();
+            X64Emitter::Label done = this->asmb.new_label();
+            this->asmb.bsr_reg_reg32(dst, ra);
+            this->asmb.jcc(X64Cond::Equal, zero);
+            // BSR returns a value in [0,31]; xor 31 is exactly 31-index.
+            this->asmb.xor_reg_imm32(dst, 31);
+            this->asmb.jmp(done);
+            this->asmb.bind(zero);
+            this->asmb.mov_reg_imm32(dst, 32);
+            this->asmb.bind(done);
+            break;
+        }
         default:
             return false;
         }
@@ -1148,7 +1256,9 @@ private:
 
     static bool flags_survive(IROpcode op) {
         return op == IROpcode::StoreGPR || op == IROpcode::StoreSPR ||
+               op == IROpcode::StoreCR  ||
                op == IROpcode::LoadGPR  || op == IROpcode::LoadSPR  ||
+               op == IROpcode::LoadCR   ||
                op == IROpcode::ConstI32 || op == IROpcode::PcRel    ||
                op == IROpcode::Exts;
     }
@@ -1158,6 +1268,164 @@ private:
                op == IROpcode::Or       || op == IROpcode::Xor ||
                op == IROpcode::MulLow   || op == IROpcode::MulHighS ||
                op == IROpcode::MulHighU;
+    }
+
+    /** Variable word shifts. RCX is removed from active_pool for the whole
+        block, so copying the count to CL cannot evict an SSA value. The PPC
+        bit-five rule is explicit because x86 otherwise masks every count to
+        five bits. */
+    bool emit_shift(const IRInsn& in, size_t idx, uint32_t& free_mask) {
+        const X64Gpr ra = X64Gpr(this->reg_of[in.a]);
+        const X64Gpr rb = X64Gpr(this->reg_of[in.b]);
+        const bool a_dies = this->last_use[in.a] == idx;
+        const bool b_dies = this->last_use[in.b] == idx;
+
+        X64Gpr dst;
+        if (in.opcode != IROpcode::Sraw && a_dies) {
+            dst = ra;
+        } else {
+            uint32_t avail = free_mask & ~bit(uint8_t(ra)) & ~bit(uint8_t(rb));
+            if (!avail) {
+                return false;
+            }
+            dst = X64Gpr(lowest_bit(avail));
+            free_mask &= ~bit(uint8_t(dst));
+        }
+
+        this->asmb.mov_reg_reg32(RCX, rb);
+        if (dst != ra) this->asmb.mov_reg_reg32(dst, ra);
+
+        if (in.opcode == IROpcode::RotlMaskVar) {
+            this->asmb.rol_reg_cl32(dst);
+            const uint32_t mask = rot_mask(in.mb, in.me);
+            if (mask != 0xFFFFFFFFU) {
+                this->asmb.and_reg_imm32(dst, mask);
+            }
+        } else if (in.opcode == IROpcode::ShiftLeft ||
+                   in.opcode == IROpcode::ShiftRightU) {
+            if (in.opcode == IROpcode::ShiftLeft) {
+                this->asmb.shl_reg_cl32(dst);
+            } else {
+                this->asmb.shr_reg_cl32(dst);
+            }
+            // Counts whose bit five is set yield zero, not count modulo 32.
+            this->asmb.xor_reg_reg32(REG_SCRATCH, REG_SCRATCH);
+            this->asmb.test_reg_imm32(RCX, 0x20);
+            this->asmb.cmov_reg_reg32(X64Cond::NotEqual, dst, REG_SCRATCH);
+        } else { // Sraw, including srawi lowered with a constant count
+            X64Emitter::Label large = this->asmb.new_label();
+            X64Emitter::Label set_ca = this->asmb.new_label();
+            X64Emitter::Label clear_ca = this->asmb.new_label();
+            X64Emitter::Label done = this->asmb.new_label();
+
+            this->asmb.test_reg_imm32(RCX, 0x20);
+            this->asmb.jcc(X64Cond::NotEqual, large);
+            this->asmb.sar_reg_cl32(dst);
+            this->asmb.test_reg_imm32(ra, 0x80000000U);
+            this->asmb.jcc(X64Cond::Equal, clear_ca);
+            // For a negative source CA is set iff shifting the result back
+            // does not recover the source, i.e. at least one discarded bit
+            // was one. This also makes shift zero clear CA.
+            this->asmb.mov_reg_reg32(REG_SCRATCH, dst);
+            this->asmb.shl_reg_cl32(REG_SCRATCH);
+            this->asmb.cmp_reg_reg32(REG_SCRATCH, ra);
+            this->asmb.jcc(X64Cond::NotEqual, set_ca);
+            this->asmb.jmp(clear_ca);
+
+            this->asmb.bind(large);
+            this->asmb.sar_reg_imm8(dst, 31);
+            this->asmb.test_reg_imm32(ra, 0x80000000U);
+            this->asmb.jcc(X64Cond::NotEqual, set_ca);
+
+            this->asmb.bind(clear_ca);
+            this->asmb.and_mem_imm32(REG_STATE, XER_OFFSET, ~uint32_t(XER::CA));
+            this->asmb.jmp(done);
+            this->asmb.bind(set_ca);
+            this->asmb.or_mem_imm32(REG_STATE, XER_OFFSET, XER::CA);
+            this->asmb.bind(done);
+        }
+
+        if (a_dies && ra != dst) free_mask |= bit(uint8_t(ra));
+        if (b_dies && rb != dst) free_mask |= bit(uint8_t(rb));
+        this->reg_of[idx] = uint8_t(dst);
+        return true;
+    }
+
+    /** Divide only after proving the host cannot trap. MPC750 exceptional
+        results are zero; the translator leaves the different 601 rules in
+        the interpreter. EAX and EDX are reserved only for blocks containing
+        one of these operations. */
+    bool emit_div(const IRInsn& in, size_t idx, uint32_t& free_mask) {
+        const X64Gpr ra = X64Gpr(this->reg_of[in.a]);
+        const X64Gpr rb = X64Gpr(this->reg_of[in.b]);
+        const bool a_dies = this->last_use[in.a] == idx;
+        const bool b_dies = this->last_use[in.b] == idx;
+
+        X64Gpr dst;
+        if (a_dies) {
+            dst = ra;
+        } else if (b_dies) {
+            dst = rb;
+        } else {
+            uint32_t avail = free_mask & ~bit(uint8_t(ra)) & ~bit(uint8_t(rb));
+            if (!avail) {
+                return false;
+            }
+            dst = X64Gpr(lowest_bit(avail));
+            free_mask &= ~bit(uint8_t(dst));
+        }
+
+        X64Emitter::Label exceptional = this->asmb.new_label();
+        X64Emitter::Label divide = this->asmb.new_label();
+        X64Emitter::Label done = this->asmb.new_label();
+
+        this->asmb.cmp_reg_imm32(rb, 0);
+        this->asmb.jcc(X64Cond::Equal, exceptional);
+        if (in.opcode == IROpcode::DivS) {
+            this->asmb.cmp_reg_imm32(ra, 0x80000000U);
+            this->asmb.jcc(X64Cond::NotEqual, divide);
+            this->asmb.cmp_reg_imm32(rb, 0xFFFFFFFFU);
+            this->asmb.jcc(X64Cond::Equal, exceptional);
+        }
+
+        this->asmb.bind(divide);
+        this->asmb.mov_reg_reg32(RAX, ra);
+        if (in.opcode == IROpcode::DivS) {
+            this->asmb.cdq();
+            this->asmb.idiv_reg32(rb);
+        } else {
+            this->asmb.xor_reg_reg32(RDX, RDX);
+            this->asmb.div_reg32(rb);
+        }
+        this->asmb.mov_reg_reg32(dst, RAX);
+        this->asmb.jmp(done);
+
+        this->asmb.bind(exceptional);
+        this->asmb.xor_reg_reg32(dst, dst);
+        this->asmb.bind(done);
+
+        if (a_dies && ra != dst) free_mask |= bit(uint8_t(ra));
+        if (b_dies && rb != dst) free_mask |= bit(uint8_t(rb));
+        this->reg_of[idx] = uint8_t(dst);
+        return true;
+    }
+
+    void emit_fmove(const IRInsn& in) {
+        this->asmb.mov_reg64_mem(REG_SCRATCH, REG_STATE, fpr_offset(in.ureg));
+        switch (FMoveKind(in.imm)) {
+        case FMoveKind::Negate:
+            this->asmb.btc_reg64_imm8(REG_SCRATCH, 63);
+            break;
+        case FMoveKind::Absolute:
+            this->asmb.btr_reg64_imm8(REG_SCRATCH, 63);
+            break;
+        case FMoveKind::NegativeAbsolute:
+            this->asmb.bts_reg64_imm8(REG_SCRATCH, 63);
+            break;
+        default:
+            break;
+        }
+        this->asmb.mov_mem_reg64(REG_STATE, fpr_offset(in.reg), REG_SCRATCH);
     }
 
     /** The XER[CA] family: the operation itself, then the host carry flag
@@ -1748,6 +2016,12 @@ private:
         if (in.ureg != IR_NO_UPDATE) {
             this->asmb.mov_mem_reg32(REG_STATE, gpr_offset(in.ureg), rea);
         }
+        if (in.reservation) {
+            // lwarx's fast path completed without an exception. The slow
+            // helper owns the earlier-before-read ordering on a fault.
+            this->asmb.mov_reg_imm32(rtmp, 1);
+            this->asmb.mov_mem_reg8(REG_STATE, RESERVE_OFFSET, rtmp);
+        }
         this->asmb.jmp(done);
 
         this->asmb.bind(slow);
@@ -1778,6 +2052,12 @@ private:
         const X64Gpr rb = b_immediate ? RAX : X64Gpr(this->reg_of[in.b]);
         const bool a_dies = this->last_use[in.a] == idx;
         const bool b_dies = this->last_use[in.b] == idx;
+
+        if (this->dead_cr_store[idx]) {
+            if (a_dies) free_mask |= bit(uint8_t(ra));
+            if (b_dies && !b_immediate) free_mask |= bit(uint8_t(rb));
+            return true;
+        }
 
         uint32_t avail = free_mask & ~bit(uint8_t(ra));
         if (!b_immediate) {
@@ -2182,6 +2462,7 @@ private:
     const AbiDesc&        abi;
     const int32_t         pad;
     const uint32_t        pool;
+    uint32_t              active_pool = 0;
     const bool            use_movbe;
     CodeMem               code;
 
@@ -2213,6 +2494,7 @@ private:
     std::vector<uint8_t>  immediate_const;
     std::vector<uint32_t> immediate_value;
     std::vector<uint8_t>  dead_gpr_store;
+    std::vector<uint8_t>  dead_cr_store;
 
     typedef struct ColdExit { X64Emitter::Label label; uint32_t guest_idx; } ColdExit;
     std::vector<ColdExit> cold_exits;

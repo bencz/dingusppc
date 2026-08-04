@@ -452,6 +452,61 @@ void X64Emitter::shl_reg_imm8(X64Gpr dst, uint8_t sh) {
     this->emit8(sh & 31);
 }
 
+void X64Emitter::sar_reg_imm8(X64Gpr dst, uint8_t sh) {
+    if ((sh & 31) == 0) return;
+    this->rex(false, 0, uint8_t(dst));
+    this->emit8(0xC1);
+    this->modrm_reg(7, uint8_t(dst)); // /7 is sar
+    this->emit8(sh & 31);
+}
+
+void X64Emitter::rol_reg_cl32(X64Gpr dst) {
+    this->rex(false, 0, uint8_t(dst));
+    this->emit8(0xD3);
+    this->modrm_reg(0, uint8_t(dst));
+}
+
+void X64Emitter::shl_reg_cl32(X64Gpr dst) {
+    this->rex(false, 0, uint8_t(dst));
+    this->emit8(0xD3);
+    this->modrm_reg(4, uint8_t(dst));
+}
+
+void X64Emitter::shr_reg_cl32(X64Gpr dst) {
+    this->rex(false, 0, uint8_t(dst));
+    this->emit8(0xD3);
+    this->modrm_reg(5, uint8_t(dst));
+}
+
+void X64Emitter::sar_reg_cl32(X64Gpr dst) {
+    this->rex(false, 0, uint8_t(dst));
+    this->emit8(0xD3);
+    this->modrm_reg(7, uint8_t(dst));
+}
+
+void X64Emitter::bsr_reg_reg32(X64Gpr dst, X64Gpr src) {
+    this->rex(false, uint8_t(dst), uint8_t(src));
+    this->emit8(0x0F);
+    this->emit8(0xBD);
+    this->modrm_reg(uint8_t(dst), uint8_t(src));
+}
+
+void X64Emitter::cdq() {
+    this->emit8(0x99);
+}
+
+void X64Emitter::div_reg32(X64Gpr divisor) {
+    this->rex(false, 0, uint8_t(divisor));
+    this->emit8(0xF7);
+    this->modrm_reg(6, uint8_t(divisor));
+}
+
+void X64Emitter::idiv_reg32(X64Gpr divisor) {
+    this->rex(false, 0, uint8_t(divisor));
+    this->emit8(0xF7);
+    this->modrm_reg(7, uint8_t(divisor));
+}
+
 void X64Emitter::bswap_reg32(X64Gpr dst) {
     this->rex(false, 0, uint8_t(dst));
     this->emit8(0x0F);
@@ -488,6 +543,36 @@ void X64Emitter::mov_reg64_mem(X64Gpr dst, X64Gpr base, int32_t disp) {
     this->rex(true, uint8_t(dst), uint8_t(base));
     this->emit8(0x8B);
     this->modrm_mem(uint8_t(dst), uint8_t(base), disp);
+}
+
+void X64Emitter::mov_mem_reg64(X64Gpr base, int32_t disp, X64Gpr src) {
+    this->rex(true, uint8_t(src), uint8_t(base));
+    this->emit8(0x89);
+    this->modrm_mem(uint8_t(src), uint8_t(base), disp);
+}
+
+void X64Emitter::btc_reg64_imm8(X64Gpr dst, uint8_t selected_bit) {
+    this->rex(true, 0, uint8_t(dst));
+    this->emit8(0x0F);
+    this->emit8(0xBA);
+    this->modrm_reg(7, uint8_t(dst));
+    this->emit8(selected_bit);
+}
+
+void X64Emitter::btr_reg64_imm8(X64Gpr dst, uint8_t selected_bit) {
+    this->rex(true, 0, uint8_t(dst));
+    this->emit8(0x0F);
+    this->emit8(0xBA);
+    this->modrm_reg(6, uint8_t(dst));
+    this->emit8(selected_bit);
+}
+
+void X64Emitter::bts_reg64_imm8(X64Gpr dst, uint8_t selected_bit) {
+    this->rex(true, 0, uint8_t(dst));
+    this->emit8(0x0F);
+    this->emit8(0xBA);
+    this->modrm_reg(5, uint8_t(dst));
+    this->emit8(selected_bit);
 }
 
 void X64Emitter::add_reg64_mem(X64Gpr dst, X64Gpr base, int32_t disp) {
@@ -637,6 +722,20 @@ void X64Emitter::mov_mem_imm32(X64Gpr base, int32_t disp, uint32_t imm) {
     this->rex(false, 0, uint8_t(base));
     this->emit8(0xC7);
     this->modrm_mem(0, uint8_t(base), disp);
+    this->emit32(imm);
+}
+
+void X64Emitter::and_mem_imm32(X64Gpr base, int32_t disp, uint32_t imm) {
+    this->rex(false, 0, uint8_t(base));
+    this->emit8(0x81);
+    this->modrm_mem(4, uint8_t(base), disp);
+    this->emit32(imm);
+}
+
+void X64Emitter::or_mem_imm32(X64Gpr base, int32_t disp, uint32_t imm) {
+    this->rex(false, 0, uint8_t(base));
+    this->emit8(0x81);
+    this->modrm_mem(1, uint8_t(base), disp);
     this->emit32(imm);
 }
 

@@ -90,6 +90,8 @@ enum class IROpcode : uint8_t {
                // which today means LR and CTR; anything with a side effect
                // stays a Call
     StoreSPR,  // spr `reg` <- a
+    LoadCR,    // full condition register -> dest
+    StoreCR,   // full condition register <- a
 
     // values
     ConstI32,  // imm          -> dest
@@ -143,6 +145,28 @@ enum class IROpcode : uint8_t {
     MulLow,
     MulHighS,
     MulHighU,
+
+    /** Word shifts retain PowerPC's six-bit count semantics: bit five makes
+        slw/srw zero and makes sraw sign-fill, while higher bits are ignored.
+        Sraw also updates XER[CA]. RotlMaskVar uses the low five bits, exactly
+        as rlwnm does. */
+    ShiftLeft,
+    ShiftRightU,
+    Sraw,
+    RotlMaskVar,
+    CountLeadingZeros,
+
+    /** The non-OE integer divide forms. Exceptional operands are represented
+        here too; a backend must produce the guest CPU's defined result rather
+        than letting a host divide trap. */
+    DivS,
+    DivU,
+
+    /** Bit-preserving floating-register moves. imm selects copy, toggle sign,
+        clear sign or set sign. Rc forms remain interpreter calls because they
+        also transfer FPSCR status into CR1. No floating arithmetic is implied
+        by this opcode. */
+    FMove,
 
     /** mtcrf: merges `a` into the condition register under a mask decided at
         translation time from CRM, carried in imm. No value is defined */
@@ -198,12 +222,10 @@ enum class IROpcode : uint8_t {
         The Rc forms come through here too, as a signed comparison of the
         result against zero, which is what ppc_changecrf0 computes.
 
-        It is materialised where it appears rather than deferred. Deferring is
-        what "lazy flags" means and the slot for it is the translator's
-        pending state, but at a mean block length of 4.3 guest instructions
-        the dominant shape is a compare immediately consumed by the branch
-        that ends the block, so there is no dead write to drop. It pays once a
-        compilation unit spans several blocks */
+        Its architectural position stays explicit. A backend may leave an
+        earlier write unmaterialised when the same field is replaced before a
+        branch, helper, memory side exit or full-CR read; the final write stays
+        eager so every block exit exposes complete guest state. */
     SetCR,
 };
 
@@ -225,6 +247,13 @@ enum class BranchTarget : uint8_t {
     Direct, // in the instruction: displacement, or absolute when AA
     LR,     // link register at run time, masked to a word boundary
     CTR,    // count register at run time, likewise
+};
+
+enum class FMoveKind : uint8_t {
+    Copy,
+    Negate,
+    Absolute,
+    NegativeAbsolute,
 };
 
 typedef struct IRInsn {
@@ -261,6 +290,7 @@ typedef struct IRInsn {
     uint8_t  width;   // Exts and Load width in bytes
     bool     signed_load;  // Load sign extends rather than zero extends
     bool     byte_reverse; // Load and Store move the bytes mirrored, lwbrx kin
+    bool     reservation;  // lwarx sets the guest reservation on a completed load
     bool     cr_signed;   // SetCR compares signed rather than unsigned
     uint8_t  crf;         // SetCR field, already multiplied by four
 
@@ -360,7 +390,8 @@ enum JitDecodeGroup : uint32_t {
     JIT_DECODE_STORE   = 1 << 3,
     JIT_DECODE_COMPARE = 1 << 4,
     JIT_DECODE_SPR     = 1 << 5, // mfspr and mtspr of LR and CTR, eieio, mtcrf
-    JIT_DECODE_ALL     = 0x3F,
+    JIT_DECODE_FPU     = 1 << 6, // bit-preserving FPR moves; arithmetic falls back
+    JIT_DECODE_ALL     = 0x7F,
 };
 
 extern uint32_t jit_decode_groups;

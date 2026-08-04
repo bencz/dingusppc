@@ -110,6 +110,12 @@ void threaded_entry(const JitBlock* blk) {
         case IROpcode::StoreSPR:
             ppc_state.spr[in.reg] = vals[in.a];
             break;
+        case IROpcode::LoadCR:
+            vals[i] = ppc_state.cr;
+            break;
+        case IROpcode::StoreCR:
+            ppc_state.cr = vals[in.a];
+            break;
         case IROpcode::PcRel:
             vals[i] = entry_pc + in.imm;
             break;
@@ -213,6 +219,71 @@ void threaded_entry(const JitBlock* blk) {
         case IROpcode::MulHighU:
             vals[i] = uint32_t((uint64_t(vals[in.a]) * uint64_t(vals[in.b])) >> 32);
             break;
+        case IROpcode::ShiftLeft: {
+            const uint32_t count = vals[in.b];
+            vals[i] = (count & 0x20) ? 0 : vals[in.a] << (count & 31);
+            break;
+        }
+        case IROpcode::ShiftRightU: {
+            const uint32_t count = vals[in.b];
+            vals[i] = (count & 0x20) ? 0 : vals[in.a] >> (count & 31);
+            break;
+        }
+        case IROpcode::Sraw: {
+            const uint32_t source = vals[in.a];
+            const uint32_t count  = vals[in.b];
+            uint32_t result;
+            bool carry;
+            if (count & 0x20) {
+                result = uint32_t(int32_t(source) >> 31);
+                carry  = int32_t(source) < 0;
+            } else {
+                const unsigned sh = count & 31;
+                result = uint32_t(int32_t(source) >> sh);
+                carry = int32_t(source) < 0 &&
+                        (source & (sh ? ((uint32_t(1) << sh) - 1) : 0));
+            }
+            if (carry) ppc_state.spr[SPR::XER] |=  XER::CA;
+            else       ppc_state.spr[SPR::XER] &= ~XER::CA;
+            vals[i] = result;
+            break;
+        }
+        case IROpcode::RotlMaskVar:
+            vals[i] = rotl32(vals[in.a], vals[in.b] & 31) &
+                      rot_mask(in.mb, in.me);
+            break;
+        case IROpcode::CountLeadingZeros: {
+            const uint32_t value = vals[in.a];
+            uint32_t count = 0;
+            for (uint32_t mask = 0x80000000U; mask && !(value & mask);
+                 mask >>= 1) {
+                count++;
+            }
+            vals[i] = count;
+            break;
+        }
+        case IROpcode::DivS: {
+            const uint32_t a = vals[in.a];
+            const uint32_t b = vals[in.b];
+            vals[i] = (!b || (a == 0x80000000U && b == 0xFFFFFFFFU))
+                    ? 0 : uint32_t(int32_t(a) / int32_t(b));
+            break;
+        }
+        case IROpcode::DivU:
+            vals[i] = vals[in.b] ? vals[in.a] / vals[in.b] : 0;
+            break;
+
+        case IROpcode::FMove: {
+            uint64_t bits = ppc_state.fpr[in.ureg].int64_r;
+            switch (FMoveKind(in.imm)) {
+            case FMoveKind::Negate:           bits ^= 1ULL << 63; break;
+            case FMoveKind::Absolute:         bits &= ~(1ULL << 63); break;
+            case FMoveKind::NegativeAbsolute: bits |= 1ULL << 63; break;
+            default: break;
+            }
+            ppc_state.fpr[in.reg].int64_r = bits;
+            break;
+        }
 
         case IROpcode::MtCrf:
             ppc_state.cr = (ppc_state.cr & ~in.imm) | (vals[in.a] & in.imm);

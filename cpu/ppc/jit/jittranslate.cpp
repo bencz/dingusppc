@@ -24,9 +24,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     Only a subset is decoded into real operations; everything else becomes a
     Call and behaves exactly as it did before. The subset was picked from a
     dynamic profile of a Mac OS X 10.0 install boot, 6.1 billion instructions,
-    and covers the arithmetic that carries the most weight without touching
-    the condition register. CR needs lazy flags to be worth emitting, and
-    rushing it here would have locked in the eager version.
+    and covers the integer, CR and bit-preserving FPU operations that carry
+    useful weight while keeping exception-heavy instructions in helpers.
  */
 
 #include "jitir.h"
@@ -313,6 +312,7 @@ public:
         for (int i = 0; i < 32; i++) {
             this->cache[i] = IR_NO_VALUE;
         }
+        this->cr_cache = IR_NO_VALUE;
     }
 
     IRValue load_gpr(unsigned reg) {
@@ -342,6 +342,13 @@ public:
         emitter had to decline. Deferral becomes worth its pressure when a
         compilation unit spans several basic blocks; the IR already allows it */
     void store_gpr(unsigned reg, IRValue v) {
+        // Writing the value already cached for this register changes no
+        // architected state. This is especially common for `or rD,rS,rS`
+        // when rD and rS are the same register, and avoiding the IR store
+        // also lets a pure self-move decode to no native instructions.
+        if (this->cache[reg] == v) {
+            return;
+        }
         IRInsn in = blank(IROpcode::StoreGPR);
         in.reg = uint8_t(reg);
         in.a   = v;
@@ -377,6 +384,25 @@ public:
         this->out.append(in);
     }
 
+    IRValue load_cr() {
+        if (this->cr_cache != IR_NO_VALUE) {
+            return this->cr_cache;
+        }
+        IRInsn in = blank(IROpcode::LoadCR);
+        this->cr_cache = this->out.append(in);
+        return this->cr_cache;
+    }
+
+    void store_cr(IRValue v) {
+        if (this->cr_cache == v) {
+            return;
+        }
+        IRInsn in = blank(IROpcode::StoreCR);
+        in.a = v;
+        this->out.append(in);
+        this->cr_cache = v;
+    }
+
     IRValue binary(IROpcode op, IRValue a, IRValue b, bool oe = false) {
         // The immediate forms often build an address or mask a half at a
         // time. Once both inputs are already constants there is no run-time
@@ -385,6 +411,45 @@ public:
         // architected state to update even when their numeric result is known.
         const IRInsn& lhs = this->out.insns[a];
         const IRInsn& rhs = this->out.insns[b];
+
+        // Algebraic identities are backend independent. Rc, when present,
+        // still receives the returned value through SetCR; only OE forms are
+        // excluded because they must update XER even when the value is known.
+        if (!oe) {
+            if (a == b) {
+                if (op == IROpcode::And || op == IROpcode::Or) {
+                    return a;
+                }
+                if (op == IROpcode::Sub || op == IROpcode::Xor) {
+                    return this->constant(0);
+                }
+            }
+            if (rhs.opcode == IROpcode::ConstI32) {
+                if ((op == IROpcode::Add || op == IROpcode::Or ||
+                     op == IROpcode::Xor) && rhs.imm == 0) {
+                    return a;
+                }
+                if (op == IROpcode::And && rhs.imm == 0xFFFFFFFFUL) {
+                    return a;
+                }
+                if (op == IROpcode::MulLow && rhs.imm == 1) {
+                    return a;
+                }
+            }
+            if (lhs.opcode == IROpcode::ConstI32) {
+                if ((op == IROpcode::Add || op == IROpcode::Or ||
+                     op == IROpcode::Xor) && lhs.imm == 0) {
+                    return b;
+                }
+                if (op == IROpcode::And && lhs.imm == 0xFFFFFFFFUL) {
+                    return b;
+                }
+                if (op == IROpcode::MulLow && lhs.imm == 1) {
+                    return b;
+                }
+            }
+        }
+
         if (!oe && lhs.opcode == IROpcode::ConstI32 &&
             rhs.opcode == IROpcode::ConstI32) {
             switch (op) {
@@ -409,6 +474,7 @@ public:
         in.a   = a;
         in.imm = mask;
         this->out.append(in);
+        this->cr_cache = IR_NO_VALUE;
     }
 
     IRValue rotl_mask(IRValue a, unsigned sh, unsigned mb, unsigned me) {
@@ -418,6 +484,38 @@ public:
         in.mb = uint8_t(mb);
         in.me = uint8_t(me);
         return this->out.append(in);
+    }
+
+    IRValue shift(IROpcode op, IRValue value, IRValue count) {
+        IRInsn in = blank(op);
+        in.a = value;
+        in.b = count;
+        return this->out.append(in);
+    }
+
+    IRValue rotl_mask_var(IRValue value, IRValue count,
+                          unsigned mb, unsigned me) {
+        IRInsn in = blank(IROpcode::RotlMaskVar);
+        in.a  = value;
+        in.b  = count;
+        in.mb = uint8_t(mb);
+        in.me = uint8_t(me);
+        return this->out.append(in);
+    }
+
+    IRValue count_leading_zeros(IRValue value) {
+        IRInsn in = blank(IROpcode::CountLeadingZeros);
+        in.a = value;
+        return this->out.append(in);
+    }
+
+    void fmove(unsigned dest, unsigned source, FMoveKind kind) {
+        IRInsn in = blank(IROpcode::FMove);
+        in.reg  = uint8_t(dest);
+        in.ureg = uint8_t(source);
+        in.imm  = uint32_t(kind);
+        in.type = IRType::F64;
+        this->out.append(in);
     }
 
     IRValue sign_extend(IRValue a, unsigned width) {
@@ -435,16 +533,24 @@ public:
         for (int i = 0; i < 32; i++) {
             this->cache[i] = IR_NO_VALUE;
         }
+        this->cr_cache = IR_NO_VALUE;
+    }
+
+    void drop_gpr_cache() {
+        for (int i = 0; i < 32; i++) {
+            this->cache[i] = IR_NO_VALUE;
+        }
     }
 
     IRValue load(IRValue ea, unsigned width, bool is_signed, uint32_t raw,
                  PPCOpcode helper, unsigned rd, unsigned update_reg,
-                 bool byte_reverse) {
+                 bool byte_reverse, bool reservation = false) {
         IRInsn in       = blank(IROpcode::Load);
         in.a            = ea;
         in.width        = uint8_t(width);
         in.signed_load  = is_signed;
         in.byte_reverse = byte_reverse;
+        in.reservation  = reservation;
         in.imm          = raw;    // the slow path hands this to the helper
         in.helper       = helper; // which does the whole instruction at once
         in.reg          = uint8_t(rd);
@@ -464,8 +570,8 @@ public:
     }
 
     /** crf is already four times the field number, the way the instruction
-        encodes it. Materialised right here; see the note on IROpcode::SetCR
-        for why there is nothing to defer at this block length */
+        encodes it. The write remains ordered in IR; a backend may discard it
+        when the same field is replaced before any CR observer. */
     void set_cr(unsigned crf, IRValue a, IRValue b, bool is_signed) {
         IRInsn in     = blank(IROpcode::SetCR);
         in.crf        = uint8_t(crf);
@@ -473,6 +579,7 @@ public:
         in.b          = b;
         in.cr_signed  = is_signed;
         this->out.append(in);
+        this->cr_cache = IR_NO_VALUE;
     }
 
     /** The Rc bit, which is a signed comparison of the result against zero */
@@ -574,9 +681,114 @@ private:
 
     IRBlock& out;
     IRValue  cache[32];
+    IRValue  cr_cache;
     int32_t  offset   = 0;
     uint16_t insn_idx = 0;
 };
+
+/** Extract one architected CR bit as a zero/one I32 value. PPC numbers CR
+    bits from the most significant end, while the mask below keeps host bit
+    zero after rotating the selected bit there. */
+IRValue extract_cr_bit(Builder& b, IRValue cr, unsigned bit) {
+    return b.rotl_mask(cr, (bit + 1) & 31, 31, 31);
+}
+
+/** mfcr, mcrf, mcrxr and the eight CR boolean operations. These helpers only
+    manipulate CR/XER words, so expressing them with ordinary IR keeps their
+    state visible at every existing helper and exit boundary. */
+bool decode_cr_state(Builder& b, uint32_t op) {
+    if (rc_bit(op)) {
+        return false;
+    }
+
+    if (primary_op(op) == 31) {
+        const unsigned rd = (op >> 21) & 31;
+        switch (ext_op(op)) {
+        case 19: // mfcr
+            b.store_gpr(rd, b.load_cr());
+            return true;
+        case 512: { // mcrxr: copy XER[SO,OV,CA,reserved] then clear them
+            // The merge temporarily needs CR, XER and two pieces at once.
+            // Cutting unrelated cached GPR live ranges here avoids declining
+            // otherwise valid blocks; every GPR value is already in state.
+            b.drop_gpr_cache();
+            const unsigned d = (op >> 21) & 0x1C;
+            const uint32_t field_mask = 0xF0000000UL >> d;
+            IRValue cr  = b.load_cr();
+            IRValue xer = b.load_spr(SPR::XER);
+            IRValue keep = b.binary(IROpcode::And, cr,
+                                    b.constant(~field_mask));
+            IRValue field = b.rotl_mask(xer, (32 - d) & 31, d, d + 3);
+            b.store_cr(b.binary(IROpcode::Or, keep, field));
+            b.store_spr(SPR::XER, b.binary(IROpcode::And, xer,
+                                           b.constant(0x0FFFFFFFUL)));
+            return true;
+        }
+        default:
+            return false;
+        }
+    }
+
+    if (primary_op(op) != 19) {
+        return false;
+    }
+
+    if (ext_op(op) == 0) { // mcrf
+        const unsigned d = (op >> 21) & 0x1C;
+        const unsigned s = (op >> 16) & 0x1C;
+        const uint32_t field_mask = 0xF0000000UL >> d;
+        IRValue cr = b.load_cr();
+        IRValue keep = b.binary(IROpcode::And, cr,
+                                b.constant(~field_mask));
+        IRValue field = b.rotl_mask(cr, (s + 32 - d) & 31, d, d + 3);
+        b.store_cr(b.binary(IROpcode::Or, keep, field));
+        return true;
+    }
+
+    enum class Logic : uint8_t { And, AndC, Eqv, Nand, Nor, Or, OrC, Xor };
+    Logic logic;
+    switch (ext_op(op)) {
+    case 33:  logic = Logic::Nor;  break;
+    case 129: logic = Logic::AndC; break;
+    case 193: logic = Logic::Xor;  break;
+    case 225: logic = Logic::Nand; break;
+    case 257: logic = Logic::And;  break;
+    case 289: logic = Logic::Eqv;  break;
+    case 417: logic = Logic::OrC;  break;
+    case 449: logic = Logic::Or;   break;
+    default:
+        return false;
+    }
+
+    const unsigned d = (op >> 21) & 31;
+    const unsigned a = (op >> 16) & 31;
+    const unsigned c = (op >> 11) & 31;
+    IRValue cr = b.load_cr();
+    IRValue av = extract_cr_bit(b, cr, a);
+    IRValue bv = extract_cr_bit(b, cr, c);
+    IRValue bit;
+    switch (logic) {
+    case Logic::And:  bit = b.binary(IROpcode::And, av, bv); break;
+    case Logic::AndC: bit = b.binary(IROpcode::And, av,
+                                     b.binary(IROpcode::Xor, bv, b.constant(1))); break;
+    case Logic::Eqv:  bit = b.binary(IROpcode::Xor,
+                                     b.binary(IROpcode::Xor, av, bv), b.constant(1)); break;
+    case Logic::Nand: bit = b.binary(IROpcode::Xor,
+                                     b.binary(IROpcode::And, av, bv), b.constant(1)); break;
+    case Logic::Nor:  bit = b.binary(IROpcode::Xor,
+                                     b.binary(IROpcode::Or, av, bv), b.constant(1)); break;
+    case Logic::Or:   bit = b.binary(IROpcode::Or, av, bv); break;
+    case Logic::OrC:  bit = b.binary(IROpcode::Or, av,
+                                     b.binary(IROpcode::Xor, bv, b.constant(1))); break;
+    default:          bit = b.binary(IROpcode::Xor, av, bv); break;
+    }
+
+    const uint32_t dst_mask = 0x80000000UL >> d;
+    IRValue keep = b.binary(IROpcode::And, cr, b.constant(~dst_mask));
+    IRValue placed = b.rotl_mask(bit, (31 - d) & 31, d, d);
+    b.store_cr(b.binary(IROpcode::Or, keep, placed));
+    return true;
+}
 
 /** The D and X form loads. rA of zero reads as a literal zero, the same rule
     addi follows, and the update forms hand rA to the Load itself, whose fast
@@ -591,6 +803,7 @@ bool decode_load(Builder& b, uint32_t op, PPCOpcode helper) {
     bool     is_signed = false;
     bool     update    = false;
     bool     reversed  = false;
+    bool     reservation = false;
     bool     x_form    = false;
 
     switch (primary_op(op)) {
@@ -605,6 +818,7 @@ bool decode_load(Builder& b, uint32_t op, PPCOpcode helper) {
     case 31:
         x_form = true;
         switch (ext_op(op)) {
+        case 20:  width = 4; reservation = true; break; // lwarx
         case 23:  width = 4; break;                       // lwzx
         case 55:  width = 4; update = true; break;        // lwzux
         case 87:  width = 1; break;                       // lbzx
@@ -634,7 +848,7 @@ bool decode_load(Builder& b, uint32_t op, PPCOpcode helper) {
         ? b.binary(IROpcode::Add, b.load_gpr_or_zero(ra), b.load_gpr(rb))
         : b.binary(IROpcode::Add, b.load_gpr_or_zero(ra), b.constant(uint32_t(d)));
     b.store_gpr(rd, b.load(ea, width, is_signed, op, helper, rd,
-                           update ? ra : IR_NO_UPDATE, reversed));
+                           update ? ra : IR_NO_UPDATE, reversed, reservation));
     return true;
 }
 
@@ -774,20 +988,30 @@ bool decode_branch(Builder& b, uint32_t op) {
     }
 }
 
-/** mfspr and mtspr of the SPRs that are plain storage, plus eieio and mtcrf.
+/** mfspr and mtspr of the SPRs that are plain storage, the cache/barrier
+    operations whose interpreter semantics are currently no-ops, and mtcrf.
 
     LR and CTR bracket every function call as mflr and mtlr, and their helper
     does nothing but move a word; anything with privilege, time or the MMU
     behind it stays a Call. eieio orders storage accesses an emulator keeps in
-    order anyway, its helper is empty, so nothing is emitted at all and the
-    instruction only counts as retired */
+    order anyway. The cache hints and placeholder barriers below likewise
+    have empty helpers, so nothing is emitted and they only count as retired.
+    icbi, isync and dcbz are deliberately absent: each has a real effect. */
 bool decode_spr(Builder& b, uint32_t op) {
     if (primary_op(op) != 31 || rc_bit(op)) {
         return false;
     }
 
-    if (ext_op(op) == 854) { // eieio
+    switch (ext_op(op)) {
+    case 54:  // dcbst, cache model placeholder
+    case 86:  // dcbf, cache model placeholder
+    case 246: // dcbtst, cache hint
+    case 278: // dcbt, cache hint
+    case 598: // sync, uniprocessor ordering placeholder
+    case 854: // eieio
         return true;
+    default:
+        break;
     }
 
     if (ext_op(op) == 144) { // mtcrf, whose mask CRM decides once, right here
@@ -818,6 +1042,46 @@ bool decode_spr(Builder& b, uint32_t op) {
     default:
         return false;
     }
+}
+
+/** The bitwise floating-point register operations are safe to emit without
+    reproducing host IEEE exception and rounding behaviour: they only move or
+    alter the sign bit. Checking the resolved helper is also the MSR[FP]
+    guard. With FP disabled the opcode table points at ppc_fpu_off instead,
+    and the instruction remains an interpreter call that raises EXC_NO_FPU. */
+bool decode_fpu_move(Builder& b, uint32_t op, PPCOpcode helper) {
+    if (primary_op(op) != 63 || rc_bit(op)) {
+        return false;
+    }
+
+    FMoveKind kind;
+    PPCOpcode expected;
+    switch (ext_op(op)) {
+    case 40:
+        kind = FMoveKind::Negate;
+        expected = dppc_interpreter::ppc_fneg<RC0>;
+        break;
+    case 72:
+        kind = FMoveKind::Copy;
+        expected = dppc_interpreter::ppc_fmr<RC0>;
+        break;
+    case 136:
+        kind = FMoveKind::NegativeAbsolute;
+        expected = dppc_interpreter::ppc_fnabs<RC0>;
+        break;
+    case 264:
+        kind = FMoveKind::Absolute;
+        expected = dppc_interpreter::ppc_fabs<RC0>;
+        break;
+    default:
+        return false;
+    }
+
+    if (helper != expected) {
+        return false;
+    }
+    b.fmove((op >> 21) & 31, (op >> 11) & 31, kind);
+    return true;
 }
 
 /** Tries to decode one guest instruction into real operations.
@@ -904,6 +1168,15 @@ bool decode_alu(Builder& b, uint32_t op) {
         return true;
     }
 
+    case 23: { // rlwnm and rlwnm.
+        const unsigned mb = (op >> 6) & 31;
+        const unsigned me = (op >> 1) & 31;
+        IRValue r = b.rotl_mask_var(b.load_gpr(rs), b.load_gpr(rb), mb, me);
+        b.store_gpr(ra, r);
+        if (rc_bit(op)) b.set_cr0(r);
+        return true;
+    }
+
     case 31: {
         IRValue r;
         unsigned dest;
@@ -953,6 +1226,37 @@ bool decode_alu(Builder& b, uint32_t op) {
             break;
         case 11: // mulhwu
             r = b.binary(IROpcode::MulHighU, b.load_gpr(ra), b.load_gpr(rb));
+            dest = rd;
+            break;
+        case 24: // slw
+            r = b.shift(IROpcode::ShiftLeft, b.load_gpr(rs), b.load_gpr(rb));
+            dest = ra;
+            break;
+        case 536: // srw
+            r = b.shift(IROpcode::ShiftRightU, b.load_gpr(rs), b.load_gpr(rb));
+            dest = ra;
+            break;
+        case 792: // sraw, whose shift also owns XER[CA]
+            r = b.shift(IROpcode::Sraw, b.load_gpr(rs), b.load_gpr(rb));
+            dest = ra;
+            break;
+        case 824: // srawi
+            r = b.shift(IROpcode::Sraw, b.load_gpr(rs),
+                        b.constant((op >> 11) & 31));
+            dest = ra;
+            break;
+        case 26: // cntlzw
+            r = b.count_leading_zeros(b.load_gpr(rs));
+            dest = ra;
+            break;
+        case 459: // divwu, non-OE; the 601 has different exceptional results
+            if (is_601) return false;
+            r = b.binary(IROpcode::DivU, b.load_gpr(ra), b.load_gpr(rb));
+            dest = rd;
+            break;
+        case 491: // divw, non-OE
+            if (is_601) return false;
+            r = b.binary(IROpcode::DivS, b.load_gpr(ra), b.load_gpr(rb));
             dest = rd;
             break;
         case 444: // or, which is also mr when rs == rb
@@ -1178,7 +1482,9 @@ bool translate_block(uint32_t virt_addr, uint32_t phys_addr, const uint8_t* code
             (jit_decode_groups & JIT_DECODE_LOAD    && decode_load(b, raw, helper)) ||
             (jit_decode_groups & JIT_DECODE_STORE   && decode_store(b, raw, helper))||
             (jit_decode_groups & JIT_DECODE_COMPARE && decode_compare(b, raw))      ||
-            (jit_decode_groups & JIT_DECODE_SPR     && decode_spr(b, raw));
+            (jit_decode_groups & JIT_DECODE_COMPARE && decode_cr_state(b, raw))     ||
+            (jit_decode_groups & JIT_DECODE_SPR     && decode_spr(b, raw))          ||
+            (jit_decode_groups & JIT_DECODE_FPU     && decode_fpu_move(b, raw, helper));
 
         if (!decoded) {
             const bool sync = reads_virtual_time(raw) || jit_sync_every_call;

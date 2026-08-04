@@ -2454,6 +2454,507 @@ static void test_native_chaining() {
     ppc_jit_flush();
 }
 
+constexpr uint32_t jit_x31(unsigned d, unsigned a, unsigned b,
+                           unsigned xo, bool rc = false) {
+    return (31U << 26) | (d << 21) | (a << 16) | (b << 11) |
+           (xo << 1) | unsigned(rc);
+}
+
+constexpr uint32_t jit_cr(unsigned d, unsigned a, unsigned b, unsigned xo) {
+    return (19U << 26) | (d << 21) | (a << 16) | (b << 11) | (xo << 1);
+}
+
+constexpr uint32_t jit_mcrf(unsigned dest_field, unsigned source_field) {
+    return (19U << 26) | ((dest_field * 4) << 21) |
+           ((source_field * 4) << 16);
+}
+
+constexpr uint32_t jit_fmove(unsigned dest, unsigned source, unsigned xo) {
+    return (63U << 26) | (dest << 21) | (source << 11) | (xo << 1);
+}
+
+/** One block covering the new CR, shift, divide and bitwise-FPU lowering.
+    The generated encoders make the operand fields visible and prevent a
+    copied hexadecimal word from accidentally testing another instruction. */
+static const uint32_t wave23_29_code[] = {
+    jit_x31(3, 0, 0, 19),       // mfcr   r3
+    jit_mcrf(2, 6),             // mcrf   cr2,cr6
+    jit_cr(0, 1, 2, 257),       // crand
+    jit_cr(3, 4, 5, 129),       // crandc
+    jit_cr(6, 6, 7, 289),       // creqv
+    jit_cr(8, 9, 10, 225),      // crnand
+    jit_cr(11, 12, 13, 33),     // crnor
+    jit_cr(14, 15, 16, 449),    // cror
+    jit_cr(17, 18, 19, 417),    // crorc
+    jit_cr(20, 21, 22, 193),    // crxor
+    jit_x31(5 * 4, 0, 0, 512),  // mcrxr  cr5
+    jit_x31(4, 0, 0, 19),       // mfcr   r4
+
+    jit_x31(6, 5, 7, 24, true), // slw.   r5,r6,r7
+    jit_x31(6, 8, 7, 536, true),// srw.   r8,r6,r7 (dead CR0 predecessor)
+    jit_x31(6, 9, 7, 792),      // sraw   r9,r6,r7
+    jit_x31(6, 10, 4, 824),     // srawi  r10,r6,4
+    jit_x31(6, 11, 12, 24),     // slw    r11,r6,r12 (count bit five)
+    jit_x31(6, 13, 12, 536),    // srw    r13,r6,r12
+    jit_x31(6, 14, 12, 792),    // sraw   r14,r6,r12
+    (23U << 26) | (6U << 21) | (15U << 16) | (7U << 11) |
+        (3U << 6) | (27U << 1), // rlwnm  r15,r6,r7,3,27
+    jit_x31(6, 16, 0, 26),      // cntlzw r16,r6
+    jit_x31(18, 17, 0, 26, true),// cntlzw. r17,r18 (final CR0)
+
+    jit_x31(22, 20, 21, 491),   // divw   r22,r20,r21
+    jit_x31(23, 6, 21, 459),    // divwu  r23,r6,r21
+    jit_x31(25, 20, 24, 491),   // divw   r25,r20,r24 (divide by zero)
+    jit_x31(28, 26, 27, 491),   // divw   r28,r26,r27 (INT_MIN / -1)
+
+    jit_x31(31, 29, 30, 20),    // lwarx  r31,r29,r30
+
+    jit_fmove(2, 1, 72),        // fmr    f2,f1
+    jit_fmove(3, 1, 40),        // fneg   f3,f1
+    jit_fmove(4, 1, 264),       // fabs   f4,f1
+    jit_fmove(5, 1, 136),       // fnabs  f5,f1
+    0x00000000,                 // illegal: stop before it
+};
+
+constexpr uint32_t WAVE_BASE = 0xC000;
+constexpr uint32_t WAVE_END = WAVE_BASE + uint32_t(sizeof(wave23_29_code) - 4);
+
+struct WaveResult {
+    uint32_t gpr[32];
+    uint64_t fpr[32];
+    uint32_t cr;
+    uint32_t xer;
+    uint32_t fpscr;
+    bool reserve;
+    uint32_t pc;
+    uint64_t retired;
+};
+
+static void load_wave23_29_code() {
+    for (size_t i = 0; i < sizeof(wave23_29_code) / sizeof(wave23_29_code[0]); i++) {
+        mmu_write_vmem<uint32_t>(NO_OPCODE, WAVE_BASE + uint32_t(i) * 4,
+                                 wave23_29_code[i]);
+    }
+    mmu_write_vmem<uint32_t>(NO_OPCODE, 0x3000, 0x13579BDFU);
+}
+
+static WaveResult run_wave23_29_code(uint32_t cr_seed = 0xA5C39E71U,
+                                     uint32_t xer_seed = 0xF1234567U) {
+    for (unsigned i = 0; i < 32; i++) {
+        ppc_state.gpr[i] = 0x5A5A0000U | i;
+        ppc_state.fpr[i].int64_r = 0x0123456789ABC000ULL | i;
+    }
+    ppc_state.gpr[6]  = 0x87654321U;
+    ppc_state.gpr[7]  = 4;
+    ppc_state.gpr[12] = 0x20;
+    ppc_state.gpr[18] = 0;
+    ppc_state.gpr[20] = uint32_t(-100);
+    ppc_state.gpr[21] = 7;
+    ppc_state.gpr[24] = 0;
+    ppc_state.gpr[26] = 0x80000000U;
+    ppc_state.gpr[27] = 0xFFFFFFFFU;
+    ppc_state.gpr[29] = 0x3000;
+    ppc_state.gpr[30] = 0;
+    ppc_state.fpr[1].int64_r = 0xFFF0123456789ABCULL;
+    ppc_state.cr = cr_seed;
+    ppc_state.spr[SPR::XER] = xer_seed;
+    ppc_state.fpscr = 0xA5A5A5A5U;
+    ppc_state.reserve = false;
+    ppc_state.pc = WAVE_BASE;
+    g_icycles = 0;
+    g_icycles_max = 0;
+    exec_flags = 0;
+    power_on = true;
+
+    ppc_exec_until(WAVE_END);
+
+    WaveResult result{};
+    for (unsigned i = 0; i < 32; i++) {
+        result.gpr[i] = ppc_state.gpr[i];
+        result.fpr[i] = ppc_state.fpr[i].int64_r;
+    }
+    result.cr = ppc_state.cr;
+    result.xer = ppc_state.spr[SPR::XER];
+    result.fpscr = ppc_state.fpscr;
+    result.reserve = ppc_state.reserve;
+    result.pc = ppc_state.pc;
+    result.retired = g_icycles;
+    return result;
+}
+
+static bool same_wave(const WaveResult& a, const WaveResult& b) {
+    for (unsigned i = 0; i < 32; i++) {
+        if (a.gpr[i] != b.gpr[i] || a.fpr[i] != b.fpr[i]) return false;
+    }
+    return a.cr == b.cr && a.xer == b.xer && a.fpscr == b.fpscr &&
+           a.reserve == b.reserve &&
+           a.pc == b.pc && a.retired == b.retired;
+}
+
+struct StressResult {
+    uint32_t gpr[32];
+    uint32_t cr;
+    uint32_t xer;
+    uint32_t pc;
+    uint64_t retired;
+};
+
+static StressResult run_integer_stress(uint32_t begin, uint32_t end) {
+    for (unsigned i = 0; i < 32; i++) {
+        ppc_state.gpr[i] = 0xC3C30000U | i;
+    }
+    ppc_state.cr = 0x96A53CC3U;
+    ppc_state.spr[SPR::XER] = 0x51234567U;
+    ppc_state.pc = begin;
+    g_icycles = 0;
+    g_icycles_max = 0;
+    exec_flags = 0;
+    power_on = true;
+    ppc_exec_until(end);
+
+    StressResult result{};
+    for (unsigned i = 0; i < 32; i++) result.gpr[i] = ppc_state.gpr[i];
+    result.cr = ppc_state.cr;
+    result.xer = ppc_state.spr[SPR::XER];
+    result.pc = ppc_state.pc;
+    result.retired = g_icycles;
+    return result;
+}
+
+static bool same_stress(const StressResult& a, const StressResult& b) {
+    for (unsigned i = 0; i < 32; i++) {
+        if (a.gpr[i] != b.gpr[i]) return false;
+    }
+    return a.cr == b.cr && a.xer == b.xer && a.pc == b.pc &&
+           a.retired == b.retired;
+}
+
+/** Exhaust every six-bit shift count over representative source words and
+    cross signed/unsigned division edge operands. Besides comparing the final
+    checksum, all GPR/CR/XER state is compared, and mcrxr samples sraw's CA on
+    every iteration. */
+static void test_shift_div_stress() {
+    constexpr uint32_t STRESS_BASE = 0x1000;
+    const uint32_t sources[] = {0, 1, 0x87654321U, 0xFFFFFFFFU};
+    const uint32_t divisors[] = {
+        0, 1, 0xFFFFFFFFU, 2, 7, 0x80000000U, 0x7FFFFFFFU, 0x12345678U,
+    };
+
+    vector<uint32_t> code;
+    auto load_imm = [&code](unsigned reg, uint32_t value) {
+        code.push_back((15U << 26) | (reg << 21) | (value >> 16));
+        code.push_back((24U << 26) | (reg << 21) | (reg << 16) |
+                       (value & 0xFFFF));
+    };
+    code.push_back((14U << 26) | (3U << 21)); // li r3,0 checksum
+
+    for (uint32_t source : sources) {
+        load_imm(6, source);
+        code.push_back(jit_x31(6, 8, 0, 26));  // cntlzw r8,r6
+        code.push_back(jit_x31(3, 3, 8, 316)); // xor r3,r3,r8
+        for (unsigned count = 0; count < 64; count++) {
+            code.push_back((14U << 26) | (7U << 21) | count); // li r7,count
+            code.push_back(jit_x31(6, 8, 7, 24));             // slw
+            code.push_back(jit_x31(3, 3, 8, 316));
+            code.push_back(jit_x31(6, 8, 7, 536));            // srw
+            code.push_back(jit_x31(3, 3, 8, 316));
+            code.push_back(jit_x31(6, 8, 7, 792));            // sraw
+            code.push_back(jit_x31(3, 3, 8, 316));
+            code.push_back(jit_x31(7 * 4, 0, 0, 512));        // mcrxr cr7
+            code.push_back(jit_x31(9, 0, 0, 19));             // mfcr r9
+            code.push_back(jit_x31(3, 3, 9, 316));
+            code.push_back((23U << 26) | (6U << 21) | (8U << 16) |
+                           (7U << 11) | (27U << 6) | (3U << 1)); // wrapping rlwnm
+            code.push_back(jit_x31(3, 3, 8, 316));
+        }
+    }
+
+    for (uint32_t numerator : divisors) {
+        for (uint32_t denominator : divisors) {
+            load_imm(6, numerator);
+            load_imm(7, denominator);
+            code.push_back(jit_x31(8, 6, 7, 491)); // divw
+            code.push_back(jit_x31(3, 3, 8, 316));
+            code.push_back(jit_x31(8, 6, 7, 459)); // divwu
+            code.push_back(jit_x31(3, 3, 8, 316));
+        }
+    }
+    code.push_back(0);
+
+    const uint32_t end = STRESS_BASE + uint32_t(code.size() - 1) * 4;
+    jit_check(end < 0x10000, "the exhaustive integer stress program fits test RAM");
+    for (size_t i = 0; i < code.size(); i++) {
+        mmu_write_vmem<uint32_t>(NO_OPCODE, STRESS_BASE + uint32_t(i) * 4, code[i]);
+    }
+
+    ppc_jit_disable();
+    const StressResult interp = run_integer_stress(STRESS_BASE, end);
+    jit_check(interp.pc == end && interp.retired == code.size() - 1,
+              "the exhaustive integer reference retired every generated opcode");
+
+    ppc_jit_enable(JitBackend::threaded);
+    const StressResult threaded = run_integer_stress(STRESS_BASE, end);
+    jit_check(same_stress(interp, threaded),
+              "threaded shifts/divisions agree for every generated edge case");
+
+    ppc_jit_disable();
+    ppc_jit_enable(JitBackend::automatic);
+    const StressResult native = run_integer_stress(STRESS_BASE, end);
+    if (ppc_jit_native_compiles()) {
+        jit_check(same_stress(interp, native),
+                  "native shifts/divisions agree for every generated edge case");
+        jit_check(ppc_jit_threaded_compiles() == 0,
+                  "the native emitter accepted every exhaustive integer block");
+    }
+    ppc_jit_disable();
+    load_test_code(); // the stress span deliberately reused the low test RAM
+}
+
+static void test_wave23_29_decode() {
+    alignas(4) uint8_t code[sizeof(wave23_29_code)];
+    for (size_t i = 0; i < sizeof(wave23_29_code) / 4; i++) {
+        code[i * 4 + 0] = uint8_t(wave23_29_code[i] >> 24);
+        code[i * 4 + 1] = uint8_t(wave23_29_code[i] >> 16);
+        code[i * 4 + 2] = uint8_t(wave23_29_code[i] >> 8);
+        code[i * 4 + 3] = uint8_t(wave23_29_code[i]);
+    }
+
+    dppc_jit::IRBlock ir;
+    const bool translated = dppc_jit::translate_block(WAVE_BASE, WAVE_BASE, code,
+                                                       ppc_state.msr, ir);
+    bool saw_cr = false, saw_shift = false, saw_div = false, saw_atomic = false;
+    bool saw_fpu = false;
+    bool saw_call = false;
+    for (const dppc_jit::IRInsn& in : ir.insns) {
+        saw_cr |= in.opcode == dppc_jit::IROpcode::LoadCR ||
+                  in.opcode == dppc_jit::IROpcode::StoreCR;
+        saw_shift |= in.opcode == dppc_jit::IROpcode::ShiftLeft ||
+                     in.opcode == dppc_jit::IROpcode::ShiftRightU ||
+                     in.opcode == dppc_jit::IROpcode::Sraw ||
+                     in.opcode == dppc_jit::IROpcode::RotlMaskVar ||
+                     in.opcode == dppc_jit::IROpcode::CountLeadingZeros;
+        saw_div |= in.opcode == dppc_jit::IROpcode::DivS ||
+                   in.opcode == dppc_jit::IROpcode::DivU;
+        saw_atomic |= in.opcode == dppc_jit::IROpcode::Load && in.reservation;
+        saw_fpu |= in.opcode == dppc_jit::IROpcode::FMove;
+        saw_call |= in.opcode == dppc_jit::IROpcode::Call;
+    }
+    jit_check(translated && saw_cr && saw_shift && saw_div && saw_atomic && saw_fpu,
+              "waves 23-29 decode every intended native IR family");
+    jit_check(!saw_call, "the directed waves 23-29 block has no interpreter calls");
+
+    constexpr uint32_t noop_words[] = {
+        jit_x31(0, 3, 4, 54),  jit_x31(0, 3, 4, 86),
+        jit_x31(0, 3, 4, 246), jit_x31(0, 3, 4, 278),
+        jit_x31(0, 0, 0, 598), jit_x31(0, 0, 0, 854),
+        0,
+    };
+    alignas(4) uint8_t noop_code[sizeof(noop_words)];
+    for (size_t i = 0; i < sizeof(noop_words) / 4; i++) {
+        noop_code[i * 4 + 0] = uint8_t(noop_words[i] >> 24);
+        noop_code[i * 4 + 1] = uint8_t(noop_words[i] >> 16);
+        noop_code[i * 4 + 2] = uint8_t(noop_words[i] >> 8);
+        noop_code[i * 4 + 3] = uint8_t(noop_words[i]);
+    }
+    dppc_jit::IRBlock noop_ir;
+    dppc_jit::translate_block(0xCF00, 0xCF00, noop_code,
+                              ppc_state.msr, noop_ir);
+    jit_check(noop_ir.insns.empty() && noop_ir.insn_count == 6,
+              "cache hints and placeholder barriers retire without emitted work");
+
+    constexpr uint32_t identity_words[] = {
+        jit_x31(3, 3, 3, 444),             // mr r3,r3
+        (14U << 26) | (4U << 21) | (4U << 16), // addi r4,r4,0
+        (26U << 26) | (5U << 21) | (5U << 16), // xori r5,r5,0
+        0,
+    };
+    alignas(4) uint8_t identity_code[sizeof(identity_words)];
+    for (size_t i = 0; i < sizeof(identity_words) / 4; i++) {
+        identity_code[i * 4 + 0] = uint8_t(identity_words[i] >> 24);
+        identity_code[i * 4 + 1] = uint8_t(identity_words[i] >> 16);
+        identity_code[i * 4 + 2] = uint8_t(identity_words[i] >> 8);
+        identity_code[i * 4 + 3] = uint8_t(identity_words[i]);
+    }
+    dppc_jit::IRBlock identity_ir;
+    dppc_jit::translate_block(0xCF80, 0xCF80, identity_code,
+                              ppc_state.msr, identity_ir);
+    bool identity_store = false, identity_alu = false;
+    for (const dppc_jit::IRInsn& in : identity_ir.insns) {
+        identity_store |= in.opcode == dppc_jit::IROpcode::StoreGPR;
+        identity_alu |= in.opcode == dppc_jit::IROpcode::Add ||
+                        in.opcode == dppc_jit::IROpcode::Or ||
+                        in.opcode == dppc_jit::IROpcode::Xor;
+    }
+    jit_check(!identity_store && !identity_alu,
+              "self moves and zero identities produce no state write or ALU IR");
+
+    // Multiword accesses and the conditional half of a reservation pair are
+    // instruction-atomic. Until an IR operation can preserve partial-fault
+    // and conditional-store semantics, the correct implementation is one
+    // whole interpreter helper. lwarx itself is covered above: its existing
+    // Load slow path already provides the required fault boundary.
+    constexpr uint32_t fallback_words[] = {
+        (46U << 26) | (3U << 21) | (4U << 16), // lmw   r3,0(r4)
+        (47U << 26) | (3U << 21) | (4U << 16), // stmw  r3,0(r4)
+        jit_x31(3, 4, 5, 150, true),           // stwcx. r3,r4,r5
+        0,
+    };
+    alignas(4) uint8_t fallback_code[sizeof(fallback_words)];
+    for (size_t i = 0; i < sizeof(fallback_words) / 4; i++) {
+        fallback_code[i * 4 + 0] = uint8_t(fallback_words[i] >> 24);
+        fallback_code[i * 4 + 1] = uint8_t(fallback_words[i] >> 16);
+        fallback_code[i * 4 + 2] = uint8_t(fallback_words[i] >> 8);
+        fallback_code[i * 4 + 3] = uint8_t(fallback_words[i]);
+    }
+    dppc_jit::IRBlock fallback_ir;
+    dppc_jit::translate_block(0xD000, 0xD000, fallback_code,
+                              ppc_state.msr, fallback_ir);
+    unsigned calls = 0;
+    for (const dppc_jit::IRInsn& in : fallback_ir.insns) {
+        calls += in.opcode == dppc_jit::IROpcode::Call;
+    }
+    jit_check(calls == 3,
+              "lmw/stmw/stwcx remain explicit whole-instruction fallbacks");
+
+    constexpr uint32_t div_oe_words[] = {
+        jit_x31(3, 4, 5, 491 + 512), // divwo
+        jit_x31(3, 4, 5, 459 + 512), // divwuo
+        0,
+    };
+    alignas(4) uint8_t div_oe_code[sizeof(div_oe_words)];
+    for (size_t i = 0; i < sizeof(div_oe_words) / 4; i++) {
+        div_oe_code[i * 4 + 0] = uint8_t(div_oe_words[i] >> 24);
+        div_oe_code[i * 4 + 1] = uint8_t(div_oe_words[i] >> 16);
+        div_oe_code[i * 4 + 2] = uint8_t(div_oe_words[i] >> 8);
+        div_oe_code[i * 4 + 3] = uint8_t(div_oe_words[i]);
+    }
+    dppc_jit::IRBlock div_oe_ir;
+    dppc_jit::translate_block(0xD100, 0xD100, div_oe_code,
+                              ppc_state.msr, div_oe_ir);
+    calls = 0;
+    for (const dppc_jit::IRInsn& in : div_oe_ir.insns) {
+        calls += in.opcode == dppc_jit::IROpcode::Call;
+    }
+    jit_check(calls == 2, "OE division remains in the XER-exact interpreter path");
+
+    const bool saved_601 = is_601;
+    is_601 = true;
+    dppc_jit::IRBlock div_601_ir;
+    // Prove the ordinary form is declined when the CPU's divide-by-zero
+    // result follows 601 rules.
+    constexpr uint32_t div_601_words[] = {jit_x31(3, 4, 5, 491), 0};
+    alignas(4) uint8_t div_601_code[sizeof(div_601_words)];
+    for (size_t i = 0; i < sizeof(div_601_words) / 4; i++) {
+        div_601_code[i * 4 + 0] = uint8_t(div_601_words[i] >> 24);
+        div_601_code[i * 4 + 1] = uint8_t(div_601_words[i] >> 16);
+        div_601_code[i * 4 + 2] = uint8_t(div_601_words[i] >> 8);
+        div_601_code[i * 4 + 3] = uint8_t(div_601_words[i]);
+    }
+    dppc_jit::translate_block(0xD200, 0xD200, div_601_code,
+                              ppc_state.msr, div_601_ir);
+    is_601 = saved_601;
+    jit_check(!div_601_ir.insns.empty() &&
+              div_601_ir.insns[0].opcode == dppc_jit::IROpcode::Call,
+              "601 division keeps its different exceptional results in the interpreter");
+
+    const uint32_t fp_msr = ppc_state.msr;
+    ppc_msr_did_change(fp_msr, fp_msr & ~MSR::FP, false);
+    exec_flags = 0;
+    constexpr uint32_t no_fpu_words[] = {jit_fmove(2, 1, 72), 0};
+    alignas(4) uint8_t no_fpu_code[sizeof(no_fpu_words)];
+    for (size_t i = 0; i < sizeof(no_fpu_words) / 4; i++) {
+        no_fpu_code[i * 4 + 0] = uint8_t(no_fpu_words[i] >> 24);
+        no_fpu_code[i * 4 + 1] = uint8_t(no_fpu_words[i] >> 16);
+        no_fpu_code[i * 4 + 2] = uint8_t(no_fpu_words[i] >> 8);
+        no_fpu_code[i * 4 + 3] = uint8_t(no_fpu_words[i]);
+    }
+    dppc_jit::IRBlock no_fpu_ir;
+    dppc_jit::translate_block(0xD300, 0xD300, no_fpu_code,
+                              ppc_state.msr, no_fpu_ir);
+    ppc_msr_did_change(ppc_state.msr, fp_msr, false);
+    exec_flags = 0;
+    jit_check(!no_fpu_ir.insns.empty() &&
+              no_fpu_ir.insns[0].opcode == dppc_jit::IROpcode::Call,
+              "FPR moves still raise through the no-FPU opcode table when FP is off");
+}
+
+static void test_wave23_29_subset() {
+    load_wave23_29_code();
+    const uint32_t saved_msr = ppc_state.msr;
+    ppc_msr_did_change(saved_msr, saved_msr | MSR::FP, false);
+    exec_flags = 0;
+
+    test_wave23_29_decode();
+
+    ppc_jit_disable();
+    const WaveResult interp = run_wave23_29_code();
+    jit_check(interp.pc == WAVE_END &&
+              interp.retired == sizeof(wave23_29_code) / 4 - 1,
+              "the waves 23-29 reference program retired exactly once per opcode");
+    jit_check(interp.gpr[11] == 0 && interp.gpr[13] == 0 &&
+              interp.gpr[14] == 0xFFFFFFFFU && interp.gpr[25] == 0 &&
+              interp.gpr[28] == 0 && interp.gpr[31] == 0x13579BDFU &&
+              interp.reserve,
+              "shift saturation and exceptional division hit their edge cases");
+    jit_check(interp.fpr[2] == 0xFFF0123456789ABCULL &&
+              interp.fpr[3] == 0x7FF0123456789ABCULL &&
+              interp.fpr[4] == 0x7FF0123456789ABCULL &&
+              interp.fpr[5] == 0xFFF0123456789ABCULL,
+              "bitwise FPU moves preserve the payload and alter only sign");
+
+    ppc_jit_enable(JitBackend::threaded);
+    const WaveResult threaded = run_wave23_29_code();
+    jit_check(same_wave(interp, threaded),
+              "the threaded backend agrees on every waves 23-29 state field");
+
+    ppc_jit_disable();
+    ppc_jit_enable(JitBackend::automatic);
+    const WaveResult native = run_wave23_29_code();
+    if (ppc_jit_native_compiles()) {
+        jit_check(same_wave(interp, native),
+                  "emitted waves 23-29 code agrees on every state field");
+        jit_check(ppc_jit_threaded_compiles() == 0,
+                  "the directed waves 23-29 block was accepted by the native emitter");
+        const WaveResult cached = run_wave23_29_code();
+        jit_check(same_wave(interp, cached),
+                  "cached waves 23-29 native code remains deterministic");
+    }
+
+    ppc_jit_disable();
+
+    const uint32_t cr_seeds[] = {0, 0xFFFFFFFFU, 0xAAAAAAAAU, 0x55555555U};
+    const uint32_t xer_seeds[] = {0, 0xF0000000U, 0xA1234567U, 0x51234567U};
+    WaveResult references[4];
+    for (unsigned i = 0; i < 4; i++) {
+        references[i] = run_wave23_29_code(cr_seeds[i], xer_seeds[i]);
+    }
+
+    ppc_jit_enable(JitBackend::threaded);
+    bool threaded_matrix = true;
+    for (unsigned i = 0; i < 4; i++) {
+        threaded_matrix &= same_wave(
+            references[i], run_wave23_29_code(cr_seeds[i], xer_seeds[i]));
+    }
+    jit_check(threaded_matrix,
+              "threaded CR logic agrees for zero, one and alternating bit matrices");
+
+    ppc_jit_disable();
+    ppc_jit_enable(JitBackend::automatic);
+    bool native_matrix = true;
+    for (unsigned i = 0; i < 4; i++) {
+        native_matrix &= same_wave(
+            references[i], run_wave23_29_code(cr_seeds[i], xer_seeds[i]));
+    }
+    if (ppc_jit_native_compiles()) {
+        jit_check(native_matrix,
+                  "native CR logic agrees for zero, one and alternating bit matrices");
+    }
+
+    ppc_jit_disable();
+    ppc_msr_did_change(ppc_state.msr, saved_msr, false);
+    exec_flags = 0;
+}
+
 int test_jit() {
     jit_tested = 0;
     jit_failed = 0;
@@ -2523,6 +3024,8 @@ int test_jit() {
     test_cr_fusion_matrix();
     test_carry_subset();
     test_ov_subset();
+    test_wave23_29_subset();
+    test_shift_div_stress();
     test_xform_subset();
     test_mmio_cycle_visibility(host_bridge);
     test_native_chaining();
