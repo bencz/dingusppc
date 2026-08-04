@@ -480,6 +480,12 @@ static const uint32_t alu_code[] = {
     0x7C8D0734, // extsh  r13, r4
     0x54AE403E, // rlwinm r14, r5, 8, 0, 31
     0x54AF2226, // rlwinm r15, r5, 4, 8, 19
+    0x54B3083C, // slwi   r19, r5, 1
+    0x54B4F800, // slwi   r20, r5, 31
+    0x54B5F87E, // srwi   r21, r5, 1
+    0x54B60FFE, // srwi   r22, r5, 31
+    0x54B8003E, // rlwinm r24, r5, 0, 0, 31  identity
+    0x54B93840, // rlwinm r25, r5, 7, 1, 0   wrapping full mask
     0x38A5FFFF, // addi   r5, r5, -1
     0x7CA52A14, // add    r5, r5, r5
     0x7CB02B78, // mr     r16, r5

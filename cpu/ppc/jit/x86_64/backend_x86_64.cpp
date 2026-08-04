@@ -1087,11 +1087,28 @@ private:
             this->asmb.shr_reg64_imm8(dst, 32);
             break;
         }
-        case IROpcode::RotlMask:
+        case IROpcode::RotlMask: {
             if (dst != ra) this->asmb.mov_reg_reg32(dst, ra);
-            this->asmb.rol_reg_imm8(dst, in.sh);
-            this->asmb.and_reg_imm32(dst, rot_mask(in.mb, in.me));
+            const uint32_t mask = rot_mask(in.mb, in.me);
+
+            // The assembler names these common rlwinm shapes slwi/srwi.
+            // A rotate followed by a mask is exact, but x64 can express each
+            // one directly with half the instructions. A full mask is a pure
+            // rotate (or an identity when sh is zero), so its AND is likewise
+            // redundant. Everything else keeps the generic sequence.
+            if (in.sh != 0 && in.mb == 0 && in.me == 31 - in.sh) {
+                this->asmb.shl_reg_imm8(dst, in.sh);
+            } else if (in.mb != 0 && in.me == 31 &&
+                       in.sh == 32 - in.mb) {
+                this->asmb.shr_reg_imm8(dst, in.mb);
+            } else {
+                this->asmb.rol_reg_imm8(dst, in.sh);
+                if (mask != 0xFFFFFFFFUL) {
+                    this->asmb.and_reg_imm32(dst, mask);
+                }
+            }
             break;
+        }
         case IROpcode::Exts:
             if (in.width == 1) this->asmb.movsx_reg8(dst, ra);
             else               this->asmb.movsx_reg16(dst, ra);
