@@ -37,6 +37,11 @@ bool     jit_local_chaining  = true;
 bool     jit_va_chaining     = true;
 bool     jit_va_revalidate   = true;
 bool     jit_va_binding      = false;
+bool     jit_va_publish_pc   = false;
+bool     jit_va_call_probe   = false;
+bool     jit_va_translate_probe = false;
+bool     jit_va_cache_probe  = false;
+bool     jit_va_verify       = false;
 bool     jit_pool_recycle    = false;
 
 const char* block_end_name(BlockEnd reason) {

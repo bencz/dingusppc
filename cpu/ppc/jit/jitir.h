@@ -443,6 +443,27 @@ extern bool jit_va_revalidate;
     handoff for continued development. */
 extern bool jit_va_binding;
 
+/** Diagnostic-only publication of the next PC immediately before a direct
+    VA-chain handoff. This isolates the state-store side effect of the full
+    verifier without performing a helper call or an MMU/cache lookup. */
+extern bool jit_va_publish_pc;
+
+/** Diagnostic-only direct handoff through a C++ call. The translate variant
+    additionally repeats instruction translation, but neither validates or
+    mutates the chain graph. */
+extern bool jit_va_call_probe;
+extern bool jit_va_translate_probe;
+
+/** Diagnostic-only validation of the bound block/cache identity without
+    repeating address translation. This isolates the verifier's cache work
+    from its instruction-MMU access. */
+extern bool jit_va_cache_probe;
+
+/** Diagnostic-only authoritative check before every direct VA-chain hit.
+    The x64 emitter omits the call entirely unless enabled before translation,
+    so the production configuration has no added branch or instruction. */
+extern bool jit_va_verify;
+
 /** Whether a dead block's emitted bytes go back to the pool for reuse.
     Off by default and DPPC_JIT_RECYCLE=1 opts in: measured on the Cheetah
     boot, reuse scatters hot code into cold holes and costs ~7% of the

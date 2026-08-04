@@ -38,6 +38,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -78,6 +79,17 @@ IRBlock scratch_ir;
 
 unsigned native_compiles   = 0;
 unsigned threaded_compiles = 0;
+
+uint64_t va_verify_checks      = 0;
+uint64_t va_verify_successes   = 0;
+uint64_t va_verify_resolvers   = 0;
+uint64_t va_verify_failures    = 0;
+uint64_t va_verify_exceptions  = 0;
+uint32_t va_verify_reports     = 0;
+
+uint64_t va_translate_checks       = 0;
+uint64_t va_translate_primary_hits = 0;
+uint64_t va_translate_misses       = 0;
 
 /** Interpreted block entries a candidate collects before the emitter is asked.
 
@@ -310,6 +322,134 @@ void unbind_all_chains() {
     }
     chained_head = nullptr;
     chain_refs   = 0;
+}
+
+bool validate_chain_graph(std::string* error, bool* can_unbind = nullptr) {
+    if (can_unbind) {
+        *can_unbind = false;
+    }
+    auto fail = [error](const char* why) {
+        if (error) {
+            *error = why;
+        }
+        return false;
+    };
+
+    const std::vector<JitBlock*> live_blocks = cache_blocks();
+    std::unordered_set<JitBlock*> live;
+    live.reserve(live_blocks.size());
+    for (JitBlock* blk : live_blocks) {
+        if (!blk) {
+            return fail("the code cache contains a null block");
+        }
+        if (!live.insert(blk).second) {
+            return fail("the code cache contains the same block twice");
+        }
+    }
+
+    // First establish ownership. This catches a cycle in a source list and
+    // one slot being claimed by two source blocks before incoming links are
+    // trusted.
+    std::unordered_set<ChainRef*> owned_refs;
+    for (JitBlock* owner : live_blocks) {
+        for (ChainRef* ref = owner->chain_out; ref; ref = ref->owner_next) {
+            if (!owned_refs.insert(ref).second) {
+                return fail("a chain entry is duplicated or cyclic in source ownership");
+            }
+            if (ref->target && !live.count(ref->target)) {
+                return fail("a source chain entry points at a dead target block");
+            }
+        }
+    }
+
+    std::unordered_set<JitBlock*> listed_blocks;
+    std::unordered_set<ChainRef*> incoming_refs;
+    JitBlock* expected_prev = nullptr;
+    for (JitBlock* blk = chained_head; blk; blk = blk->chained_next) {
+        if (!listed_blocks.insert(blk).second) {
+            return fail("the chained-block registry is duplicated or cyclic");
+        }
+        if (!live.count(blk)) {
+            return fail("the chained-block registry contains a dead block");
+        }
+        if (blk->chained_prev != expected_prev) {
+            return fail("the chained-block previous link is inconsistent");
+        }
+        if (!blk->chain_in) {
+            return fail("a chained-block registry entry has no incoming chains");
+        }
+
+        ChainRef* expected_ref_prev = nullptr;
+        for (ChainRef* ref = blk->chain_in; ref; ref = ref->next) {
+            if (!incoming_refs.insert(ref).second) {
+                return fail("an incoming chain entry is duplicated or cyclic");
+            }
+            if (!owned_refs.count(ref)) {
+                return fail("an incoming chain entry has no live source owner");
+            }
+            if (ref->target != blk) {
+                return fail("an incoming chain entry names a different target");
+            }
+            if (ref->prev != expected_ref_prev) {
+                return fail("an incoming chain previous link is inconsistent");
+            }
+            if (!ref->code || !ref->resolver) {
+                return fail("a tracked chain entry has an incomplete code cell");
+            }
+            expected_ref_prev = ref;
+        }
+        expected_prev = blk;
+    }
+
+    for (JitBlock* blk : live_blocks) {
+        const bool listed = listed_blocks.count(blk) != 0;
+        if ((blk->chain_in != nullptr) != listed) {
+            return fail("a block's incoming-list state disagrees with the registry");
+        }
+    }
+    for (ChainRef* ref : owned_refs) {
+        const bool incoming = incoming_refs.count(ref) != 0;
+        if ((ref->target != nullptr) != incoming) {
+            return fail("a source chain's target state disagrees with incoming lists");
+        }
+    }
+
+    // All lists are finite, mutually consistent and backed by live owners at
+    // this point. A semantic failure below can therefore be contained by
+    // walking them once more and restoring every resolver.
+    if (can_unbind) {
+        *can_unbind = true;
+    }
+
+    size_t direct_refs = 0;
+    for (ChainRef* ref : incoming_refs) {
+        JitBlock* blk = ref->target;
+        if (ref->pred) {
+            const uint64_t prediction = *ref->pred;
+            if (prediction > UINT32_MAX || prediction == 1 ||
+                (prediction & 3) != 0) {
+                return fail("a tracked virtual chain has an invalid prediction");
+            }
+            if ((uint32_t(prediction) & ~PPC_PAGE_MASK) !=
+                (blk->phys_addr & ~PPC_PAGE_MASK)) {
+                return fail("a virtual chain prediction and target offset disagree");
+            }
+        }
+        if (*ref->code != ref->resolver) {
+            if (*ref->code != blk->code) {
+                return fail("a direct chain points somewhere other than its target code");
+            }
+            direct_refs++;
+        }
+    }
+    if (direct_refs != chain_refs) {
+        return fail("the direct-chain statistic disagrees with the graph");
+    }
+
+    if (error) {
+        error->clear();
+    }
+    return true;
 }
 
 /** Registers a block's invalidation ranges, the cross page walk through's
@@ -814,10 +954,180 @@ const void* rt_chain_resolve_va(ChainVaSlot* slot) noexcept {
     }
 }
 
+static const void* validate_chain_va(ChainVaSlot* slot, uint32_t way,
+                                     uint32_t entry_pc,
+                                     bool translate) noexcept {
+    void** code = way ? &slot->code1 : &slot->code0;
+    uint64_t* pred = way ? &slot->pred1 : &slot->pred0;
+    uint64_t* gen = way ? &slot->gen1 : &slot->gen0;
+    uint32_t* phys = way ? &slot->phys1 : &slot->phys0;
+    ChainRef* ref = way ? &slot->ref1 : &slot->ref0;
+
+    // An observed way deliberately still points at the resolver. Preserve
+    // that path without charging it as a direct entry verification.
+    if (*code == slot->resolver) {
+        va_verify_resolvers++;
+        return slot->resolver;
+    }
+
+    va_verify_checks++;
+
+    auto reject = [&](const char* reason, uint32_t translated_phys,
+                      JitBlock* cached) -> const void* {
+        va_verify_failures++;
+        if (va_verify_reports++ < 32) {
+            const JitBlock* target = ref->target;
+            LOG_F(ERROR,
+                  "JIT VA verify failed (%s): pc=%08X way=%u pred=%08llX "
+                  "gen=%llu/%llu phys=%08X translated=%08X target=%p "
+                  "target_phys=%08X target_mode=%08X current_mode=%08X "
+                  "cached=%p flags=%02X",
+                  reason, entry_pc, way,
+                  (unsigned long long)*pred,
+                  (unsigned long long)*gen,
+                  (unsigned long long)mmu_itrans_generation,
+                  *phys, translated_phys, static_cast<const void*>(target),
+                  target ? target->phys_addr : 0,
+                  target ? target->mode : 0, ppc_jit_mode(),
+                  static_cast<void*>(cached), unsigned(exec_flags));
+        }
+
+        // The generated frame owns this slot but no code is being reclaimed.
+        // Detaching one bad way and poisoning its prediction is safe; dispatch
+        // performs the authoritative retry from ppc_state.pc.
+        if (ref->target) {
+            unlink_chain_ref(ref);
+        }
+        *code = const_cast<void*>(slot->resolver);
+        *pred = 1;
+        *gen = 0;
+        *phys = 0;
+        return nullptr;
+    };
+
+    if (!power_on || exec_flags) {
+        return reject("pending execution state", 0, nullptr);
+    }
+    if (*pred != entry_pc) {
+        return reject("prediction changed", 0, nullptr);
+    }
+    if (*gen != mmu_itrans_generation) {
+        return reject("translation generation changed", 0, nullptr);
+    }
+    if (!ref->target) {
+        return reject("direct cell has no target", 0, nullptr);
+    }
+    if (*code != ref->target->code) {
+        return reject("code cell and target disagree", 0, nullptr);
+    }
+
+    try {
+        uint32_t translated_phys = ref->target->phys_addr;
+        if (translate) {
+            mmu_translate_imem(entry_pc, &translated_phys);
+        }
+        const uint32_t mode = ppc_jit_mode();
+        JitBlock* cached = cache_lookup(translated_phys, mode);
+
+        if (ref->target->mode != mode) {
+            return reject("target mode is stale", translated_phys, cached);
+        }
+        if (translate && ref->target->phys_addr != translated_phys) {
+            return reject("target physical address is stale", translated_phys, cached);
+        }
+        if (*phys != (translated_phys & PPC_PAGE_MASK)) {
+            return reject("inline physical guard is stale", translated_phys, cached);
+        }
+        if (cached != ref->target) {
+            return reject("cache lookup names another block", translated_phys, cached);
+        }
+
+        va_verify_successes++;
+        if (va_verify_checks == 1) {
+            LOG_F(INFO, "JIT VA %s verify: first direct hit validated at pc=%08X",
+                  translate ? "full" : "cache-only", entry_pc);
+        } else if ((va_verify_checks & ((uint64_t(1) << 24) - 1)) == 0) {
+            LOG_F(INFO,
+                  "JIT VA verify progress: %llu checks, %llu valid, "
+                  "%llu mismatches, %llu fetch unwinds",
+                  (unsigned long long)va_verify_checks,
+                  (unsigned long long)va_verify_successes,
+                  (unsigned long long)va_verify_failures,
+                  (unsigned long long)va_verify_exceptions);
+        }
+        return ref->target->code;
+    } catch (PPCExcUnwind&) {
+        va_verify_exceptions++;
+        if (va_verify_reports++ < 32) {
+            LOG_F(ERROR, "JIT VA verify fetch unwound at pc=%08X way=%u",
+                  entry_pc, way);
+        }
+        return nullptr;
+    }
+}
+
+const void* rt_chain_cache_va(ChainVaSlot* slot, uint32_t way,
+                              uint32_t entry_pc) noexcept {
+    return validate_chain_va(slot, way, entry_pc, false);
+}
+
+const void* rt_chain_verify_va(ChainVaSlot* slot, uint32_t way,
+                               uint32_t entry_pc) noexcept {
+    return validate_chain_va(slot, way, entry_pc, true);
+}
+
+const void* rt_chain_call_va(const void* code, uint32_t) noexcept {
+    return code;
+}
+
+const void* rt_chain_translate_va(const void* code,
+                                  uint32_t entry_pc) noexcept {
+    try {
+        const uint32_t tag = (entry_pc & PPC_PAGE_MASK) | g_itlb_epoch;
+        const TLBEntry& primary =
+            pCurITLB1[(entry_pc >> PPC_PAGE_SIZE_BITS) & tlb_size_mask];
+        va_translate_checks++;
+        if (primary.tag == tag) {
+            va_translate_primary_hits++;
+        } else {
+            va_translate_misses++;
+        }
+
+        if (va_translate_checks == 1) {
+            LOG_F(INFO,
+                  "JIT VA translate probe: first access was a primary ITLB %s",
+                  primary.tag == tag ? "hit" : "miss");
+        } else if ((va_translate_checks & ((uint64_t(1) << 24) - 1)) == 0) {
+            LOG_F(INFO,
+                  "JIT VA translate progress: %llu calls, %llu primary hits, "
+                  "%llu misses",
+                  (unsigned long long)va_translate_checks,
+                  (unsigned long long)va_translate_primary_hits,
+                  (unsigned long long)va_translate_misses);
+        }
+
+        uint32_t translated_phys = 0;
+        mmu_translate_imem(entry_pc, &translated_phys);
+        return code;
+    } catch (PPCExcUnwind&) {
+        return nullptr;
+    }
+}
+
 } // namespace dppc_jit
 
 bool ppc_jit_enable(JitBackend choice) {
     ppc_jit_disable();
+
+    dppc_jit::va_verify_checks     = 0;
+    dppc_jit::va_verify_successes  = 0;
+    dppc_jit::va_verify_resolvers  = 0;
+    dppc_jit::va_verify_failures   = 0;
+    dppc_jit::va_verify_exceptions = 0;
+    dppc_jit::va_verify_reports    = 0;
+    dppc_jit::va_translate_checks       = 0;
+    dppc_jit::va_translate_primary_hits = 0;
+    dppc_jit::va_translate_misses       = 0;
 
     if (choice == JitBackend::automatic) {
         dppc_jit::native_backend = dppc_jit::make_native_backend();
@@ -923,6 +1233,47 @@ bool ppc_jit_enable(JitBackend choice) {
         }
     }
 
+    dppc_jit::jit_va_publish_pc = false;
+    if (const char* publish = getenv("DPPC_JIT_CHAIN_VA_PUBLISH_PC")) {
+        dppc_jit::jit_va_publish_pc = strtol(publish, nullptr, 0) != 0;
+        if (dppc_jit::jit_va_publish_pc) {
+            LOG_F(WARNING, "JIT: publishing PC before direct VA-chain handoffs");
+        }
+    }
+
+    dppc_jit::jit_va_call_probe = false;
+    if (const char* call = getenv("DPPC_JIT_CHAIN_VA_CALL")) {
+        dppc_jit::jit_va_call_probe = strtol(call, nullptr, 0) != 0;
+        if (dppc_jit::jit_va_call_probe) {
+            LOG_F(WARNING, "JIT: routing direct VA-chain handoffs through a pass-through call");
+        }
+    }
+
+    dppc_jit::jit_va_translate_probe = false;
+    if (const char* translate = getenv("DPPC_JIT_CHAIN_VA_TRANSLATE")) {
+        dppc_jit::jit_va_translate_probe = strtol(translate, nullptr, 0) != 0;
+        if (dppc_jit::jit_va_translate_probe) {
+            LOG_F(WARNING, "JIT: repeating instruction translation before direct VA-chain handoffs");
+        }
+    }
+
+    dppc_jit::jit_va_cache_probe = false;
+    if (const char* cache = getenv("DPPC_JIT_CHAIN_VA_CACHE")) {
+        dppc_jit::jit_va_cache_probe = strtol(cache, nullptr, 0) != 0;
+        if (dppc_jit::jit_va_cache_probe) {
+            LOG_F(WARNING,
+                  "JIT: validating direct VA chains against the block cache without MMU translation");
+        }
+    }
+
+    dppc_jit::jit_va_verify = false;
+    if (const char* verify = getenv("DPPC_JIT_CHAIN_VA_VERIFY")) {
+        dppc_jit::jit_va_verify = strtol(verify, nullptr, 0) != 0;
+        if (dppc_jit::jit_va_verify) {
+            LOG_F(WARNING, "JIT: authoritative direct VA-chain verification enabled");
+        }
+    }
+
     if (const char* rc = getenv("DPPC_JIT_RECYCLE")) {
         dppc_jit::jit_pool_recycle = strtol(rc, nullptr, 0) != 0;
         if (dppc_jit::jit_pool_recycle) {
@@ -958,12 +1309,39 @@ bool ppc_jit_enable(JitBackend choice) {
 void ppc_jit_disable() {
     ppc_jit_enabled = false;
 
+    if ((dppc_jit::jit_va_verify || dppc_jit::jit_va_cache_probe) &&
+        (dppc_jit::va_verify_checks || dppc_jit::va_verify_resolvers)) {
+        LOG_F(INFO,
+              "JIT VA %s verify summary: %llu direct checks, %llu valid, "
+              "%llu resolver cells, %llu mismatches, %llu fetch unwinds",
+              dppc_jit::jit_va_verify ? "full" : "cache-only",
+              (unsigned long long)dppc_jit::va_verify_checks,
+              (unsigned long long)dppc_jit::va_verify_successes,
+              (unsigned long long)dppc_jit::va_verify_resolvers,
+              (unsigned long long)dppc_jit::va_verify_failures,
+              (unsigned long long)dppc_jit::va_verify_exceptions);
+    }
+    if (dppc_jit::jit_va_translate_probe &&
+        dppc_jit::va_translate_checks) {
+        LOG_F(INFO,
+              "JIT VA translate summary: %llu calls, %llu primary ITLB hits, "
+              "%llu misses",
+              (unsigned long long)dppc_jit::va_translate_checks,
+              (unsigned long long)dppc_jit::va_translate_primary_hits,
+              (unsigned long long)dppc_jit::va_translate_misses);
+    }
+
     dppc_jit::flush_everything();
     dppc_jit::native_backend.reset();
     dppc_jit::threaded_backend.reset();
 
     dppc_jit::native_compiles   = 0;
     dppc_jit::threaded_compiles = 0;
+    dppc_jit::jit_va_publish_pc = false;
+    dppc_jit::jit_va_call_probe = false;
+    dppc_jit::jit_va_translate_probe = false;
+    dppc_jit::jit_va_cache_probe = false;
+    dppc_jit::jit_va_verify = false;
 
     ppc_code_cache_set_release_cb(nullptr);
 }
@@ -986,6 +1364,18 @@ unsigned ppc_jit_threaded_compiles() {
 
 uint64_t ppc_jit_bound_chains() {
     return uint64_t(dppc_jit::chain_refs);
+}
+
+bool ppc_jit_validate_chains(std::string* error) {
+    return dppc_jit::validate_chain_graph(error);
+}
+
+uint64_t ppc_jit_va_verify_checks() {
+    return dppc_jit::va_verify_checks;
+}
+
+uint64_t ppc_jit_va_verify_failures() {
+    return dppc_jit::va_verify_failures + dppc_jit::va_verify_exceptions;
 }
 
 const char* ppc_jit_backend_name() {

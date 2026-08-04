@@ -37,6 +37,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include <cinttypes>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <optional>
@@ -171,6 +172,10 @@ int main(int argc, char** argv) {
 
     CLI11_PARSE(app, argc, argv);
 
+    if (const char* realtime = std::getenv("DPPC_REALTIME")) {
+        realtime_enabled = std::strtol(realtime, nullptr, 0) != 0;
+    }
+
     if (*list_cmd) {
         if (sub_arg == "machines") {
             MachineFactory::list_machines();
@@ -199,6 +204,11 @@ int main(int argc, char** argv) {
     } else {
         loguru::g_stderr_verbosity = log_verbosity;
         loguru::init(argc, argv);
+    }
+
+    ppc_set_realtime(realtime_enabled);
+    if (realtime_enabled) {
+        LOG_F(INFO, "Real-time CPU pacing enabled");
     }
 
     auto rom_data = std::unique_ptr<char[]>(new char[4 * 1024 * 1024]);

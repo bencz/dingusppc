@@ -105,7 +105,8 @@ int MachineAlchemy::initialize(const std::string &id) {
     psx_obj->set_bus_speed(PSX_BUS_SPEED_40);
 
     // init virtual CPU and request MPC603ev
-    ppc_cpu_init(psx_obj, PPC_VER::MPC603E, false, timebase_freq);
+    ppc_cpu_init(psx_obj, PPC_VER::MPC603E, false, timebase_freq,
+                 225000000ULL);
 
     // CPU frequency is hardcoded to 225 MHz for now
     //ppc_state.spr[SPR::HID1] = get_cpu_pll_value(225000000) << 28;

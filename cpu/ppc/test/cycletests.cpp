@@ -114,17 +114,32 @@ static void test_batching() {
     }
 }
 
+static void test_realtime_keeps_virtual_time() {
+    const uint64_t saved_icycles = g_icycles;
+    g_icycles = 0x123456;
+    ppc_set_realtime(true);
+    cy_check(get_virt_time_ns() == (g_icycles << icnt_factor),
+             "real-time pacing leaves guest virtual time cycle-derived");
+    ppc_set_realtime(false);
+    g_icycles = saved_icycles;
+}
+
 int test_cycle_accounting() {
     cy_tested = 0;
     cy_failed = 0;
 
     MPC106* host_bridge = new MPC106;
     host_bridge->add_ram_region(0, 0x10000);
-    ppc_cpu_init(host_bridge, PPC_VER::MPC750, false, 16705000);
+    ppc_cpu_init(host_bridge, PPC_VER::MPC750, false, 16705000,
+                 233870000);
     TimerManager::get_instance()->cancel_all_timers();
+
+    cy_check(icnt_factor == 2,
+             "a 233.87 MHz G3 selects the nearest 250 MIPS timing rate");
 
     test_deadline();
     test_batching();
+    test_realtime_keeps_virtual_time();
 
     TimerManager::get_instance()->cancel_all_timers();
 

@@ -248,6 +248,24 @@ typedef struct ChainVaSlot {
     anyone else */
 const void* rt_chain_resolve_va(ChainVaSlot* slot) noexcept;
 
+/** Diagnostic pass-throughs used to distinguish the C++ call boundary from
+    the instruction-MMU side effect of full VA-chain verification. */
+const void* rt_chain_call_va(const void* code, uint32_t entry_pc) noexcept;
+const void* rt_chain_translate_va(const void* code,
+                                  uint32_t entry_pc) noexcept;
+
+/** Diagnostic verifier which checks the chain metadata and block-cache
+    identity but deliberately does not touch the instruction MMU. */
+const void* rt_chain_cache_va(ChainVaSlot* slot, uint32_t way,
+                              uint32_t entry_pc) noexcept;
+
+/** Diagnostic slow path emitted only for DPPC_JIT_CHAIN_VA_VERIFY. It repeats
+    the honest instruction translation and cache lookup immediately before a
+    direct hit and returns the verified code address, or nullptr to dispatch
+    after rejecting an inconsistent way. */
+const void* rt_chain_verify_va(ChainVaSlot* slot, uint32_t way,
+                               uint32_t entry_pc) noexcept;
+
 /** Hands control back to the emulator between two blocks and says where to
     go next. Everything a native backend used to return to C++ for happens
     here instead, inside the frame the blocks share.

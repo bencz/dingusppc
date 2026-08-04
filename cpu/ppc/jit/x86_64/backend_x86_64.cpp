@@ -671,7 +671,11 @@ private:
         X64Emitter::Label try_way1    = this->asmb.new_label();
         X64Emitter::Label probe0      = this->asmb.new_label();
         X64Emitter::Label probe1      = this->asmb.new_label();
+        X64Emitter::Label verified0   = this->asmb.new_label();
+        X64Emitter::Label verified1   = this->asmb.new_label();
         X64Emitter::Label thunk       = this->asmb.new_label();
+        const bool slow_probe = jit_va_verify || jit_va_cache_probe ||
+                                jit_va_translate_probe || jit_va_call_probe;
 
         if (retired) {
             this->asmb.add_mem64_imm32(REG_TIME, this->icycles_disp, retired);
@@ -694,7 +698,14 @@ private:
         this->asmb.cmp_reg64_mem(RAX, REG_TIME, this->gen_disp);
         this->asmb.jcc(X64Cond::NotEqual,
                        jit_va_revalidate ? probe0 : thunk);
-        this->asmb.jmp_mem_abs(&slot->code0);
+        if (slow_probe) {
+            this->asmb.jmp(verified0);
+        } else {
+            if (jit_va_publish_pc) {
+                this->asmb.mov_mem_reg32(REG_STATE, PC_OFFSET, REG_ENTRYPC);
+            }
+            this->asmb.jmp_mem_abs(&slot->code0);
+        }
 
         this->asmb.bind(try_way1);
         this->asmb.cmp_reg_mem32_abs(RDX, &slot->pred1);
@@ -703,7 +714,14 @@ private:
         this->asmb.cmp_reg64_mem(RAX, REG_TIME, this->gen_disp);
         this->asmb.jcc(X64Cond::NotEqual,
                        jit_va_revalidate ? probe1 : thunk);
-        this->asmb.jmp_mem_abs(&slot->code1);
+        if (slow_probe) {
+            this->asmb.jmp(verified1);
+        } else {
+            if (jit_va_publish_pc) {
+                this->asmb.mov_mem_reg32(REG_STATE, PC_OFFSET, REG_ENTRYPC);
+            }
+            this->asmb.jmp_mem_abs(&slot->code1);
+        }
 
         this->asmb.bind(to_dispatch);
         this->asmb.mov_mem_reg32(REG_STATE, PC_OFFSET, RDX);
@@ -717,8 +735,15 @@ private:
         // generated code. Mac OS X moves the generation thousands of times a
         // second without moving the mappings underneath, and this is what
         // keeps that from unbinding the world each time
-        this->emit_va_probe(probe0, thunk, &slot->phys0, &slot->gen0, &slot->code0);
-        this->emit_va_probe(probe1, thunk, &slot->phys1, &slot->gen1, &slot->code1);
+        this->emit_va_probe(probe0, thunk, verified0,
+                            &slot->phys0, &slot->gen0, &slot->code0);
+        this->emit_va_probe(probe1, thunk, verified1,
+                            &slot->phys1, &slot->gen1, &slot->code1);
+
+        if (slow_probe) {
+            this->emit_va_diagnostic_hit(verified0, slot, 0);
+            this->emit_va_diagnostic_hit(verified1, slot, 1);
+        }
 
         this->va_chain_exits.push_back({slot, 0, thunk});
         return true;
@@ -744,7 +769,8 @@ private:
         target address and stays untouched for the thunk's sake; RAX and the
         scratch register are free here, nothing being live at an exit */
     void emit_va_probe(X64Emitter::Label probe, X64Emitter::Label thunk,
-                       uint32_t* phys, uint64_t* gen, void** code) {
+                       X64Emitter::Label verified, uint32_t* phys,
+                       uint64_t* gen, void** code) {
         this->asmb.bind(probe);
 
         this->emit_tlb1_entry(RAX, RDX, this->itlb1_disp);
@@ -763,7 +789,59 @@ private:
 
         this->asmb.mov_reg64_mem(RAX, REG_TIME, this->gen_disp);
         this->asmb.mov_mem64_abs_reg(gen, RAX);
-        this->asmb.jmp_mem_abs(code);
+        if (jit_va_verify || jit_va_cache_probe ||
+            jit_va_translate_probe || jit_va_call_probe) {
+            this->asmb.jmp(verified);
+        } else {
+            if (jit_va_publish_pc) {
+                this->asmb.mov_mem_reg32(REG_STATE, PC_OFFSET, REG_ENTRYPC);
+            }
+            this->asmb.jmp_mem_abs(code);
+        }
+    }
+
+    /** Diagnostic-only replacement for a direct hit. It publishes the target
+        PC, repeats the authoritative translation/cache lookup in C++, and
+        jumps only to the returned block. The entire sequence is absent from
+        ordinary translations, including its labels and branches. */
+    void emit_va_diagnostic_hit(X64Emitter::Label label, ChainVaSlot* slot,
+                                uint32_t way) {
+        const X64Gpr arg0 = X64Gpr(this->abi.int_arg_regs[0]);
+        const X64Gpr arg1 = X64Gpr(this->abi.int_arg_regs[1]);
+        const X64Gpr arg2 = X64Gpr(this->abi.int_arg_regs[2]);
+        const X64Gpr ret  = X64Gpr(this->abi.int_ret_reg);
+
+        this->asmb.bind(label);
+        this->asmb.mov_mem_reg32(REG_STATE, PC_OFFSET, REG_ENTRYPC);
+
+        if (jit_va_verify || jit_va_cache_probe) {
+            // Copy the entry PC before loading arg1: Microsoft x64 uses RDX
+            // for arg1, which is also where the branch target arrived.
+            this->asmb.mov_reg_reg32(arg2, REG_ENTRYPC);
+            this->asmb.mov_reg_imm32(arg1, way);
+            this->asmb.mov_reg_imm64(arg0, uint64_t(uintptr_t(slot)));
+            const void* helper = jit_va_verify
+                ? reinterpret_cast<const void*>(&rt_chain_verify_va)
+                : reinterpret_cast<const void*>(&rt_chain_cache_va);
+            this->call_absolute(uint64_t(uintptr_t(helper)));
+        } else {
+            void** code = way ? &slot->code1 : &slot->code0;
+            this->asmb.mov_reg_reg32(arg1, REG_ENTRYPC);
+            this->asmb.mov_reg64_mem_abs(arg0, code);
+            const void* helper = jit_va_translate_probe
+                ? reinterpret_cast<const void*>(&rt_chain_translate_va)
+                : reinterpret_cast<const void*>(&rt_chain_call_va);
+            this->call_absolute(uint64_t(uintptr_t(helper)));
+        }
+
+        X64Emitter::Label give_up = this->asmb.new_label();
+        this->asmb.test_reg64_self(ret);
+        this->asmb.jcc(X64Cond::Equal, give_up);
+        this->asmb.jmp_reg(ret);
+
+        this->asmb.bind(give_up);
+        this->asmb.xor_reg_reg32(REG_RETIRED, REG_RETIRED);
+        this->asmb.jmp_abs(this->dispatch);
     }
 
     /** The seam of a cross page walk through: the same primary ITLB probe

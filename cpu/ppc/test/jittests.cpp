@@ -42,9 +42,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "devices/common/mmiodevice.h"
 #include "devices/memctrl/mpc106.h"
 
+#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <vector>
 
 using namespace std;
 
@@ -2438,6 +2440,12 @@ constexpr uint32_t CHAIN_END        = CHAIN_BASE + 8;
 constexpr uint32_t CHAIN_ITERATIONS = 64;
 
 static void stop_chain_run(uint32_t) {
+    // Generated blocks observe helper control flow through exec_flags. Keep
+    // the synthetic stop at the same PC in every executor instead of letting
+    // a translated block continue decoding the zero-filled test RAM after
+    // power_on was cleared.
+    ppc_next_instruction_address = ppc_state.pc;
+    exec_flags = EXEF_BRANCH;
     power_on = false;
 }
 
@@ -2714,6 +2722,374 @@ static void test_native_chaining() {
     ppc_opcode_grabber[0] = saved_zero;
     dppc_jit::jit_va_binding = saved_va_binding;
     ppc_jit_flush();
+}
+
+/* A deliberately hostile chain lifecycle rather than one more short opcode
+   example. One computed bclr site rotates over four target pages while its
+   ChainVaSlot only has two ways. Every run therefore evicts and rebinds ways;
+   between runs one target is rewritten, translation generations are moved,
+   and the entire cache is periodically flushed. This is the compact shape of
+   the real Finder failure: long-lived generated sources, changing targets,
+   cross-page fixed returns and computed virtual dispatch all coexist. */
+constexpr uint32_t CHAIN_STRESS_DISPATCH = 0xE000;
+constexpr uint32_t CHAIN_STRESS_DATA     = 0x3000;
+constexpr uint32_t CHAIN_STRESS_TARGETS[] = {
+    0x8000, 0x9000, 0xA000, 0xB000,
+};
+constexpr uint32_t CHAIN_STRESS_ROUNDS     = 96;
+constexpr uint32_t CHAIN_STRESS_ITERATIONS = 67;
+
+constexpr uint32_t jit_dform(unsigned primary, unsigned d, unsigned a,
+                             uint32_t imm) {
+    return (primary << 26) | (d << 21) | (a << 16) | (imm & 0xFFFF);
+}
+
+constexpr uint32_t jit_bdnz(uint32_t from, uint32_t target) {
+    return 0x42000000U | ((target - from) & 0xFFFC);
+}
+
+struct ChainStressMutation {
+    uint32_t target;
+    uint32_t addend;
+    uint32_t xor_mask;
+    bool tlbie;
+    bool flush;
+};
+
+struct ChainStressResult {
+    std::array<uint32_t, 32> gpr;
+    std::array<uint32_t, 4> mem;
+    uint32_t cr;
+    uint32_t xer;
+    uint32_t ctr;
+    uint32_t lr;
+    uint32_t fpscr;
+    uint32_t pc;
+    uint64_t retired;
+    bool reserve;
+};
+
+struct ChainStressTrace {
+    std::vector<ChainStressResult> rounds;
+    bool graph_valid = true;
+    std::string graph_error;
+};
+
+static uint32_t chain_stress_random(uint32_t& state) {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return state;
+}
+
+static std::vector<ChainStressMutation> make_chain_stress_mutations() {
+    std::vector<ChainStressMutation> mutations;
+    mutations.reserve(CHAIN_STRESS_ROUNDS);
+    uint32_t random = 0xC001D00DU;
+    for (uint32_t round = 0; round < CHAIN_STRESS_ROUNDS; round++) {
+        const uint32_t target = chain_stress_random(random) & 3;
+        const uint32_t addend = (chain_stress_random(random) & 0x3FF) + 1;
+        const uint32_t xor_mask = chain_stress_random(random) & 0xFFFF;
+        mutations.push_back({target, addend, xor_mask,
+                             (round % 5) == 4, (round % 17) == 16});
+    }
+    return mutations;
+}
+
+static void load_chain_stress_dispatch() {
+    const uint32_t code[] = {
+        jit_dform(14, 4, 4, 1),       // addi   r4,r4,1
+        jit_dform(28, 4, 5, 3),       // andi.  r5,r4,3
+        jit_dform(7, 5, 5, 0x1000),   // mulli  r5,r5,0x1000
+        jit_dform(24, 5, 5, 0x8000),  // ori    r5,r5,0x8000
+        0x7CA803A6,                    // mtlr   r5
+        0x4E800020,                    // blr
+    };
+    for (size_t i = 0; i < std::size(code); i++) {
+        mmu_write_vmem<uint32_t>(NO_OPCODE,
+                                 CHAIN_STRESS_DISPATCH + uint32_t(i) * 4,
+                                 code[i]);
+    }
+}
+
+static void patch_chain_stress_target(uint32_t target, uint32_t addend,
+                                      uint32_t xor_mask) {
+    const uint32_t base = CHAIN_STRESS_TARGETS[target];
+    const uint32_t code[] = {
+        jit_dform(14, 3, 3, addend),              // addi r3,r3,addend
+        jit_dform(26, 6, 6, xor_mask),            // xori r6,r6,mask
+        jit_dform(36, 3, 8, target * 4),          // stw  r3,n(r8)
+        jit_dform(32, 7, 8, target * 4),          // lwz  r7,n(r8)
+        jit_bdnz(base + 16, CHAIN_STRESS_DISPATCH),
+        0x00000000,
+    };
+    for (size_t i = 0; i < std::size(code); i++) {
+        mmu_write_vmem<uint32_t>(NO_OPCODE, base + uint32_t(i) * 4, code[i]);
+    }
+}
+
+static ChainStressResult run_chain_stress_round(uint32_t round) {
+    for (uint32_t i = 0; i < 32; i++) {
+        ppc_state.gpr[i] = 0x9E370000U ^ (round * 0x101U) ^ i;
+    }
+    ppc_state.gpr[3] = 0x10203040U ^ (round * 17);
+    ppc_state.gpr[4] = round & 3;
+    ppc_state.gpr[6] = 0xA5A55A5AU ^ round;
+    ppc_state.gpr[8] = CHAIN_STRESS_DATA;
+    ppc_state.cr = 0x5AA5C33CU ^ (round * 0x01010101U);
+    ppc_state.spr[SPR::XER] = 0xE1234567U ^ round;
+    ppc_state.spr[SPR::CTR] = CHAIN_STRESS_ITERATIONS;
+    ppc_state.spr[SPR::LR] = 0;
+    ppc_state.fpscr = 0x13572468U ^ round;
+    ppc_state.reserve = (round & 1) != 0;
+    ppc_state.pc = CHAIN_STRESS_DISPATCH;
+    for (uint32_t i = 0; i < 4; i++) {
+        mmu_write_vmem<uint32_t>(NO_OPCODE, CHAIN_STRESS_DATA + i * 4,
+                                 0xDEAD0000U | (round << 4) | i);
+    }
+    g_icycles = 0;
+    g_icycles_max = UINT64_MAX;
+    exec_timer = false;
+    exec_flags = 0;
+    power_on = true;
+
+    ppc_exec();
+
+    ChainStressResult result{};
+    for (uint32_t i = 0; i < 32; i++) {
+        result.gpr[i] = ppc_state.gpr[i];
+    }
+    for (uint32_t i = 0; i < 4; i++) {
+        result.mem[i] = mmu_read_vmem<uint32_t>(
+            NO_OPCODE, CHAIN_STRESS_DATA + i * 4);
+    }
+    result.cr = ppc_state.cr;
+    result.xer = ppc_state.spr[SPR::XER];
+    result.ctr = ppc_state.spr[SPR::CTR];
+    result.lr = ppc_state.spr[SPR::LR];
+    result.fpscr = ppc_state.fpscr;
+    result.pc = ppc_state.pc;
+    result.retired = g_icycles;
+    result.reserve = ppc_state.reserve;
+    return result;
+}
+
+static ChainStressTrace run_chain_stress_trace(
+        const std::vector<ChainStressMutation>& mutations,
+        JitBackend backend, bool enable_jit, bool direct_va,
+        bool verify_va = false, bool publish_pc = false,
+        bool call_probe = false, bool translate_probe = false,
+        bool cache_probe = false) {
+    ppc_jit_disable();
+    if (enable_jit && !ppc_jit_enable(backend)) {
+        return {};
+    }
+    dppc_jit::jit_va_binding = direct_va;
+    dppc_jit::jit_va_verify = verify_va;
+    dppc_jit::jit_va_publish_pc = publish_pc;
+    dppc_jit::jit_va_call_probe = call_probe;
+    dppc_jit::jit_va_translate_probe = translate_probe;
+    dppc_jit::jit_va_cache_probe = cache_probe;
+
+    load_chain_stress_dispatch();
+    for (uint32_t target = 0; target < 4; target++) {
+        patch_chain_stress_target(target, target + 1,
+                                  0x1111U * (target + 1));
+    }
+
+    ChainStressTrace trace;
+    trace.rounds.reserve(mutations.size());
+    auto validate = [&trace](uint32_t round, const char* phase) {
+        if (!ppc_jit_is_enabled() || !trace.graph_valid) {
+            return;
+        }
+        std::string error;
+        if (!ppc_jit_validate_chains(&error)) {
+            trace.graph_valid = false;
+            trace.graph_error = "round " + std::to_string(round) + " " +
+                                phase + ": " + error;
+        }
+    };
+
+    for (uint32_t round = 0; round < mutations.size(); round++) {
+        const ChainStressMutation& mutation = mutations[round];
+        patch_chain_stress_target(mutation.target, mutation.addend,
+                                  mutation.xor_mask);
+        if (mutation.tlbie) {
+            tlb_flush_entry(CHAIN_STRESS_TARGETS[mutation.target]);
+        }
+        if (mutation.flush && ppc_jit_is_enabled()) {
+            ppc_jit_flush();
+        }
+        validate(round, "after invalidation");
+        trace.rounds.push_back(run_chain_stress_round(round));
+        validate(round, "after execution");
+    }
+    return trace;
+}
+
+static bool same_chain_stress(const ChainStressResult& a,
+                              const ChainStressResult& b) {
+    return a.gpr == b.gpr && a.mem == b.mem && a.cr == b.cr &&
+           a.xer == b.xer && a.ctr == b.ctr && a.lr == b.lr &&
+           a.fpscr == b.fpscr && a.pc == b.pc &&
+           a.retired == b.retired && a.reserve == b.reserve;
+}
+
+static bool same_chain_stress_trace(const ChainStressTrace& reference,
+                                    const ChainStressTrace& actual,
+                                    const char* backend) {
+    if (reference.rounds.size() != actual.rounds.size()) {
+        cout << "  " << backend << " produced " << actual.rounds.size()
+             << " stress rounds, expected " << reference.rounds.size() << endl;
+        return false;
+    }
+    for (size_t i = 0; i < reference.rounds.size(); i++) {
+        if (!same_chain_stress(reference.rounds[i], actual.rounds[i])) {
+            cout << "  " << backend << " first diverged in chain-stress round "
+                 << i << endl;
+            const ChainStressResult& expected = reference.rounds[i];
+            const ChainStressResult& got = actual.rounds[i];
+            for (size_t reg = 0; reg < expected.gpr.size(); reg++) {
+                if (expected.gpr[reg] != got.gpr[reg]) {
+                    cout << "    r" << dec << reg << ": expected 0x" << hex
+                         << expected.gpr[reg] << ", got 0x" << got.gpr[reg]
+                         << dec << endl;
+                    break;
+                }
+            }
+            for (size_t word = 0; word < expected.mem.size(); word++) {
+                if (expected.mem[word] != got.mem[word]) {
+                    cout << "    mem[" << word << "]: expected 0x" << hex
+                         << expected.mem[word] << ", got 0x" << got.mem[word]
+                         << dec << endl;
+                    break;
+                }
+            }
+            if (expected.cr != got.cr || expected.xer != got.xer ||
+                expected.ctr != got.ctr || expected.lr != got.lr ||
+                expected.pc != got.pc || expected.retired != got.retired) {
+                cout << "    cr/xer/ctr/lr/pc/cycles expected " << hex
+                     << expected.cr << '/' << expected.xer << '/'
+                     << expected.ctr << '/' << expected.lr << '/'
+                     << expected.pc << dec << '/' << expected.retired
+                     << ", got " << hex << got.cr << '/' << got.xer << '/'
+                     << got.ctr << '/' << got.lr << '/' << got.pc << dec
+                     << '/' << got.retired << endl;
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+static void test_chain_lifecycle_stress() {
+    const bool saved_va_binding = dppc_jit::jit_va_binding;
+    const bool saved_va_verify = dppc_jit::jit_va_verify;
+    const bool saved_va_publish_pc = dppc_jit::jit_va_publish_pc;
+    const bool saved_va_call_probe = dppc_jit::jit_va_call_probe;
+    const bool saved_va_translate_probe = dppc_jit::jit_va_translate_probe;
+    const bool saved_va_cache_probe = dppc_jit::jit_va_cache_probe;
+    PPCOpcode saved_zero = ppc_opcode_grabber[0];
+    ppc_opcode_grabber[0] = stop_chain_run;
+
+    const std::vector<ChainStressMutation> mutations =
+        make_chain_stress_mutations();
+    const ChainStressTrace interp = run_chain_stress_trace(
+        mutations, JitBackend::automatic, false, false);
+
+    const ChainStressTrace threaded = run_chain_stress_trace(
+        mutations, JitBackend::threaded, true, false);
+    jit_check(threaded.graph_valid,
+              "threaded chain graph survives the invalidation stress");
+    if (!threaded.graph_valid) {
+        cout << "  threaded graph: " << threaded.graph_error << endl;
+    }
+    jit_check(same_chain_stress_trace(interp, threaded, "threaded"),
+              "threaded state matches the interpreter through every chain mutation");
+
+    const ChainStressTrace native_safe = run_chain_stress_trace(
+        mutations, JitBackend::automatic, true, false);
+    if (ppc_jit_native_compiles() == 0) {
+        cout << "  (no emitter on this host, skipping native chain stress)" << endl;
+    } else {
+        jit_check(native_safe.graph_valid,
+                  "resolver-backed native chain graph survives the stress");
+        if (!native_safe.graph_valid) {
+            cout << "  native safe graph: " << native_safe.graph_error << endl;
+        }
+        jit_check(same_chain_stress_trace(interp, native_safe, "native safe"),
+                  "resolver-backed native state matches every interpreter round");
+
+        const ChainStressTrace native_direct = run_chain_stress_trace(
+            mutations, JitBackend::automatic, true, true);
+        jit_check(native_direct.graph_valid,
+                  "direct native chain graph survives rebinding and invalidation");
+        if (!native_direct.graph_valid) {
+            cout << "  native direct graph: " << native_direct.graph_error << endl;
+        }
+        jit_check(same_chain_stress_trace(interp, native_direct, "native direct"),
+                  "direct native state matches every interpreter stress round");
+
+        const ChainStressTrace native_published = run_chain_stress_trace(
+            mutations, JitBackend::automatic, true, true, false, true);
+        jit_check(native_published.graph_valid,
+                  "PC-publishing direct chain graph survives the lifecycle stress");
+        jit_check(same_chain_stress_trace(interp, native_published,
+                                          "native published PC"),
+                  "PC-publishing direct state matches every interpreter stress round");
+
+        const ChainStressTrace native_called = run_chain_stress_trace(
+            mutations, JitBackend::automatic, true, true,
+            false, false, true, false);
+        jit_check(native_called.graph_valid,
+                  "call-probed direct chain graph survives the lifecycle stress");
+        jit_check(same_chain_stress_trace(interp, native_called,
+                                          "native call probe"),
+                  "call-probed direct state matches every interpreter stress round");
+
+        const ChainStressTrace native_translated = run_chain_stress_trace(
+            mutations, JitBackend::automatic, true, true,
+            false, false, false, true);
+        jit_check(native_translated.graph_valid,
+                  "translation-probed chain graph survives the lifecycle stress");
+        jit_check(same_chain_stress_trace(interp, native_translated,
+                                          "native translation probe"),
+                  "translation-probed direct state matches every interpreter stress round");
+
+        const ChainStressTrace native_cache_checked = run_chain_stress_trace(
+            mutations, JitBackend::automatic, true, true,
+            false, false, false, false, true);
+        jit_check(native_cache_checked.graph_valid,
+                  "cache-checked direct chain graph survives the lifecycle stress");
+        jit_check(same_chain_stress_trace(interp, native_cache_checked,
+                                          "native cache check"),
+                  "cache-checked direct state matches every interpreter stress round");
+
+        const ChainStressTrace native_verified = run_chain_stress_trace(
+            mutations, JitBackend::automatic, true, true, true);
+        jit_check(native_verified.graph_valid,
+                  "verified direct chain graph survives the lifecycle stress");
+        jit_check(same_chain_stress_trace(interp, native_verified,
+                                          "native verified"),
+                  "verified direct state matches every interpreter stress round");
+        jit_check(ppc_jit_va_verify_checks() > 0 &&
+                  ppc_jit_va_verify_failures() == 0,
+                  "authoritative VA checks observed direct hits without mismatches");
+    }
+
+    ppc_jit_disable();
+    ppc_opcode_grabber[0] = saved_zero;
+    dppc_jit::jit_va_binding = saved_va_binding;
+    dppc_jit::jit_va_verify = saved_va_verify;
+    dppc_jit::jit_va_publish_pc = saved_va_publish_pc;
+    dppc_jit::jit_va_call_probe = saved_va_call_probe;
+    dppc_jit::jit_va_translate_probe = saved_va_translate_probe;
+    dppc_jit::jit_va_cache_probe = saved_va_cache_probe;
+
+    std::string empty_error;
+    jit_check(ppc_jit_validate_chains(&empty_error),
+              "disabling the JIT leaves an empty, valid chain graph");
 }
 
 constexpr uint32_t jit_x31(unsigned d, unsigned a, unsigned b,
@@ -3293,6 +3669,7 @@ int test_jit() {
     test_xform_subset();
     test_mmio_cycle_visibility(host_bridge);
     test_native_chaining();
+    test_chain_lifecycle_stress();
 
     ppc_jit_disable();
     jit_check(!ppc_jit_is_enabled(), "the JIT reports itself disabled again");

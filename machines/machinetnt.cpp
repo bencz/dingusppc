@@ -145,9 +145,11 @@ int MachineTnt::initialize(const std::string &id) {
         // configure CPU clocks
         uint64_t bus_freq      = 50000000ULL;
         uint64_t timebase_freq = bus_freq / 4;
+        uint64_t cpu_freq      = bus_freq * 7 / 2; // PLL 3.5:1
 
         // initialize virtual CPU and request MPC750 CPU aka G3
-        ppc_cpu_init(memctrl_obj, PPC_VER::MPC750, false, timebase_freq);
+        ppc_cpu_init(memctrl_obj, PPC_VER::MPC750, false, timebase_freq,
+                     cpu_freq);
 
         // set CPU PLL ratio to 3.5
         ppc_state.spr[SPR::HID1] = 0xE << 28;

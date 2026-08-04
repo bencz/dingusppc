@@ -100,14 +100,16 @@ int MachineYosemite::initialize(const std::string &id) {
     setup_ram_slot("RAM_DIMM_4", 0x53, GET_INT_PROP("rambank4_size"));
 
     // configure CPU clocks
-    uint64_t bus_freq      = 66820000ULL;
+    uint64_t bus_freq      = 100000000ULL;
     uint64_t timebase_freq = bus_freq / 4;
+    uint64_t cpu_freq      = bus_freq * 9 / 2; // PLL 4.5:1
 
     // initialize virtual CPU and request MPC750 CPU aka G3
-    ppc_cpu_init(grackle_obj, PPC_VER::MPC750, false, timebase_freq);
+    ppc_cpu_init(grackle_obj, PPC_VER::MPC750, false, timebase_freq,
+                 cpu_freq);
 
-    // set CPU PLL ratio to 3.5
-    ppc_state.spr[SPR::HID1] = 0xE << 28;
+    // set CPU PLL ratio to 4.5
+    ppc_state.spr[SPR::HID1] = 0x7 << 28;
 
     return 0;
 }

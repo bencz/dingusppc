@@ -37,6 +37,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "jitblock.h"
 
 #include <cstddef>
+#include <vector>
 
 namespace dppc_jit {
 
@@ -51,6 +52,10 @@ void cache_forget(JitBlock* blk);
 void cache_clear();
 
 size_t cache_size();
+
+/** Snapshot of every live block. Only diagnostics and tests walk it; normal
+    lookup stays on the quick table/unordered map path above. */
+std::vector<JitBlock*> cache_blocks();
 
 } // namespace dppc_jit
 

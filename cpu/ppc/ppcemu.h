@@ -215,6 +215,10 @@ extern int icnt_factor;
 /** Services whatever timers came due and returns the next deadline */
 uint64_t ppc_process_events();
 
+/** Enables or disables wall-clock pacing of virtual CPU time. Guest-visible
+    clocks remain derived exclusively from g_icycles. */
+void ppc_set_realtime(bool enabled);
+
 /** Accounts for retired instructions and services timers once their deadline
     has passed.
 
@@ -511,7 +515,9 @@ typedef enum {
 constexpr uint32_t NO_OPCODE = 0;
 
 // Function prototypes
-extern void ppc_cpu_init(MemCtrlBase* mem_ctrl, uint32_t cpu_version, bool include_601, uint64_t tb_freq);
+extern void ppc_cpu_init(MemCtrlBase* mem_ctrl, uint32_t cpu_version,
+                         bool include_601, uint64_t tb_freq,
+                         uint64_t cpu_freq = 62500000ULL);
 extern void ppc_mmu_init();
 
 void ppc_illegalop(uint32_t opcode);

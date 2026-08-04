@@ -136,4 +136,13 @@ size_t cache_size() {
     return blocks.size();
 }
 
+std::vector<JitBlock*> cache_blocks() {
+    std::vector<JitBlock*> result;
+    result.reserve(blocks.size());
+    for (const auto& entry : blocks) {
+        result.push_back(entry.second);
+    }
+    return result;
+}
+
 } // namespace dppc_jit

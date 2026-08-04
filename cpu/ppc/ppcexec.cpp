@@ -36,6 +36,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <stdexcept>
 #include <stdio.h>
 #include <string>
+#include <thread>
 
 #ifdef __APPLE__
 #include <mach/mach_time.h>
@@ -95,8 +96,10 @@ bool int_pin = false; // interrupt request pin state: true - asserted
 bool dec_exception_pending = false;
 
 /* variables related to virtual time */
-const bool g_realtime = false;
-uint64_t g_nanoseconds_base;
+static bool g_realtime = false;
+static bool g_realtime_epoch_valid = false;
+static uint64_t g_realtime_guest_base = 0;
+static std::chrono::steady_clock::time_point g_realtime_wall_base;
 uint64_t g_icycles;
 uint64_t g_icycles_max;
 int      icnt_factor;
@@ -327,10 +330,48 @@ static long long cpu_now_ns() {
 
 uint64_t get_virt_time_ns()
 {
-    if (g_realtime) {
-        return cpu_now_ns() - g_nanoseconds_base;
-    } else {
-        return g_icycles << icnt_factor;
+    return g_icycles << icnt_factor;
+}
+
+void ppc_set_realtime(bool enabled)
+{
+    g_realtime = enabled;
+    g_realtime_epoch_valid = false;
+}
+
+/** Holds an ahead-of-real-time CPU at an event boundary without changing
+    guest-visible time. A long host stall rebases the epoch: after a paused
+    window or debugger stop the guest resumes paced immediately instead of
+    sprinting until it has made up all of the missed wall time. */
+static void ppc_pace_realtime()
+{
+    if (!g_realtime) {
+        return;
+    }
+
+    using namespace std::chrono;
+    const steady_clock::time_point now = steady_clock::now();
+    if (!g_realtime_epoch_valid || g_icycles < g_realtime_guest_base) {
+        g_realtime_guest_base = g_icycles;
+        g_realtime_wall_base = now;
+        g_realtime_epoch_valid = true;
+        return;
+    }
+
+    const uint64_t cycle_delta = g_icycles - g_realtime_guest_base;
+    if (cycle_delta > (uint64_t(INT64_MAX) >> icnt_factor)) {
+        g_realtime_guest_base = g_icycles;
+        g_realtime_wall_base = now;
+        return;
+    }
+
+    const steady_clock::time_point target = g_realtime_wall_base +
+        nanoseconds(int64_t(cycle_delta << icnt_factor));
+    if (target > now) {
+        std::this_thread::sleep_until(target);
+    } else if (now - target > milliseconds(100)) {
+        g_realtime_guest_base = g_icycles;
+        g_realtime_wall_base = now;
     }
 }
 
@@ -393,6 +434,7 @@ static void ppc_report_speed()
 
 uint64_t ppc_process_events()
 {
+    ppc_pace_realtime();
     ppc_report_speed();
 
     // Clear first so a device thread that queues an invalidation during or
@@ -990,7 +1032,28 @@ void initialize_ppc_opcode_table() {
     }
 }
 
-void ppc_cpu_init(MemCtrlBase* mem_ctrl, uint32_t cpu_version, bool do_include_601, uint64_t tb_freq)
+static int frequency_to_icnt_factor(uint64_t cpu_freq)
+{
+    int best_factor = 0;
+    uint64_t best_rate = NS_PER_SEC;
+    uint64_t best_error = best_rate > cpu_freq
+        ? best_rate - cpu_freq : cpu_freq - best_rate;
+
+    for (int factor = 1; factor <= 11; factor++) {
+        const uint64_t rate = uint64_t(NS_PER_SEC) >> factor;
+        const uint64_t error = rate > cpu_freq
+            ? rate - cpu_freq : cpu_freq - rate;
+        if (error < best_error) {
+            best_factor = factor;
+            best_error = error;
+        }
+    }
+    return best_factor;
+}
+
+void ppc_cpu_init(MemCtrlBase* mem_ctrl, uint32_t cpu_version,
+                  bool do_include_601, uint64_t tb_freq,
+                  uint64_t cpu_freq)
 {
     mem_ctrl_instance = mem_ctrl;
 
@@ -1033,7 +1096,7 @@ void ppc_cpu_init(MemCtrlBase* mem_ctrl, uint32_t cpu_version, bool do_include_6
 #ifdef __APPLE__
     mach_timebase_info(&timebase_info);
 #endif
-    g_nanoseconds_base = cpu_now_ns();
+    g_realtime_epoch_valid = false;
     g_icycles = 0;
     g_icycles_max = 0;
 
@@ -1045,11 +1108,18 @@ void ppc_cpu_init(MemCtrlBase* mem_ctrl, uint32_t cpu_version, bool do_include_6
 //  icnt_factor =  7; // 1 instruction =  128 ns =    7.813 MHz // 0069E54C =     6.939980 MHz =  144.092 ns //  [0..10] MHz = invalid clock for PDM gestalt calculation
 //  icnt_factor =  6; // 1 instruction =   64 ns =   15.625 MHz // 00D3E6F5 =    13.887221 MHz =   72.008 ns // (10..60] = 50, (60..73] = 66, (73..100] = 80 MHz
 //  icnt_factor =  5; // 1 instruction =   32 ns =   31.250 MHz // 01A7B672 =    27.768434 MHz =   36.012 ns //
-    icnt_factor =  4; // 1 instruction =   16 ns =   62.500 MHz // 034F0F0F =    55.512847 MHz =   18.013 ns // 6100/60 in Apple System Profiler
+    icnt_factor = frequency_to_icnt_factor(cpu_freq);
 //  icnt_factor =  3; // 1 instruction =    8 ns =  125.000 MHz // 069E1E1E =   111.025694 MHz =    9.006 ns // (100...) MHz = invalid clock for PDM gestalt calculation
 //  icnt_factor =  2; // 1 instruction =    4 ns =  250.000 MHz // 0D3C3C3C =   222.051388 MHz =    4.503 ns // (100...) MHz = invalid clock for PDM gestalt calculation
 //  icnt_factor =  1; // 1 instruction =    2 ns =  500.000 MHz // 1A611A7B =   442.571387 MHz =    2.259 ns // (100...) MHz = invalid clock for PDM gestalt calculation
 //  icnt_factor =  0; // 1 instruction =    1 ns = 1500.000 MHz // 3465B2D9 =   879.080153 MHz =    1.137 ns // (100...) MHz = invalid clock for PDM gestalt calculation
+
+    if (g_realtime) {
+        const uint64_t modeled_rate = uint64_t(NS_PER_SEC) >> icnt_factor;
+        LOG_F(INFO,
+              "Real-time CPU target: %.3f MIPS for nominal %.3f MHz",
+              double(modeled_rate) / 1e6, double(cpu_freq) / 1e6);
+    }
 
     tbr_wr_timestamp = 0;
     rtc_timestamp = 0;
