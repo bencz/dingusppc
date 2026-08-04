@@ -157,6 +157,8 @@ public:
     void movsx_reg8(X64Gpr dst, X64Gpr src);      // sign extend low byte
     void movsx_reg16(X64Gpr dst, X64Gpr src);     // sign extend low word
     void add_reg_imm32(X64Gpr dst, uint32_t imm);
+    void add_reg_imm32_flags(X64Gpr dst, uint32_t imm); // never elides zero
+    void adc_reg_imm32(X64Gpr dst, uint32_t imm);
     void inc_reg32(X64Gpr dst);
     void xor_reg_reg32(X64Gpr dst, X64Gpr src);
     void test_reg8_self(X64Gpr reg);

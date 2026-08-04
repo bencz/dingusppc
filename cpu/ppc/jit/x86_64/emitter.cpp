@@ -281,8 +281,9 @@ void X64Emitter::lea_reg_reg32(X64Gpr dst, X64Gpr base, X64Gpr index) {
 }
 
 /** ALU forms with an immediate share their ModRM extension: /0 add, /1 or,
-    /4 and, /6 xor, /7 cmp. 0x83 sign extends its byte, so it is both shorter
-    and exactly equivalent whenever the 32-bit immediate is a signed byte. */
+    /2 adc, /4 and, /6 xor, /7 cmp. 0x83 sign extends its byte, so it is both
+    shorter and exactly equivalent whenever the 32-bit immediate is a signed
+    byte. */
 void X64Emitter::alu_reg_imm32(uint8_t ext, X64Gpr dst, uint32_t imm) {
     this->rex(false, 0, uint8_t(dst));
     if (fits_int8(int32_t(imm))) {
@@ -586,6 +587,15 @@ void X64Emitter::add_reg_imm32(X64Gpr dst, uint32_t imm) {
         return;
     }
     this->alu_reg_imm32(0, dst, imm);
+}
+
+void X64Emitter::add_reg_imm32_flags(X64Gpr dst, uint32_t imm) {
+    // Carry-producing guest instructions need CF/OF even for add zero.
+    this->alu_reg_imm32(0, dst, imm);
+}
+
+void X64Emitter::adc_reg_imm32(X64Gpr dst, uint32_t imm) {
+    this->alu_reg_imm32(2, dst, imm);
 }
 
 void X64Emitter::inc_reg32(X64Gpr dst) {

@@ -72,6 +72,8 @@ static void test_x64_encoding() {
     emitter.cmp_reg_imm32(dppc_jit::R10, 0x12345678);
     emitter.imul_reg_reg_imm32(dppc_jit::R9, dppc_jit::R10, uint32_t(-2));
     emitter.imul_reg_reg_imm32(dppc_jit::R10, dppc_jit::R9, 0x12345678);
+    emitter.add_reg_imm32_flags(dppc_jit::R9, 0);
+    emitter.adc_reg_imm32(dppc_jit::R10, uint32_t(-1));
 
     constexpr uint8_t expected[] = {
         0x45, 0x0F, 0x38, 0xF0, 0x4A, 0x7F,
@@ -81,12 +83,14 @@ static void test_x64_encoding() {
         0x41, 0x81, 0xFA, 0x78, 0x56, 0x34, 0x12,
         0x45, 0x6B, 0xCA, 0xFE,
         0x45, 0x69, 0xD1, 0x78, 0x56, 0x34, 0x12,
+        0x41, 0x83, 0xC1, 0x00,
+        0x41, 0x83, 0xD2, 0xFF,
     };
     bool same = emitter.size() == sizeof(expected);
     for (size_t i = 0; same && i < sizeof(expected); i++) {
         same = emitter.bytes()[i] == expected[i];
     }
-    jit_check(same, "MOVBE, compares and IMUL have the exact x64 encoding");
+    jit_check(same, "MOVBE, compare, IMUL and carry have exact x64 encodings");
 }
 #endif
 

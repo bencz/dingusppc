@@ -903,7 +903,9 @@ private:
                  in.opcode == IROpcode::Or  || in.opcode == IROpcode::Xor ||
                  in.opcode == IROpcode::MulLow);
             const bool immediate_compare = in.opcode == IROpcode::SetCR;
-            if (!immediate_alu && !immediate_compare) {
+            const bool immediate_carry = in.opcode == IROpcode::AddCA ||
+                                         in.opcode == IROpcode::AddECA;
+            if (!immediate_alu && !immediate_compare && !immediate_carry) {
                 continue;
             }
 
@@ -911,7 +913,8 @@ private:
             if (in.b != IR_NO_VALUE && use_count[in.b] == 1 &&
                 ir.insns[in.b].opcode == IROpcode::ConstI32) {
                 selected = in.b;
-            } else if (immediate_alu && in.a != IR_NO_VALUE &&
+            } else if ((immediate_alu || immediate_carry) &&
+                       in.a != IR_NO_VALUE &&
                        use_count[in.a] == 1 &&
                        ir.insns[in.a].opcode == IROpcode::ConstI32) {
                 selected = in.a;
@@ -1168,8 +1171,11 @@ private:
         register is needed for the XER merge; a block too pressured to have
         one goes to the interpreter like any other allocation failure */
     bool emit_carry(const IRInsn& in, size_t idx, uint32_t& free_mask) {
-        const X64Gpr ra = X64Gpr(this->reg_of[in.a]);
-        const X64Gpr rb = X64Gpr(this->reg_of[in.b]);
+        const bool a_immediate = this->immediate_const[in.a];
+        const bool b_immediate = this->immediate_const[in.b];
+        const bool has_immediate = a_immediate || b_immediate;
+        const X64Gpr ra = a_immediate ? RAX : X64Gpr(this->reg_of[in.a]);
+        const X64Gpr rb = b_immediate ? RAX : X64Gpr(this->reg_of[in.b]);
         const bool a_dies = this->last_use[in.a] == idx;
         const bool b_dies = this->last_use[in.b] == idx;
 
@@ -1178,24 +1184,41 @@ private:
         const bool commutative = in.opcode == IROpcode::AddCA ||
                                  in.opcode == IROpcode::AddECA;
 
-        // same reuse rules as emit_value_op, with one exception: SubECA flips
-        // dst before reading b, so the two may not share a register, which
-        // aliased operands would otherwise make happen
+        // Same reuse rules as emit_value_op. An immediate Add has only one
+        // register operand and can update it when it dies; otherwise it gets
+        // a fresh destination. SubECA has one exception: it flips dst before
+        // reading b, so aliased operands may not share the destination.
         X64Gpr dst;
-        if (a_dies && !(in.opcode == IROpcode::SubECA && ra == rb)) {
-            dst = ra;
-        } else if (b_dies && commutative) {
-            dst = rb;
-        } else {
-            if (!free_mask) {
-                return false;
+        X64Gpr immediate_src = RAX;
+        if (has_immediate) {
+            immediate_src = a_immediate ? rb : ra;
+            const bool src_dies = a_immediate ? b_dies : a_dies;
+            if (src_dies) {
+                dst = immediate_src;
+            } else {
+                if (!free_mask) {
+                    return false;
+                }
+                dst = X64Gpr(lowest_bit(free_mask));
+                free_mask &= ~bit(uint8_t(dst));
             }
-            dst = X64Gpr(lowest_bit(free_mask));
-            free_mask &= ~bit(uint8_t(dst));
+        } else {
+            if (a_dies && !(in.opcode == IROpcode::SubECA && ra == rb)) {
+                dst = ra;
+            } else if (b_dies && commutative) {
+                dst = rb;
+            } else {
+                if (!free_mask) {
+                    return false;
+                }
+                dst = X64Gpr(lowest_bit(free_mask));
+                free_mask &= ~bit(uint8_t(dst));
+            }
         }
 
-        uint32_t avail = free_mask & ~bit(uint8_t(dst)) &
-                         ~bit(uint8_t(ra)) & ~bit(uint8_t(rb));
+        uint32_t avail = free_mask & ~bit(uint8_t(dst));
+        if (!a_immediate) avail &= ~bit(uint8_t(ra));
+        if (!b_immediate) avail &= ~bit(uint8_t(rb));
         if (!avail) {
             return false;
         }
@@ -1209,18 +1232,36 @@ private:
 
         switch (in.opcode) {
         case IROpcode::AddCA:
-            if (dst == rb)      this->asmb.add_reg_reg32(dst, ra);
-            else {
-                if (dst != ra)  this->asmb.mov_reg_reg32(dst, ra);
-                this->asmb.add_reg_reg32(dst, rb);
+            if (has_immediate) {
+                if (dst != immediate_src) {
+                    this->asmb.mov_reg_reg32(dst, immediate_src);
+                }
+                const IRValue imm_value = a_immediate ? in.a : in.b;
+                this->asmb.add_reg_imm32_flags(
+                    dst, this->immediate_value[imm_value]);
+            } else {
+                if (dst == rb)      this->asmb.add_reg_reg32(dst, ra);
+                else {
+                    if (dst != ra)  this->asmb.mov_reg_reg32(dst, ra);
+                    this->asmb.add_reg_reg32(dst, rb);
+                }
             }
             break;
         case IROpcode::AddECA:
             // mov does not touch the flags, so the carry survives it
-            if (dst == rb)      this->asmb.adc_reg_reg32(dst, ra);
-            else {
-                if (dst != ra)  this->asmb.mov_reg_reg32(dst, ra);
-                this->asmb.adc_reg_reg32(dst, rb);
+            if (has_immediate) {
+                if (dst != immediate_src) {
+                    this->asmb.mov_reg_reg32(dst, immediate_src);
+                }
+                const IRValue imm_value = a_immediate ? in.a : in.b;
+                this->asmb.adc_reg_imm32(
+                    dst, this->immediate_value[imm_value]);
+            } else {
+                if (dst == rb)      this->asmb.adc_reg_reg32(dst, ra);
+                else {
+                    if (dst != ra)  this->asmb.mov_reg_reg32(dst, ra);
+                    this->asmb.adc_reg_reg32(dst, rb);
+                }
             }
             break;
         case IROpcode::SubCA:
@@ -1259,8 +1300,10 @@ private:
         this->asmb.or_reg_reg32(rtmp, REG_SCRATCH);
         this->asmb.mov_mem_reg32(REG_STATE, XER_OFFSET, rtmp);
 
-        if (a_dies && ra != dst) free_mask |= bit(uint8_t(ra));
-        if (b_dies && rb != dst) free_mask |= bit(uint8_t(rb));
+        if (a_dies && !a_immediate && ra != dst)
+            free_mask |= bit(uint8_t(ra));
+        if (b_dies && !b_immediate && rb != dst)
+            free_mask |= bit(uint8_t(rb));
         this->reg_of[idx] = uint8_t(dst);
         return true;
     }
