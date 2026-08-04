@@ -532,6 +532,15 @@ void X64Emitter::mov_mem_reg16(X64Gpr base, int32_t disp, X64Gpr src) {
 }
 
 void X64Emitter::cmp_reg_imm32(X64Gpr dst, uint32_t imm) {
+    // `test r32,r32` leaves exactly the flags `cmp r32,0` does: CF and OF
+    // clear, ZF and SF from the value. It is one byte shorter than even the
+    // sign-extended imm8 compare and has no immediate to decode.
+    if (imm == 0) {
+        this->rex(false, uint8_t(dst), uint8_t(dst));
+        this->emit8(0x85);
+        this->modrm_reg(uint8_t(dst), uint8_t(dst));
+        return;
+    }
     this->alu_reg_imm32(7, dst, imm);
 }
 

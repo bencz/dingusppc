@@ -60,26 +60,29 @@ static void jit_check(bool passed, const char* what) {
 }
 
 #if defined(DPPC_JIT_X86_64)
-/** The load and store forms differ by one opcode byte and share the same REX
-    and ModRM fields. Exercise extended registers and a disp8 so every part of
-    the encoding is visible rather than relying only on the current CPU to
-    accept it. */
-static void test_movbe_encoding() {
+/** Exercise exact encodings whose prefix, REX or special zero form is easy to
+    get subtly wrong, rather than relying only on the current CPU to accept
+    them. */
+static void test_x64_encoding() {
     dppc_jit::X64Emitter emitter;
     emitter.movbe_reg_mem32(dppc_jit::R9, dppc_jit::R10, 0x7F);
     emitter.movbe_mem_reg32(dppc_jit::R10, -4, dppc_jit::R9);
     emitter.movbe_mem_reg16(dppc_jit::R10, -8, dppc_jit::R9);
+    emitter.cmp_reg_imm32(dppc_jit::R9, 0);
+    emitter.cmp_reg_imm32(dppc_jit::R10, 0x12345678);
 
     constexpr uint8_t expected[] = {
         0x45, 0x0F, 0x38, 0xF0, 0x4A, 0x7F,
         0x45, 0x0F, 0x38, 0xF1, 0x4A, 0xFC,
         0x66, 0x45, 0x0F, 0x38, 0xF1, 0x4A, 0xF8,
+        0x45, 0x85, 0xC9,
+        0x41, 0x81, 0xFA, 0x78, 0x56, 0x34, 0x12,
     };
     bool same = emitter.size() == sizeof(expected);
     for (size_t i = 0; same && i < sizeof(expected); i++) {
         same = emitter.bytes()[i] == expected[i];
     }
-    jit_check(same, "MOVBE word and halfword forms have the exact x64 encoding");
+    jit_check(same, "MOVBE and immediate compares have the exact x64 encoding");
 }
 #endif
 
@@ -886,6 +889,8 @@ static const uint32_t cr_code[] = {
     0x2C830009, // cmpi   cr1, r3, 9
     0x2F840000, // cmpi   cr7, r4, 0
     0x29040001, // cmpli  cr2, r4, 1     sem sinal, -7 e enorme
+    0x2E848000, // cmpi   cr5, r4, -32768  imediato fora de int8
+    0x2B04FFFF, // cmpli  cr6, r4, 65535   imediato fora de int8
     0x7D832000, // cmp    cr3, r3, r4
     0x7E032040, // cmpl   cr4, r3, r4
     0x70650004, // andi.  r5, r3, 0x4
@@ -2449,7 +2454,7 @@ int test_jit() {
     ppc_cpu_init(host_bridge, PPC_VER::MPC750, false, 16705000);
 
 #if defined(DPPC_JIT_X86_64)
-    test_movbe_encoding();
+    test_x64_encoding();
 #endif
 
     // MSR[DR] is clear coming out of reset, so effective addresses are physical

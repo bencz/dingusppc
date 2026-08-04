@@ -892,14 +892,17 @@ private:
 
         // x86 can consume one constant operand without first materialising
         // it in a host register. Restrict this to a single-use value and one
-        // operand per instruction. All other backends keep seeing the
-        // ordinary, backend-neutral IR.
+        // operand per instruction. SetCR deliberately takes only its second
+        // operand here: that is the immediate in cmpi/cmpli and the zero in
+        // every Rc form, so no reversed comparison is needed. All other
+        // backends keep seeing the ordinary, backend-neutral IR.
         for (size_t i = 0; i < ir.insns.size(); i++) {
             const IRInsn& in = ir.insns[i];
             const bool immediate_alu = !in.oe &&
                 (in.opcode == IROpcode::Add || in.opcode == IROpcode::And ||
                  in.opcode == IROpcode::Or  || in.opcode == IROpcode::Xor);
-            if (!immediate_alu) {
+            const bool immediate_compare = in.opcode == IROpcode::SetCR;
+            if (!immediate_alu && !immediate_compare) {
                 continue;
             }
 
@@ -907,7 +910,8 @@ private:
             if (in.b != IR_NO_VALUE && use_count[in.b] == 1 &&
                 ir.insns[in.b].opcode == IROpcode::ConstI32) {
                 selected = in.b;
-            } else if (in.a != IR_NO_VALUE && use_count[in.a] == 1 &&
+            } else if (immediate_alu && in.a != IR_NO_VALUE &&
+                       use_count[in.a] == 1 &&
                        ir.insns[in.a].opcode == IROpcode::ConstI32) {
                 selected = in.a;
             }
@@ -1680,11 +1684,15 @@ private:
         ppc_changecrf0 do between them */
     bool emit_set_cr(const IRInsn& in, size_t idx, uint32_t& free_mask) {
         const X64Gpr ra = X64Gpr(this->reg_of[in.a]);
-        const X64Gpr rb = X64Gpr(this->reg_of[in.b]);
+        const bool b_immediate = this->immediate_const[in.b];
+        const X64Gpr rb = b_immediate ? RAX : X64Gpr(this->reg_of[in.b]);
         const bool a_dies = this->last_use[in.a] == idx;
         const bool b_dies = this->last_use[in.b] == idx;
 
-        uint32_t avail = free_mask & ~bit(uint8_t(ra)) & ~bit(uint8_t(rb));
+        uint32_t avail = free_mask & ~bit(uint8_t(ra));
+        if (!b_immediate) {
+            avail &= ~bit(uint8_t(rb));
+        }
         if (!avail) {
             return false;
         }
@@ -1716,7 +1724,11 @@ private:
             // the pieces are disjoint, so the adds below are the or
             this->asmb.lea_reg_reg32(rcr, rcr, rtmp);
 
-            this->asmb.cmp_reg_reg32(ra, rb);
+            if (b_immediate) {
+                this->asmb.cmp_reg_imm32(ra, this->immediate_value[in.b]);
+            } else {
+                this->asmb.cmp_reg_reg32(ra, rb);
+            }
 
             this->asmb.mov_reg_imm32(rfield, CRx_bit::CR_EQ >> in.crf);
             this->asmb.mov_reg_imm32(rtmp, CRx_bit::CR_GT >> in.crf);
@@ -1732,7 +1744,11 @@ private:
         } else {
             // two scratch registers: the legacy ordering, FLAGS do not
             // survive it
-            this->asmb.cmp_reg_reg32(ra, rb);
+            if (b_immediate) {
+                this->asmb.cmp_reg_imm32(ra, this->immediate_value[in.b]);
+            } else {
+                this->asmb.cmp_reg_reg32(ra, rb);
+            }
 
             this->asmb.mov_reg_imm32(rfield, CRx_bit::CR_EQ);
             this->asmb.mov_reg_imm32(rtmp, CRx_bit::CR_GT);
@@ -1756,7 +1772,7 @@ private:
         }
 
         if (a_dies) free_mask |= bit(uint8_t(ra));
-        if (b_dies) free_mask |= bit(uint8_t(rb));
+        if (b_dies && !b_immediate) free_mask |= bit(uint8_t(rb));
         return true;
     }
 
