@@ -1224,6 +1224,17 @@ private:
         }
         const X64Gpr rtmp = X64Gpr(lowest_bit(avail));
 
+        // setcc only writes the low byte. Clear its destinations before the
+        // arithmetic establishes CF/OF, moving the zero extension off the
+        // flag-dependent path. Loading and shifting XER already leaves the
+        // whole scratch register zero above that byte for the carry-in forms.
+        if (!wants_cf) {
+            this->asmb.xor_reg_reg32(REG_SCRATCH, REG_SCRATCH);
+        }
+        if (in.oe) {
+            this->asmb.xor_reg_reg32(rtmp, rtmp);
+        }
+
         if (wants_cf) {
             // CA sits in bit 29, so shifting by 30 drops it into CF
             this->asmb.mov_reg_mem32(REG_SCRATCH, REG_STATE, XER_OFFSET);
@@ -1286,12 +1297,10 @@ private:
         if (in.oe) {
             this->asmb.setcc_reg8(X64Cond::Overflow, rtmp);
         }
-        this->asmb.movzx_reg8(REG_SCRATCH, REG_SCRATCH);
         this->asmb.shl_reg_imm8(REG_SCRATCH, 29);
         if (in.oe) {
-            this->asmb.movzx_reg8(rtmp, rtmp);
             this->asmb.neg_reg32(rtmp); // all ones when it overflowed
-            this->asmb.and_reg_imm32(rtmp, XER::SO | XER::OV);
+            this->asmb.shl_reg_imm8(rtmp, 30); // SO|OV when it overflowed
             this->asmb.or_reg_reg32(REG_SCRATCH, rtmp);
         }
         this->asmb.mov_reg_mem32(rtmp, REG_STATE, XER_OFFSET);
@@ -1338,6 +1347,10 @@ private:
         }
         const X64Gpr rtmp = X64Gpr(lowest_bit(avail));
 
+        // seto writes one byte; clearing the scratch ahead of the arithmetic
+        // avoids a flag-dependent movzx after it.
+        this->asmb.xor_reg_reg32(REG_SCRATCH, REG_SCRATCH);
+
         if (in.opcode == IROpcode::Sub) {
             if (dst != ra) this->asmb.mov_reg_reg32(dst, ra);
             this->asmb.sub_reg_reg32(dst, rb);
@@ -1346,9 +1359,8 @@ private:
         }
 
         this->asmb.setcc_reg8(X64Cond::Overflow, REG_SCRATCH);
-        this->asmb.movzx_reg8(REG_SCRATCH, REG_SCRATCH);
         this->asmb.neg_reg32(REG_SCRATCH);
-        this->asmb.and_reg_imm32(REG_SCRATCH, XER::SO | XER::OV);
+        this->asmb.shl_reg_imm8(REG_SCRATCH, 30);
         this->asmb.mov_reg_mem32(rtmp, REG_STATE, XER_OFFSET);
         this->asmb.and_reg_imm32(rtmp, ~uint32_t(XER::OV));
         this->asmb.or_reg_reg32(rtmp, REG_SCRATCH);
